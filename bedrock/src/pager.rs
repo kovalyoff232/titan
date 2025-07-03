@@ -1,0 +1,115 @@
+use std::fs::{File, OpenOptions, create_dir_all};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use crate::{Page, PageId, PAGE_SIZE};
+
+/// The Pager is responsible for reading and writing pages to the database file.
+pub struct Pager {
+    file: File,
+    pub num_pages: u32,
+}
+
+impl Pager {
+    /// Opens the database file, creating it and its parent directories if they don't exist.
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path_ref = path.as_ref();
+        println!("[Pager::open] Opening database file at: {:?}", path_ref);
+        if let Some(parent) = path_ref.parent() {
+            create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path_ref)?;
+        
+        let file_size = file.metadata()?.len();
+        let num_pages = (file_size / PAGE_SIZE as u64) as u32;
+        println!("[Pager::open] File size: {}, initial num_pages: {}", file_size, num_pages);
+
+        Ok(Self { file, num_pages })
+    }
+
+    /// Reads a page from the database file. If the page is beyond the end of the file,
+    /// it returns a new, empty page.
+    pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
+        println!("[Pager::read_page] Reading page_id: {}", page_id);
+        let mut page = Page::new(page_id);
+        if page_id >= self.num_pages {
+            println!("[Pager::read_page] Page {} is new, returning empty page.", page_id);
+            return Ok(page);
+        }
+
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        
+        match self.file.read(&mut page.data) {
+            Ok(n) if n < PAGE_SIZE => {
+                println!("[Pager::read_page] Read {} bytes (less than page size), zeroing rest.", n);
+                for i in n..PAGE_SIZE {
+                    page.data[i] = 0;
+                }
+            }
+            Ok(_) => {
+                 println!("[Pager::read_page] Successfully read page {}", page_id);
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(page)
+    }
+
+    /// Writes a page to the database file.
+    pub fn write_page(&mut self, page: &Page) -> io::Result<()> {
+        println!("[Pager::write_page] Writing page_id: {}", page.id);
+        let offset = page.id as u64 * PAGE_SIZE as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(&page.data)?;
+        self.file.sync_all()?;
+        if page.id >= self.num_pages {
+            self.num_pages = page.id + 1;
+            println!("[Pager::write_page] Increased num_pages to {}", self.num_pages);
+        }
+        Ok(())
+    }
+
+    /// Allocates a new page in the database file and returns its PageId.
+    pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        let page_id = self.num_pages;
+        self.num_pages += 1;
+        println!("[Pager::allocate_page] Allocating new page_id: {}. New num_pages: {}", page_id, self.num_pages);
+        Ok(page_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_pager() -> io::Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut pager = Pager::open(temp_file.path())?;
+
+        // Allocate a new page
+        let page_id = pager.allocate_page()?;
+        assert_eq!(page_id, 0);
+
+        // Write some data to the page
+        let mut page = pager.read_page(page_id)?;
+        page.data[0..5].copy_from_slice(b"hello");
+        pager.write_page(&page)?;
+
+        // Read the page back and verify the data
+        let page = pager.read_page(page_id)?;
+        assert_eq!(&page.data[0..5], b"hello");
+
+        // Verify the header
+        let header = page.header();
+        assert_eq!(header.lower_offset, std::mem::size_of::<crate::page::PageHeaderData>() as u16);
+
+        Ok(())
+    }
+}

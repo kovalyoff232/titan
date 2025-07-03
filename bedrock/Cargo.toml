@@ -1,0 +1,11 @@
+[package]
+name = "bedrock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = "0.8.4"
+crc32fast = "1.4.0"
+
+[dev-dependencies]
+tempfile = "3.10.1"
