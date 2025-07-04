@@ -153,7 +153,8 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                     match &stmt {
                         parser::Statement::Begin => {
                             // The transaction was already started implicitly above.
-                            // We just need to send the response.
+                            // We just need to prevent it from being auto-committed at the end of this block.
+                            tx_already_ended = true; 
                             send_command_complete(&mut stream, "BEGIN")?;
                             last_result = None; // Don't send another response below
                             continue;
@@ -241,20 +242,20 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
 }
 
 fn main() -> std::io::Result<()> {
-    let db_path = "titan.db";
-    let wal_path = "titan.wal";
+    let db_path = std::env::var("TITAN_DB_PATH").unwrap_or("titan.db".to_string());
+    let wal_path = std::env::var("TITAN_WAL_PATH").unwrap_or("titan.wal".to_string());
 
     // --- Recovery Phase ---
-    let mut pager_for_recovery = Pager::open(db_path)?;
+    let mut pager_for_recovery = Pager::open(&db_path)?;
     let db_is_new = pager_for_recovery.num_pages == 0;
-    let highest_tx_id = WalManager::recover(wal_path, &mut pager_for_recovery)?;
+    let highest_tx_id = WalManager::recover(&wal_path, &mut pager_for_recovery)?;
     println!("[RECOVERY] Completed. Highest TX ID found: {}", highest_tx_id);
 
     // --- Initialization after Recovery ---
-    let pager = Pager::open(db_path)?;
+    let pager = Pager::open(&db_path)?;
     let bpm = Arc::new(BufferPoolManager::new(pager));
     let tm = Arc::new(TransactionManager::new(highest_tx_id + 1));
-    let wal = Arc::new(Mutex::new(WalManager::open(wal_path)?));
+    let wal = Arc::new(Mutex::new(WalManager::open(&wal_path)?));
 
     if db_is_new {
         println!("[INIT] New database detected, initializing system tables.");

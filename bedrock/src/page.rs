@@ -186,66 +186,22 @@ impl Page {
 
     /// Returns true if the tuple is visible to the given snapshot.
     pub fn is_visible(&self, snapshot: &Snapshot, current_tx_id: TransactionId, item_id: u16) -> bool {
-        let item_id_data = match self.get_item_id_data(item_id) {
-            Some(data) => data,
-            None => return false, // Item ID does not exist
-        };
-        let header = self.tuple_header(item_id_data.offset);
-        let xmin = header.xmin;
-        let xmax = header.xmax;
+        let header = self.tuple_header(self.get_item_id_data(item_id).unwrap().offset);
 
-        // --- Logging ---
-        let log_prefix = format!(
-            "[is_visible] page: {}, item: {}, current_tx: {}, snapshot: {:?} || tuple_xmin: {}, tuple_xmax: {}",
-            self.id, item_id, current_tx_id, snapshot, xmin, xmax
-        );
+        if header.xmin == current_tx_id {
+            return header.xmax == 0;
+        }
 
-        // --- Visibility Rules ---
-
-        // Rule 1: The transaction that created the tuple is the current transaction.
-        if xmin == current_tx_id {
-            // And the tuple has not been deleted by the current transaction.
-            if xmax == 0 {
-                println!("{} -> visible (Rule 1: Own insert, not deleted)", log_prefix);
+        if snapshot.is_visible(header.xmin) {
+            if header.xmax == 0 {
                 return true;
             }
-            // If xmax is set, it means the tuple was deleted. If it was deleted by our own
-            // transaction, it's not visible.
-            println!("{} -> not visible (Rule 1: Own insert, but deleted by xmax={})", log_prefix, xmax);
-            return false;
+            if header.xmax == current_tx_id {
+                return true;
+            }
+            return !snapshot.is_visible(header.xmax);
         }
 
-        // Rule 2: The creating transaction is not visible in our snapshot.
-        // This means the transaction was either aborted or is still in progress.
-        if !snapshot.is_visible(xmin) {
-            println!("{} -> not visible (Rule 2: xmin not visible)", log_prefix);
-            return false;
-        }
-
-        // Rule 3: The tuple has not been deleted (xmax is not set).
-        if xmax == 0 {
-            println!("{} -> visible (Rule 3: xmin visible, not deleted)", log_prefix);
-            return true;
-        }
-
-        // Rule 4: The deleting transaction is our own transaction.
-        if xmax == current_tx_id {
-             println!("{} -> not visible (Rule 4: Deleted by own transaction)", log_prefix);
-            return false;
-        }
-
-        // Rule 5: The deleting transaction is another transaction. Check its visibility.
-        // If the deleting transaction is *not* visible, it means the deletion is not
-        // "real" to us, so the tuple *is* visible.
-        if !snapshot.is_visible(xmax) {
-            println!("{} -> visible (Rule 5: xmax not visible)", log_prefix);
-            return true;
-        }
-
-        // If we reach here, it means xmin is visible and xmax is also visible.
-        // This means the tuple was created and then deleted by transactions that
-        // are both considered "in the past" from our point of view. So, it's not visible.
-        println!("{} -> not visible (Default: xmin and xmax both visible)", log_prefix);
         false
     }
 

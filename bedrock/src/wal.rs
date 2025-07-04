@@ -23,27 +23,43 @@ pub struct WalRecordHeader {
 #[derive(Debug, Clone)]
 pub enum WalRecord {
     /// Indicates the commit of a transaction.
-    Commit,
+    Commit { tx_id: u32 },
     /// Indicates the abort of a transaction.
-    Abort,
+    Abort { tx_id: u32 },
     /// A new tuple was inserted.
     InsertTuple {
+        tx_id: u32,
         page_id: PageId,
         item_id: u16,
     },
     /// A tuple was marked as deleted.
     DeleteTuple {
+        tx_id: u32,
         page_id: PageId,
         item_id: u16,
     },
     /// A tuple was updated (old data is logged for UNDO).
     UpdateTuple {
+        tx_id: u32,
         page_id: PageId,
         item_id: u16,
         old_data: Vec<u8>,
     },
     /// A checkpoint record.
     Checkpoint,
+}
+
+impl WalRecord {
+    pub fn tx_id(&self) -> u32 {
+        match self {
+            WalRecord::Commit { tx_id } => *tx_id,
+            WalRecord::Abort { tx_id } => *tx_id,
+            WalRecord::InsertTuple { tx_id, .. } => *tx_id,
+            WalRecord::DeleteTuple { tx_id, .. } => *tx_id,
+            WalRecord::UpdateTuple { tx_id, .. } => *tx_id,
+            WalRecord::Checkpoint => 0, // Checkpoints don't belong to a tx
+        }
+    }
 }
 
 /// The WAL manager.
@@ -101,20 +117,29 @@ impl WalManager {
 
     fn serialize_record(&self, record: &WalRecord, buf: &mut Vec<u8>) {
         match record {
-            WalRecord::Commit => buf.push(1),
-            WalRecord::Abort => buf.push(2),
-            WalRecord::InsertTuple { page_id, item_id } => {
+            WalRecord::Commit { tx_id } => {
+                buf.push(1);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
+            }
+            WalRecord::Abort { tx_id } => {
+                buf.push(2);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
+            }
+            WalRecord::InsertTuple { tx_id, page_id, item_id } => {
                 buf.push(3);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
                 buf.extend_from_slice(&page_id.to_be_bytes());
                 buf.extend_from_slice(&item_id.to_be_bytes());
             }
-            WalRecord::DeleteTuple { page_id, item_id } => {
+            WalRecord::DeleteTuple { tx_id, page_id, item_id } => {
                 buf.push(4);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
                 buf.extend_from_slice(&page_id.to_be_bytes());
                 buf.extend_from_slice(&item_id.to_be_bytes());
             }
-            WalRecord::UpdateTuple { page_id, item_id, old_data } => {
+            WalRecord::UpdateTuple { tx_id, page_id, item_id, old_data } => {
                 buf.push(5);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
                 buf.extend_from_slice(&page_id.to_be_bytes());
                 buf.extend_from_slice(&item_id.to_be_bytes());
                 buf.extend_from_slice(&(old_data.len() as u32).to_be_bytes());
@@ -129,24 +154,33 @@ impl WalManager {
         let record_type = buf[0];
         let data = &buf[1..];
         match record_type {
-            1 => Some(WalRecord::Commit),
-            2 => Some(WalRecord::Abort),
+            1 => {
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                Some(WalRecord::Commit { tx_id })
+            }
+            2 => {
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                Some(WalRecord::Abort { tx_id })
+            }
             3 => {
-                let page_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[4..6].try_into().ok()?);
-                Some(WalRecord::InsertTuple { page_id, item_id })
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
+                Some(WalRecord::InsertTuple { tx_id, page_id, item_id })
             }
             4 => {
-                let page_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[4..6].try_into().ok()?);
-                Some(WalRecord::DeleteTuple { page_id, item_id })
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
+                Some(WalRecord::DeleteTuple { tx_id, page_id, item_id })
             }
             5 => {
-                let page_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[4..6].try_into().ok()?);
-                let len = u32::from_be_bytes(data[6..10].try_into().ok()?) as usize;
-                let old_data = data[10..10+len].to_vec();
-                Some(WalRecord::UpdateTuple { page_id, item_id, old_data })
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
+                let len = u32::from_be_bytes(data[10..14].try_into().ok()?) as usize;
+                let old_data = data[14..14+len].to_vec();
+                Some(WalRecord::UpdateTuple { tx_id, page_id, item_id, old_data })
             }
             6 => Some(WalRecord::Checkpoint),
             _ => None,
@@ -154,9 +188,15 @@ impl WalManager {
     }
 
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
+        if lsn == 0 {
+            return Ok((None, 0));
+        }
         self.file.seek(SeekFrom::Start(lsn))?;
         let mut header_buf = [0u8; std::mem::size_of::<WalRecordHeader>()];
-        self.file.read_exact(&mut header_buf)?;
+        if self.file.read_exact(&mut header_buf).is_err() {
+            // This can happen if we are at the end of the file or the file is corrupted.
+            return Ok((None, 0));
+        }
         let header: WalRecordHeader = unsafe { std::mem::transmute(header_buf) };
         
         let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();

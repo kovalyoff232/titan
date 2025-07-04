@@ -96,37 +96,34 @@ impl TransactionManager {
         let mut last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
 
         while last_lsn > 0 {
-            // In a real system, we would have a WAL iterator or a way to read a specific LSN.
-            // Here, we have to do a full scan, which is very inefficient.
-            // This is a simplified demonstration.
             let (record, prev_lsn) = wal.read_record(last_lsn)?;
 
             if let Some(rec) = record {
+                if rec.tx_id() != tx_id {
+                    last_lsn = prev_lsn;
+                    continue;
+                }
+
                 match rec {
-                    WalRecord::InsertTuple { page_id, item_id } => {
+                    WalRecord::InsertTuple { page_id, item_id, .. } => {
                         let page_guard = bpm.acquire_page(page_id)?;
                         let mut page = page_guard.write();
-                        // To "undo" an insert, we can simply mark the tuple header as invalid
-                        // so it's not visible to anyone. A real system might have a more
-                        // complex way to reclaim the space.
                         if let Some(header) = page.get_tuple_header_mut(item_id) {
                             header.xmax = tx_id; // Mark as deleted by this aborting tx
                         }
                     }
-                    WalRecord::DeleteTuple { page_id, item_id } => {
+                    WalRecord::DeleteTuple { page_id, item_id, .. } => {
                         let page_guard = bpm.acquire_page(page_id)?;
                         let mut page = page_guard.write();
-                        // To "undo" a delete, we reset xmax.
                         if let Some(header) = page.get_tuple_header_mut(item_id) {
                             if header.xmax == tx_id {
                                 header.xmax = 0;
                             }
                         }
                     }
-                    WalRecord::UpdateTuple { page_id, item_id, old_data } => {
+                    WalRecord::UpdateTuple { page_id, item_id, old_data, .. } => {
                         let page_guard = bpm.acquire_page(page_id)?;
                         let mut page = page_guard.write();
-                        // To "undo" an update, we restore the old data.
                         if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
                             tuple.copy_from_slice(&old_data);
                         }
@@ -141,7 +138,8 @@ impl TransactionManager {
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
 
         let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
-        wal.log(tx_id, prev_lsn, &WalRecord::Abort)?;
+        let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Abort { tx_id })?;
+        self.set_last_lsn(tx_id, lsn);
 
         println!("[TM::abort] Aborted tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
         Ok(())

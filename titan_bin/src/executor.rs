@@ -181,7 +181,7 @@ fn execute_create_table(stmt: &CreateTableStatement, bpm: &Arc<BufferPoolManager
         let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
         
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id })?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
         println!("[execute_create_table] Added to pg_class with oid {}", new_table_oid);
@@ -202,7 +202,7 @@ fn execute_create_table(stmt: &CreateTableStatement, bpm: &Arc<BufferPoolManager
             tuple_data.extend_from_slice(col.name.as_bytes());
             let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_ATTRIBUTE_TABLE_OID, item_id })?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_ATTRIBUTE_TABLE_OID, item_id })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
         }
@@ -234,7 +234,7 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
         let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
         
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id })?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
     }
@@ -339,11 +339,11 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
         // Log the changes to pg_class to the WAL.
         if let Some(old_id) = old_item_id {
              let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-             let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { page_id: PG_CLASS_TABLE_OID, item_id: old_id })?;
+             let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id: old_id })?;
              tm.set_last_lsn(tx_id, lsn);
         }
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id: new_item_id })?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id: new_item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         pg_class_page.header_mut().lsn = lsn;
     }
@@ -369,7 +369,7 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
         
         // Log the specific insert operation to the WAL.
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: table_page_id, item_id })?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: table_page_id, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
         println!("[INSERT] Successfully inserted tuple with item_id {} into page {}", item_id, table_page_id);
@@ -439,7 +439,7 @@ fn execute_update(stmt: &UpdateStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
             rows_affected += 1;
 
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::UpdateTuple { page_id: table_page_id, item_id: new_item_id, old_data: old_tuple_raw })?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::UpdateTuple { tx_id, page_id: table_page_id, item_id: new_item_id, old_data: old_tuple_raw })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
         }
@@ -478,7 +478,7 @@ fn execute_delete(stmt: &DeleteStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
             header.xmax = tx_id;
             rows_affected += 1;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { page_id: table_page_id, item_id })?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { tx_id, page_id: table_page_id, item_id })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
         }
