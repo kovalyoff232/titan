@@ -1,8 +1,9 @@
 //! B-Tree index implementation.
-use crate::pager::Pager;
+use crate::buffer_pool::BufferPoolManager;
 use crate::{Page, PageId, TupleId};
 use std::io;
 use std::mem::size_of;
+use std::sync::Arc;
 
 pub type Key = i32;
 
@@ -91,65 +92,75 @@ impl Page {
 }
 
 /// Searches for a key in the B-Tree.
-pub fn btree_search(pager: &mut Pager, root_page_id: PageId, key: Key) -> io::Result<Option<TupleId>> {
-    let mut current_page = pager.read_page(root_page_id)?;
+pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key) -> io::Result<Option<TupleId>> {
+    let mut current_page_id = root_page_id;
     loop {
+        let current_page_guard = bpm.acquire_page(current_page_id)?;
+        let current_page = current_page_guard.read();
         match current_page.btree_header().page_type {
             BTreePageType::Leaf => {
                 let num_cells = current_page.btree_header().num_cells as usize;
+                // TODO: Binary search would be much faster here.
                 for i in 0..num_cells {
                     if current_page.leaf_cell(i).key == key {
                         return Ok(Some(current_page.leaf_cell(i).tuple_id));
                     }
                 }
+                // Key not found in this leaf page.
                 return Ok(None);
             }
             BTreePageType::Internal => {
                 let num_cells = current_page.btree_header().num_cells as usize;
                 let mut next_page_id = *current_page.right_child();
+                // TODO: Binary search would be much faster here.
                 for i in 0..num_cells {
                     if key < current_page.internal_cell(i).key {
                         next_page_id = current_page.internal_cell(i).page_id;
                         break;
                     }
                 }
-                current_page = pager.read_page(next_page_id)?;
+                current_page_id = next_page_id;
             }
         }
     }
 }
 
-pub fn btree_insert(pager: &mut Pager, root_page_id: PageId, key: Key, tuple_id: TupleId) -> io::Result<PageId> {
-    let mut root_page = pager.read_page(root_page_id)?;
-    if root_page.btree_header().num_cells as usize == LEAF_MAX_CELLS {
-        let new_page_id = pager.allocate_page()?;
-        let mut new_page = pager.read_page(new_page_id)?;
-        let median_key = leaf_split_and_move(&mut root_page, &mut new_page);
-
-        let new_root_page_id = pager.allocate_page()?;
-        let mut new_root_page = pager.read_page(new_root_page_id)?;
-        new_root_page.as_btree_internal_page();
+pub fn btree_insert(bpm: &Arc<BufferPoolManager>, mut root_page_id: PageId, key: Key, tuple_id: TupleId) -> io::Result<PageId> {
+    let root_page_guard = bpm.acquire_page(root_page_id)?;
+    if root_page_guard.read().btree_header().num_cells as usize == LEAF_MAX_CELLS {
+        let new_page_guard = bpm.new_page()?;
+        let new_page_id = new_page_guard.read().id;
         
-        *new_root_page.right_child_mut() = new_page_id;
-        *new_root_page.internal_cell_mut(0) = InternalCell { key: median_key, page_id: root_page_id };
-        new_root_page.btree_header_mut().num_cells = 1;
+        let median_key = {
+            let mut root_page = root_page_guard.write();
+            let mut new_page = new_page_guard.write();
+            leaf_split_and_move(&mut root_page, &mut new_page)
+        };
+
+        let new_root_page_guard = bpm.new_page()?;
+        let new_root_page_id = new_root_page_guard.read().id;
+        {
+            let mut new_root_page = new_root_page_guard.write();
+            new_root_page.as_btree_internal_page();
+            *new_root_page.right_child_mut() = new_page_id;
+            *new_root_page.internal_cell_mut(0) = InternalCell { key: median_key, page_id: root_page_id };
+            new_root_page.btree_header_mut().num_cells = 1;
+        }
 
         if key < median_key {
+            let mut root_page = root_page_guard.write();
             leaf_insert(&mut root_page, key, tuple_id);
         } else {
+            let mut new_page = new_page_guard.write();
             leaf_insert(&mut new_page, key, tuple_id);
         }
 
-        pager.write_page(&root_page)?;
-        pager.write_page(&new_page)?;
-        pager.write_page(&new_root_page)?;
-
-        Ok(new_root_page_id)
+        root_page_id = new_root_page_id;
     } else {
+        let mut root_page = root_page_guard.write();
         leaf_insert(&mut root_page, key, tuple_id);
-        pager.write_page(&root_page)?;
-        Ok(root_page_id)
     }
+    Ok(root_page_id)
 }
 
 fn leaf_split_and_move(old_page: &mut Page, new_page: &mut Page) -> Key {

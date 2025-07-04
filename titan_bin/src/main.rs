@@ -106,7 +106,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
         if stream.read_exact(&mut msg_type).is_err() {
             println!("[handle_client] Connection closed by peer.");
             if in_transaction {
-                tm.abort(tx_id);
+                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
             }
             return Ok(());
         }
@@ -123,61 +123,79 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                 let query_str = String::from_utf8_lossy(&buffer[..len-1]).to_string();
                 println!("[handle_client] Received query: '{}'", query_str);
 
-                if !in_transaction {
-                    tx_id = tm.begin();
-                    in_transaction = true;
-                    println!("[handle_client] Started a new transaction with tx_id: {}", tx_id);
-                }
-
-                match parser::sql_parser(&query_str) {
-                    Ok(stmts) => {
-                        for stmt in stmts {
-                            println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
-                            let snapshot = tm.create_snapshot(tx_id);
-                            let result = executor::execute(&stmt, &bpm, &tm, &wal, tx_id, &snapshot);
-                            
-                            match result {
-                                Ok(execute_result) => {
-                                    println!("[handle_client] Execution successful: {:?}", execute_result);
-                                    match execute_result {
-                                        ExecuteResult::Ddl => send_command_complete(&mut stream, "DDL")?,
-                                        ExecuteResult::Insert(count) => send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?,
-                                        ExecuteResult::Delete(count) => send_command_complete(&mut stream, &format!("DELETE {}", count))?,
-                                        ExecuteResult::Update(count) => send_command_complete(&mut stream, &format!("UPDATE {}", count))?,
-                                        ExecuteResult::ResultSet(ResultSet { columns, rows }) => {
-                                            send_row_description(&mut stream, &columns)?;
-                                            let row_count = rows.len();
-                                            for row in &rows {
-                                                send_data_row(&mut stream, &row)?;
-                                            }
-                                            send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("[handle_client] Execution failed: {:?}", e);
-                                    send_error_response(&mut stream, &format!("Execution failed: {:?}", e))?;
-                                    tm.abort(tx_id);
-                                    in_transaction = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                let stmts = match parser::sql_parser(&query_str) {
+                    Ok(s) => s,
                     Err(e) => {
                         println!("[handle_client] Parsing failed: {:?}", e);
                         send_error_response(&mut stream, &format!("Parsing failed: {:?}", e))?;
+                        send_ready_for_query(&mut stream)?;
+                        continue;
+                    }
+                };
+
+                for stmt in stmts {
+                    if !in_transaction {
+                        tx_id = tm.begin();
+                        in_transaction = true;
+                        println!("[handle_client] Started a new transaction with tx_id: {}", tx_id);
+                    }
+
+                    println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
+                    let snapshot = tm.create_snapshot(tx_id);
+                    let result = executor::execute(&stmt, &bpm, &tm, &wal, tx_id, &snapshot);
+                    
+                    let mut tx_ended = false;
+                    if let Ok(ExecuteResult::Ddl) = result {
+                        match stmt {
+                            parser::Statement::Commit => {
+                                tm.commit(tx_id);
+                                bpm.flush_all_pages()?;
+                                in_transaction = false;
+                                tx_ended = true;
+                                send_command_complete(&mut stream, "COMMIT")?;
+                            }
+                            parser::Statement::Rollback => {
+                                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
+                                in_transaction = false;
+                                tx_ended = true;
+                                send_command_complete(&mut stream, "ROLLBACK")?;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !tx_ended {
+                         match result {
+                            Ok(execute_result) => {
+                                println!("[handle_client] Execution successful: {:?}", execute_result);
+                                match execute_result {
+                                    ExecuteResult::Ddl => send_command_complete(&mut stream, "DDL")?,
+                                    ExecuteResult::Insert(count) => send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?,
+                                    ExecuteResult::Delete(count) => send_command_complete(&mut stream, &format!("DELETE {}", count))?,
+                                    ExecuteResult::Update(count) => send_command_complete(&mut stream, &format!("UPDATE {}", count))?,
+                                    ExecuteResult::ResultSet(ResultSet { columns, rows }) => {
+                                        send_row_description(&mut stream, &columns)?;
+                                        let row_count = rows.len();
+                                        for row in &rows {
+                                            send_data_row(&mut stream, &row)?;
+                                        }
+                                        send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("[handle_client] Execution failed: {:?}", e);
+                                send_error_response(&mut stream, &format!("Execution failed: {:?}", e))?;
+                                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
+                                in_transaction = false;
+                            }
+                        }
                     }
                 }
-
-                if query_str.to_uppercase().contains("COMMIT") {
-                    println!("[handle_client] Committing tx_id: {}", tx_id);
+                
+                if !in_transaction {
+                    // Auto-commit if not in an explicit transaction block
                     tm.commit(tx_id);
-                    in_transaction = false;
-                } else if query_str.to_uppercase().contains("ROLLBACK") {
-                    println!("[handle_client] Rolling back tx_id: {}", tx_id);
-                    tm.abort(tx_id);
-                    in_transaction = false;
                 }
 
                 send_ready_for_query(&mut stream)?;
@@ -185,7 +203,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
             b'X' => { // Terminate
                 println!("[handle_client] Terminate message received. Closing connection.");
                 if in_transaction {
-                    tm.abort(tx_id);
+                    tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                 }
                 return Ok(());
             }

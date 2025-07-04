@@ -92,7 +92,7 @@ fn find_table(name: &str, bpm: &Arc<BufferPoolManager>, tx_id: u32, snapshot: &S
 }
 
 fn get_table_schema(bpm: &Arc<BufferPoolManager>, table_oid: u32, tx_id: u32, snapshot: &Snapshot) -> Result<Vec<Column>, ExecutionError> {
-    let mut schema = Vec::new();
+    let mut schema_cols = Vec::new();
     let attr_page_guard = bpm.acquire_page(PG_ATTRIBUTE_TABLE_OID)?;
     let attr_page = attr_page_guard.read();
     for i in 0..attr_page.get_tuple_count() {
@@ -100,15 +100,18 @@ fn get_table_schema(bpm: &Arc<BufferPoolManager>, table_oid: u32, tx_id: u32, sn
             if let Some(tuple_data) = attr_page.get_tuple(i) {
                 let rel_oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
                 if rel_oid == table_oid {
+                    let attnum = u16::from_be_bytes(tuple_data[4..6].try_into().unwrap());
                     let type_id = u32::from_be_bytes(tuple_data[6..10].try_into().unwrap());
                     let name_len = tuple_data[10] as usize;
                     let name = String::from_utf8_lossy(&tuple_data[11..11 + name_len]).to_string();
-                    schema.push(Column { name, type_id });
+                    schema_cols.push((attnum, Column { name, type_id }));
                 }
             }
         }
     }
-    Ok(schema)
+    // Sort columns by attribute number to ensure correct order
+    schema_cols.sort_by_key(|(attnum, _)| *attnum);
+    Ok(schema_cols.into_iter().map(|(_, col)| col).collect())
 }
 
 
@@ -149,10 +152,11 @@ pub fn execute(stmt: &Statement, bpm: &Arc<BufferPoolManager>, tm: &Arc<Transact
     match stmt {
         Statement::Select(select_stmt) => execute_select(select_stmt, bpm, tx_id, snapshot).map(ExecuteResult::ResultSet),
         Statement::CreateTable(create_stmt) => execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl),
-        Statement::CreateIndex(create_stmt) => execute_create_index(create_stmt, bpm, wm, tx_id, snapshot).map(|_| ExecuteResult::Ddl),
-        Statement::Insert(insert_stmt) => execute_insert(insert_stmt, bpm, wm, tx_id, snapshot).map(ExecuteResult::Insert),
-        Statement::Update(update_stmt) => execute_update(update_stmt, bpm, wm, tx_id, snapshot).map(ExecuteResult::Update),
-        Statement::Delete(delete_stmt) => execute_delete(delete_stmt, bpm, wm, tx_id, snapshot).map(ExecuteResult::Delete),
+        Statement::CreateIndex(create_stmt) => execute_create_index(create_stmt, bpm, tm, wm, tx_id, snapshot).map(|_| ExecuteResult::Ddl),
+        Statement::Insert(insert_stmt) => execute_insert(insert_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Insert),
+        Statement::Update(update_stmt) => execute_update(update_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Update),
+        Statement::Delete(delete_stmt) => execute_delete(delete_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Delete),
+        Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Ok(ExecuteResult::Ddl),
     }
 }
@@ -174,11 +178,11 @@ fn execute_create_table(stmt: &CreateTableStatement, bpm: &Arc<BufferPoolManager
         tuple_data.extend_from_slice(&0u32.to_be_bytes()); 
         tuple_data.push(stmt.table_name.len() as u8);
         tuple_data.extend_from_slice(stmt.table_name.as_bytes());
-        page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
         
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: PG_CLASS_TABLE_OID, data: page_data_box })?;
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id })?;
+        tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
         println!("[execute_create_table] Added to pg_class with oid {}", new_table_oid);
     }
@@ -196,34 +200,46 @@ fn execute_create_table(stmt: &CreateTableStatement, bpm: &Arc<BufferPoolManager
             tuple_data.extend_from_slice(&type_id.to_be_bytes());
             tuple_data.push(col.name.len() as u8);
             tuple_data.extend_from_slice(col.name.as_bytes());
-            page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+            let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_ATTRIBUTE_TABLE_OID, item_id })?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
         }
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: PG_ATTRIBUTE_TABLE_OID, data: page_data_box })?;
-        page.header_mut().lsn = lsn;
         println!("[execute_create_table] Added {} columns to pg_attribute for oid {}", stmt.columns.len(), new_table_oid);
     }
 
     Ok(())
 }
 
-fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<(), ExecutionError> {
+fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<(), ExecutionError> {
     let (_table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
-    let index_file_name = format!("titan_bin/{}.idx", stmt.index_name);
-    let mut index_pager = bedrock::pager::Pager::open(&index_file_name)?;
-    let mut root_page_id = index_pager.allocate_page()?;
     
+    // Create a new B-Tree root page
+    let root_page_guard = bpm.new_page()?;
+    let mut root_page_id = root_page_guard.read().id;
+    root_page_guard.write().as_btree_leaf_page();
+    drop(root_page_guard);
+
+    // Create a new relation for the index in pg_class
+    let index_oid = tm.get_next_oid();
     {
-        let page_guard = bpm.acquire_page(root_page_id)?;
+        let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
         let mut page = page_guard.write();
-        page.as_btree_leaf_page();
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: root_page_id, data: page_data_box })?;
+        let mut tuple_data = Vec::new();
+        tuple_data.extend_from_slice(&index_oid.to_be_bytes());
+        tuple_data.extend_from_slice(&root_page_id.to_be_bytes());
+        tuple_data.push(stmt.index_name.len() as u8);
+        tuple_data.extend_from_slice(stmt.index_name.as_bytes());
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+        
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id })?;
+        tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
     }
 
+    // Populate the index
     if table_page_id != 0 {
         let page_guard = bpm.acquire_page(table_page_id)?;
         let page = page_guard.read();
@@ -232,43 +248,63 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
                 if let Some(tuple_data) = page.get_tuple(i) {
                     let key = i32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
                     let tuple_id: TupleId = (page.id, i);
-                    root_page_id = btree::btree_insert(&mut index_pager, root_page_id, key, tuple_id)?;
+                    root_page_id = btree::btree_insert(bpm, root_page_id, key, tuple_id)?;
                 }
             }
         }
     }
+
+    // Update the root_page_id in pg_class
+    {
+        let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
+        let mut page = page_guard.write();
+        for i in 0..page.get_tuple_count() {
+            if let Some(tuple_data) = page.get_tuple(i) {
+                let oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
+                if oid == index_oid {
+                    if let Some(mut tuple) = page.get_raw_tuple_mut(i) {
+                        tuple[4..8].copy_from_slice(&root_page_id.to_be_bytes());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
 // --- DML ---
 
-fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
-    println!("[INSERT] table: {}, tx_id: {}", stmt.table_name, tx_id);
+fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
+    println!("[INSERT] table: '{}', tx_id: {}", stmt.table_name, tx_id);
     let (table_oid, mut table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
     
+    // This block handles the very first insertion into a table, allocating its first page.
     if table_page_id == 0 {
-        // This is the first insert into this table, so we need to allocate a real page for it.
+        println!("[INSERT] First insert for table '{}' (oid {}). Allocating a new page.", stmt.table_name, table_oid);
         let new_page_guard = bpm.new_page()?;
         let new_page_id = new_page_guard.read().id;
-        // CRITICAL FIX: Assign the new_page_id to table_page_id for the subsequent insert.
-        table_page_id = new_page_id;
+        table_page_id = new_page_id; // Use this new page for the insert.
         println!("[INSERT] Allocated new page {} for table '{}'", new_page_id, stmt.table_name);
 
-        // Now, update the pg_class entry for this table to point to the new page.
-        // This is a critical step. We create a new version of the pg_class row.
+        // Now, we must update the pg_class entry for this table to point to the newly allocated page.
+        // This is a critical step for persistence. We create a new version of the pg_class row.
         let pg_class_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
         let mut pg_class_page = pg_class_guard.write();
         
-        // Find the old entry and mark it as deleted by the current transaction.
+        let mut old_item_id = None;
+        // Find the old entry (where page_id was 0) and mark it as deleted by the current transaction.
         for i in 0..pg_class_page.get_tuple_count() {
-            // We need a fresh snapshot here to see the just-created table entry.
-            // But for simplicity in this step, we just look for the oid.
             if let Some(tuple_data) = pg_class_page.get_tuple(i) {
                 let oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
                 let page_id = u32::from_be_bytes(tuple_data[4..8].try_into().unwrap());
-                if oid == table_oid && page_id == 0 { // Find the initial entry
+                // We need to find the specific version of the row for this table that has page_id 0
+                // and is visible to our current transaction.
+                if oid == table_oid && page_id == 0 && pg_class_page.is_visible(snapshot, tx_id, i) {
                     if let Some(header) = pg_class_page.get_tuple_header_mut(i) {
                         header.xmax = tx_id;
+                        old_item_id = Some(i);
                         println!("[INSERT] Marked initial pg_class entry for oid {} (item_id {}) as deleted by tx {}", table_oid, i, tx_id);
                     }
                     break;
@@ -285,13 +321,19 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc
         let new_item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
         println!("[INSERT] Added new pg_class entry for oid {} with page_id {} at item_id {}", table_oid, table_page_id, new_item_id);
 
-        // Log the change to pg_class to the WAL.
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&pg_class_page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: PG_CLASS_TABLE_OID, data: page_data_box })?;
+        // Log the changes to pg_class to the WAL.
+        if let Some(old_id) = old_item_id {
+             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+             let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { page_id: PG_CLASS_TABLE_OID, item_id: old_id })?;
+             tm.set_last_lsn(tx_id, lsn);
+        }
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: PG_CLASS_TABLE_OID, item_id: new_item_id })?;
+        tm.set_last_lsn(tx_id, lsn);
         pg_class_page.header_mut().lsn = lsn;
     }
 
+    // This block executes for ALL inserts (first or subsequent).
     {
         println!("[INSERT] Inserting tuple into page_id: {}", table_page_id);
         let page_guard = bpm.acquire_page(table_page_id)?;
@@ -307,18 +349,21 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc
                 _ => {}
             }
         }
-        page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+        // TODO: Handle page full scenario. For now, we assume it fits.
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
         
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: table_page_id, data: page_data_box })?;
+        // Log the specific insert operation to the WAL.
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { page_id: table_page_id, item_id })?;
+        tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
+        println!("[INSERT] Successfully inserted tuple with item_id {} into page {}", item_id, table_page_id);
     }
 
     Ok(1)
 }
 
-fn execute_update(stmt: &UpdateStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
+fn execute_update(stmt: &UpdateStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
     let (table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
     if table_page_id == 0 { return Ok(0); }
 
@@ -374,22 +419,21 @@ fn execute_update(stmt: &UpdateStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc
             if let Some(header) = page.get_tuple_header_mut(item_id) {
                 header.xmax = tx_id;
             }
-            page.add_tuple(&new_tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
+            let old_tuple_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
+            let new_item_id = page.add_tuple(&new_tuple_data, tx_id, 0).ok_or(ExecutionError::GenericError(()))?;
             rows_affected += 1;
-        }
-    }
 
-    if rows_affected > 0 {
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: table_page_id, data: page_data_box })?;
-        page.header_mut().lsn = lsn;
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::UpdateTuple { page_id: table_page_id, item_id: new_item_id, old_data: old_tuple_raw })?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
+        }
     }
 
     Ok(rows_affected)
 }
 
-fn execute_delete(stmt: &DeleteStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
+fn execute_delete(stmt: &DeleteStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<u32, ExecutionError> {
     let (table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
     if table_page_id == 0 { return Ok(0); }
 
@@ -418,14 +462,11 @@ fn execute_delete(stmt: &DeleteStatement, bpm: &Arc<BufferPoolManager>, wm: &Arc
         if let Some(header) = page.get_tuple_header_mut(item_id) {
             header.xmax = tx_id;
             rows_affected += 1;
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { page_id: table_page_id, item_id })?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
         }
-    }
-
-    if rows_affected > 0 {
-        let mut page_data_box = Box::new([0u8; PAGE_SIZE]);
-        page_data_box.copy_from_slice(&page.data);
-        let lsn = wm.lock().unwrap().log(&WalRecord::SetPage { tx_id, page_id: table_page_id, data: page_data_box })?;
-        page.header_mut().lsn = lsn;
     }
 
     Ok(rows_affected)
@@ -446,29 +487,85 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
     let projected_columns = if stmt.select_list.len() == 1 && matches!(stmt.select_list[0], SelectItem::Wildcard) {
         table_schema.clone()
     } else {
-        // TODO: Handle specific column selection
-        table_schema.clone() 
+        let mut proj_cols = Vec::new();
+        for item in &stmt.select_list {
+            if let SelectItem::UnnamedExpr(Expression::Column(name)) = item {
+                if let Some(col) = table_schema.iter().find(|c| c.name == *name) {
+                    proj_cols.push(col.clone());
+                } else {
+                    return Err(ExecutionError::ColumnNotFound(()));
+                }
+            }
+            // TODO: Handle expressions and other select items
+        }
+        proj_cols
     };
 
     let mut rows = Vec::new();
-    if table_page_id != 0 {
+
+    // Simple optimization: If there is a WHERE clause on an indexed column, use an index scan.
+    let mut used_index = false;
+    if let Some(Expression::Binary { left, op: BinaryOperator::Eq, right }) = &stmt.where_clause {
+        if let (Expression::Column(col_name), Expression::Literal(LiteralValue::Number(val_str))) = (&**left, &**right) {
+            // This is a simplified check. A real system would check pg_index.
+            if col_name == "id" {
+                let index_name = format!("idx_{}", col_name);
+                if let Ok(Some((_index_oid, index_root_page_id))) = find_table(&index_name, bpm, tx_id, snapshot) {
+                    if index_root_page_id != 0 {
+                        let key = val_str.parse::<i32>().unwrap_or(0);
+                        if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, key)? {
+                            let (page_id, item_id) = tuple_id;
+                            let page_guard = bpm.acquire_page(page_id)?;
+                            let page = page_guard.read();
+                            if page.is_visible(snapshot, tx_id, item_id) {
+                                if let Some(tuple_data) = page.get_tuple(item_id) {
+                                     let parsed_tuple = parse_tuple(tuple_data, &table_schema);
+                                     let mut row = Vec::new();
+                                     for col in &projected_columns {
+                                         if let Some(value) = parsed_tuple.get(&col.name) {
+                                             row.push(value.to_string());
+                                         } else {
+                                             row.push("".to_string());
+                                         }
+                                     }
+                                     rows.push(row);
+                                }
+                            }
+                            used_index = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !used_index && table_page_id != 0 {
         let page_guard = bpm.acquire_page(table_page_id)?;
         let page = page_guard.read();
         println!("[SELECT] scanning page_id: {}, tuple_count: {}", page.id, page.get_tuple_count());
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
                 if let Some(tuple_data) = page.get_tuple(i) {
-                    println!("[SELECT] visible tuple data on page {}: {:?}", page.id, tuple_data);
                     let parsed_tuple = parse_tuple(tuple_data, &table_schema);
-                    let mut row = Vec::new();
-                    for col in &projected_columns {
-                        if let Some(value) = parsed_tuple.get(&col.name) {
-                            row.push(value.to_string());
-                        } else {
-                            row.push("".to_string()); 
+
+                    // Filter rows based on WHERE clause if it exists
+                    let should_include = if let Some(where_clause) = &stmt.where_clause {
+                        evaluate_expr_for_row(where_clause, &parsed_tuple).unwrap_or(false)
+                    } else {
+                        true // No WHERE clause means include all rows
+                    };
+
+                    if should_include {
+                        let mut row = Vec::new();
+                        for col in &projected_columns {
+                            if let Some(value) = parsed_tuple.get(&col.name) {
+                                row.push(value.to_string());
+                            } else {
+                                row.push("".to_string()); 
+                            }
                         }
+                        rows.push(row);
                     }
-                    rows.push(row);
                 }
             }
         }

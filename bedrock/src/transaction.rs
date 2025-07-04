@@ -1,9 +1,11 @@
 //! Transaction management.
 
-use std::collections::HashSet;
+use crate::buffer_pool::BufferPoolManager;
+use crate::page::TransactionId;
+use crate::wal::{Lsn, WalManager, WalRecord};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::page::TransactionId;
 
 /// A snapshot of the database state.
 /// It contains the set of active transactions.
@@ -32,6 +34,7 @@ impl Snapshot {
 struct TransactionManagerState {
     next_transaction_id: AtomicU32,
     active_transactions: Mutex<HashSet<TransactionId>>,
+    last_lsns: Mutex<HashMap<TransactionId, Lsn>>,
     next_oid: AtomicU32,
 }
 
@@ -47,6 +50,7 @@ impl TransactionManager {
         let state = TransactionManagerState {
             next_transaction_id: AtomicU32::new(initial_tx_id),
             active_transactions: Mutex::new(HashSet::new()),
+            last_lsns: Mutex::new(HashMap::new()),
             next_oid: AtomicU32::new(100), // Start OIDs from a higher number
         };
         Self {
@@ -65,6 +69,7 @@ impl TransactionManager {
     pub fn begin(&self) -> TransactionId {
         let tx_id = self.state.next_transaction_id.fetch_add(1, Ordering::SeqCst);
         self.state.active_transactions.lock().unwrap().insert(tx_id);
+        self.state.last_lsns.lock().unwrap().insert(tx_id, 0); // Initialize LSN to 0
         println!("[TM::begin] Started tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
         tx_id
     }
@@ -72,39 +77,97 @@ impl TransactionManager {
     /// Commits a transaction.
     pub fn commit(&self, tx_id: TransactionId) {
         self.state.active_transactions.lock().unwrap().remove(&tx_id);
+        self.state.last_lsns.lock().unwrap().remove(&tx_id);
         println!("[TM::commit] Committed tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
     }
 
-    /// Aborts a transaction.
-    pub fn abort(&self, tx_id: TransactionId) {
-        // For now, aborting is the same as committing as we don't have UNDO logs yet.
+    pub fn get_last_lsn(&self, tx_id: TransactionId) -> Option<Lsn> {
+        self.state.last_lsns.lock().unwrap().get(&tx_id).cloned()
+    }
+
+    pub fn set_last_lsn(&self, tx_id: TransactionId, lsn: Lsn) {
+        self.state.last_lsns.lock().unwrap().insert(tx_id, lsn);
+    }
+
+    /// Aborts a transaction, rolling back its changes.
+    pub fn abort(&self, tx_id: TransactionId, wal: &mut WalManager, bpm: &Arc<BufferPoolManager>) -> std::io::Result<()> {
+        println!("[TM::abort] Aborting tx_id: {}", tx_id);
+
+        let mut last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+
+        while last_lsn > 0 {
+            // In a real system, we would have a WAL iterator or a way to read a specific LSN.
+            // Here, we have to do a full scan, which is very inefficient.
+            // This is a simplified demonstration.
+            let (record, prev_lsn) = wal.read_record(last_lsn)?;
+
+            if let Some(rec) = record {
+                match rec {
+                    WalRecord::InsertTuple { page_id, item_id } => {
+                        let page_guard = bpm.acquire_page(page_id)?;
+                        let mut page = page_guard.write();
+                        // To "undo" an insert, we can simply mark the tuple header as invalid
+                        // so it's not visible to anyone. A real system might have a more
+                        // complex way to reclaim the space.
+                        if let Some(header) = page.get_tuple_header_mut(item_id) {
+                            header.xmax = tx_id; // Mark as deleted by this aborting tx
+                        }
+                    }
+                    WalRecord::DeleteTuple { page_id, item_id } => {
+                        let page_guard = bpm.acquire_page(page_id)?;
+                        let mut page = page_guard.write();
+                        // To "undo" a delete, we reset xmax.
+                        if let Some(header) = page.get_tuple_header_mut(item_id) {
+                            if header.xmax == tx_id {
+                                header.xmax = 0;
+                            }
+                        }
+                    }
+                    WalRecord::UpdateTuple { page_id, item_id, old_data } => {
+                        let page_guard = bpm.acquire_page(page_id)?;
+                        let mut page = page_guard.write();
+                        // To "undo" an update, we restore the old data.
+                        if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
+                            tuple.copy_from_slice(&old_data);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            last_lsn = prev_lsn;
+        }
+
         self.state.active_transactions.lock().unwrap().remove(&tx_id);
+        self.state.last_lsns.lock().unwrap().remove(&tx_id);
+
+        let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+        wal.log(tx_id, prev_lsn, &WalRecord::Abort)?;
+
         println!("[TM::abort] Aborted tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
+        Ok(())
     }
 
     /// Creates a new snapshot of the current database state.
-    pub fn create_snapshot(&self, current_tx_id: TransactionId) -> Snapshot {
+    pub fn create_snapshot(&self, _current_tx_id: TransactionId) -> Snapshot {
         let active_txns = self.state.active_transactions.lock().unwrap();
         
-        let xmin = active_txns.iter()
-            .filter(|&&tx| tx != current_tx_id)
-            .min()
-            .cloned()
-            .unwrap_or_else(|| self.state.next_transaction_id.load(Ordering::SeqCst));
+        // xmin is the lowest transaction ID that is currently active.
+        // Any transaction with an ID less than xmin is guaranteed to be either committed or aborted.
+        let xmin = active_txns.iter().min().cloned().unwrap_or_else(|| self.state.next_transaction_id.load(Ordering::SeqCst));
 
+        // xmax is the next transaction ID to be allocated. Any transaction with this ID or
+        // higher has not yet started and is therefore not visible.
         let xmax = self.state.next_transaction_id.load(Ordering::SeqCst);
-        
+
         let snapshot = Snapshot {
             xmin,
             xmax,
             active_transactions: Arc::new(active_txns.clone()),
         };
-        println!("[TM::create_snapshot] Created for tx {}: {:?}", current_tx_id, snapshot);
+        println!("[TM::create_snapshot] Created for tx {}: {:?}", _current_tx_id, snapshot);
         snapshot
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -112,10 +175,10 @@ mod tests {
 
     #[test]
     fn test_transaction_manager_snapshot() {
-        let tm = TransactionManager::new();
-        
+        let tm = TransactionManager::new(0);
+
         // No active transactions
-        let snapshot1 = tm.create_snapshot();
+        let snapshot1 = tm.create_snapshot(0);
         assert_eq!(snapshot1.xmin, 0);
         assert_eq!(snapshot1.xmax, 0);
         assert!(snapshot1.active_transactions.is_empty());
@@ -123,8 +186,8 @@ mod tests {
         // Start some transactions
         let tx1 = tm.begin(); // 0
         let tx2 = tm.begin(); // 1
-        
-        let snapshot2 = tm.create_snapshot();
+
+        let snapshot2 = tm.create_snapshot(tx2);
         assert_eq!(snapshot2.xmin, 0); // Smallest active is 0
         assert_eq!(snapshot2.xmax, 2); // Next tx id is 2
         assert!(snapshot2.active_transactions.contains(&0));
@@ -133,7 +196,7 @@ mod tests {
 
         tm.commit(tx1);
 
-        let snapshot3 = tm.create_snapshot();
+        let snapshot3 = tm.create_snapshot(tx2);
         assert_eq!(snapshot3.xmin, 1); // Smallest active is now 1
         assert_eq!(snapshot3.xmax, 2);
         assert!(!snapshot3.active_transactions.contains(&0));
@@ -161,3 +224,7 @@ mod tests {
         assert!(snapshot.is_visible(19));
     }
 }
+
+
+
+

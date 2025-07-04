@@ -35,26 +35,27 @@ impl Pager {
     /// it returns a new, empty page.
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
         println!("[Pager::read_page] Reading page_id: {}", page_id);
-        let mut page = Page::new(page_id);
+        let mut page = Page::new(page_id); // It already initializes the header
         if page_id >= self.num_pages {
-            println!("[Pager::read_page] Page {} is new, returning empty page.", page_id);
+            println!("[Pager::read_page] Page {} is new, returning initialized page.", page_id);
             return Ok(page);
         }
 
         let offset = page_id as u64 * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         
-        match self.file.read(&mut page.data) {
-            Ok(n) if n < PAGE_SIZE => {
-                println!("[Pager::read_page] Read {} bytes (less than page size), zeroing rest.", n);
-                for i in n..PAGE_SIZE {
-                    page.data[i] = 0;
-                }
-            }
-            Ok(_) => {
-                 println!("[Pager::read_page] Successfully read page {}", page_id);
-            }
-            Err(e) => return Err(e),
+        let bytes_read = self.file.read(&mut page.data)?;
+        if bytes_read == 0 {
+            // This case can happen if the file was extended but not written to yet.
+            // The page is already initialized by Page::new, so we are good.
+            println!("[Pager::read_page] Read 0 bytes for page {}, using fresh initialized page.", page_id);
+        } else if bytes_read < PAGE_SIZE {
+             println!("[Pager::read_page] Read {} bytes (less than page size), zeroing rest.", bytes_read);
+             for i in bytes_read..PAGE_SIZE {
+                page.data[i] = 0;
+             }
+        } else {
+             println!("[Pager::read_page] Successfully read full page {}", page_id);
         }
 
         Ok(page)
