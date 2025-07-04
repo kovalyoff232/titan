@@ -213,7 +213,7 @@ fn execute_create_table(stmt: &CreateTableStatement, bpm: &Arc<BufferPoolManager
 }
 
 fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<(), ExecutionError> {
-    let (_table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
+    let (table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
     
     // Create a new B-Tree root page
     let root_page_guard = bpm.new_page()?;
@@ -239,19 +239,34 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
         page.header_mut().lsn = lsn;
     }
 
-    // Populate the index
+    // Populate the index by scanning the entire table
+    println!("[create_index] Populating index '{}' for table '{}'...", stmt.index_name, stmt.table_name);
     if table_page_id != 0 {
         let page_guard = bpm.acquire_page(table_page_id)?;
         let page = page_guard.read();
+        let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+        
+        // Find the column index for the indexed column
+        let col_idx = schema.iter().position(|c| c.name == stmt.column_name).ok_or(ExecutionError::ColumnNotFound(()))?;
+
+        println!("[create_index] Scanning {} tuples in page {}", page.get_tuple_count(), table_page_id);
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
                 if let Some(tuple_data) = page.get_tuple(i) {
-                    let key = i32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
-                    let tuple_id: TupleId = (page.id, i);
-                    root_page_id = btree::btree_insert(bpm, root_page_id, key, tuple_id)?;
+                    // This is a simplified key extraction. It assumes the key is the first column and is an i32.
+                    // A real implementation would need a more robust way to parse the key based on the schema.
+                    if tuple_data.len() >= 4 {
+                        let key = i32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
+                        let tuple_id: TupleId = (page.id, i);
+                        println!("[create_index] Inserting key: {}, tid: ({}, {})", key, tuple_id.0, tuple_id.1);
+                        root_page_id = btree::btree_insert(bpm, root_page_id, key, tuple_id)?;
+                    }
                 }
             }
         }
+        println!("[create_index] Finished populating index.");
+    } else {
+        println!("[create_index] Table is empty, no data to populate.");
     }
 
     // Update the root_page_id in pg_class

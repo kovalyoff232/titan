@@ -133,69 +133,95 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                     }
                 };
 
+                let mut last_result: Option<ExecuteResult> = None;
+                let mut tx_already_ended = false;
+
                 for stmt in stmts {
+                    // If a transaction hasn't been started manually with BEGIN, start one now.
+                    // This creates an implicit transaction for single statements.
                     if !in_transaction {
                         tx_id = tm.begin();
                         in_transaction = true;
-                        println!("[handle_client] Started a new transaction with tx_id: {}", tx_id);
+                        println!("[handle_client] Started implicit transaction with tx_id: {}", tx_id);
                     }
 
                     println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
                     let snapshot = tm.create_snapshot(tx_id);
                     let result = executor::execute(&stmt, &bpm, &tm, &wal, tx_id, &snapshot);
-                    
-                    let mut tx_ended = false;
-                    if let Ok(ExecuteResult::Ddl) = result {
-                        match stmt {
-                            parser::Statement::Commit => {
-                                tm.commit(tx_id);
-                                bpm.flush_all_pages()?;
-                                in_transaction = false;
-                                tx_ended = true;
-                                send_command_complete(&mut stream, "COMMIT")?;
-                            }
-                            parser::Statement::Rollback => {
-                                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
-                                in_transaction = false;
-                                tx_ended = true;
-                                send_command_complete(&mut stream, "ROLLBACK")?;
-                            }
-                            _ => {}
+
+                    // Handle transaction control statements explicitly
+                    match &stmt {
+                        parser::Statement::Begin => {
+                            // The transaction was already started implicitly above.
+                            // We just need to send the response.
+                            send_command_complete(&mut stream, "BEGIN")?;
+                            last_result = None; // Don't send another response below
+                            continue;
                         }
+                        parser::Statement::Commit => {
+                            tm.commit(tx_id);
+                            bpm.flush_all_pages()?;
+                            in_transaction = false;
+                            tx_already_ended = true;
+                            send_command_complete(&mut stream, "COMMIT")?;
+                            last_result = None; // Don't send another response below
+                            continue;
+                        }
+                        parser::Statement::Rollback => {
+                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
+                            in_transaction = false;
+                            tx_already_ended = true;
+                            send_command_complete(&mut stream, "ROLLBACK")?;
+                            last_result = None; // Don't send another response below
+                            continue;
+                        }
+                        _ => {}
                     }
 
-                    if !tx_ended {
-                         match result {
-                            Ok(execute_result) => {
-                                println!("[handle_client] Execution successful: {:?}", execute_result);
-                                match execute_result {
-                                    ExecuteResult::Ddl => send_command_complete(&mut stream, "DDL")?,
-                                    ExecuteResult::Insert(count) => send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?,
-                                    ExecuteResult::Delete(count) => send_command_complete(&mut stream, &format!("DELETE {}", count))?,
-                                    ExecuteResult::Update(count) => send_command_complete(&mut stream, &format!("UPDATE {}", count))?,
-                                    ExecuteResult::ResultSet(ResultSet { columns, rows }) => {
-                                        send_row_description(&mut stream, &columns)?;
-                                        let row_count = rows.len();
-                                        for row in &rows {
-                                            send_data_row(&mut stream, &row)?;
-                                        }
-                                        send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("[handle_client] Execution failed: {:?}", e);
-                                send_error_response(&mut stream, &format!("Execution failed: {:?}", e))?;
+                    // Handle the result of other statements
+                    match result {
+                        Ok(res) => {
+                            last_result = Some(res);
+                        }
+                        Err(e) => {
+                            println!("[handle_client] Execution failed: {:?}", e);
+                            send_error_response(&mut stream, &format!("Execution failed: {:?}", e))?;
+                            // Abort the transaction on any error
+                            if in_transaction {
                                 tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                                 in_transaction = false;
+                                tx_already_ended = true;
                             }
+                            last_result = None;
+                            break; // Stop processing further statements in the batch
                         }
                     }
                 }
-                
-                if !in_transaction {
-                    // Auto-commit if not in an explicit transaction block
+
+                // Send the response for the *last* statement in the batch, if any.
+                if let Some(execute_result) = last_result {
+                    match execute_result {
+                        ExecuteResult::Ddl => send_command_complete(&mut stream, "DDL")?,
+                        ExecuteResult::Insert(count) => send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?,
+                        ExecuteResult::Delete(count) => send_command_complete(&mut stream, &format!("DELETE {}", count))?,
+                        ExecuteResult::Update(count) => send_command_complete(&mut stream, &format!("UPDATE {}", count))?,
+                        ExecuteResult::ResultSet(ResultSet { columns, rows }) => {
+                            send_row_description(&mut stream, &columns)?;
+                            let row_count = rows.len();
+                            for row in &rows {
+                                send_data_row(&mut stream, &row)?;
+                            }
+                            send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
+                        }
+                    }
+                }
+
+                // If the transaction is still active and wasn't explicitly committed/rolled back,
+                // it means it was an implicit, single-statement transaction that should be committed.
+                if in_transaction && !tx_already_ended {
+                    println!("[handle_client] Committing implicit transaction with tx_id: {}", tx_id);
                     tm.commit(tx_id);
+                    in_transaction = false;
                 }
 
                 send_ready_for_query(&mut stream)?;
