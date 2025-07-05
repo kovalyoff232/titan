@@ -1,4 +1,4 @@
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, SimpleQueryMessage};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
@@ -7,7 +7,44 @@ use tempfile::{tempdir, TempDir};
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(6000);
 
-pub fn setup_server_and_client(test_name: &str) -> (TempDir, Child, Client, u16) {
+/// A wrapper around the postgres::Client that ensures the server process
+/// is killed when the client goes out of scope.
+pub struct TestClient {
+    pub client: Client,
+    pub addr: String,
+    _server_process: Child, // The underscore prevents warnings about it being unused
+    _dir: TempDir,          // Ensures the temp directory is cleaned up
+}
+
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        // Best effort to kill the server process.
+        let _ = self._server_process.kill();
+    }
+}
+
+impl TestClient {
+    /// Executes a simple query and returns the results as a vector of strings.
+    pub fn simple_query(&mut self, query: &str) -> Vec<String> {
+        let rows = self.client.simple_query(query).unwrap();
+        rows.into_iter()
+            .filter_map(|msg| {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    Some(
+                        (0..row.len())
+                            .map(|i| row.get(i).unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+pub fn setup_server_and_client(test_name: &str) -> TestClient {
     let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
     let addr = format!("127.0.0.1:{}", port);
     let client_addr = format!("host=localhost port={} user=postgres", port);
@@ -35,6 +72,11 @@ pub fn setup_server_and_client(test_name: &str) -> (TempDir, Child, Client, u16)
     thread::sleep(Duration::from_millis(500));
 
     let client = Client::connect(&client_addr, NoTls).unwrap();
-    (dir, server_process, client, port)
+    TestClient {
+        client,
+        addr: client_addr,
+        _server_process: server_process,
+        _dir: dir,
+    }
 }
 
