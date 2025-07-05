@@ -259,7 +259,7 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
                         let key = i32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
                         let tuple_id: TupleId = (page.id, i);
                         println!("[create_index] Inserting key: {}, tid: ({}, {})", key, tuple_id.0, tuple_id.1);
-                        root_page_id = btree::btree_insert(bpm, root_page_id, key, tuple_id)?;
+                        root_page_id = btree::btree_insert(bpm, tm, wm, tx_id, root_page_id, key, tuple_id)?;
                     }
                 }
             }

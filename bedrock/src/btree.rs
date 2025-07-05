@@ -1,9 +1,11 @@
 //! B-Tree index implementation.
 use crate::buffer_pool::BufferPoolManager;
+use crate::transaction::TransactionManager;
+use crate::wal::{WalManager, WalRecord};
 use crate::{Page, PageId, TupleId};
 use std::io;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub type Key = i32;
 
@@ -125,12 +127,20 @@ pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key
     }
 }
 
-pub fn btree_insert(bpm: &Arc<BufferPoolManager>, mut root_page_id: PageId, key: Key, tuple_id: TupleId) -> io::Result<PageId> {
+pub fn btree_insert(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    mut root_page_id: PageId,
+    key: Key,
+    tuple_id: TupleId,
+) -> io::Result<PageId> {
     let root_page_guard = bpm.acquire_page(root_page_id)?;
     if root_page_guard.read().btree_header().num_cells as usize == LEAF_MAX_CELLS {
         let new_page_guard = bpm.new_page()?;
         let new_page_id = new_page_guard.read().id;
-        
+
         let median_key = {
             let mut root_page = root_page_guard.write();
             let mut new_page = new_page_guard.write();
@@ -143,7 +153,10 @@ pub fn btree_insert(bpm: &Arc<BufferPoolManager>, mut root_page_id: PageId, key:
             let mut new_root_page = new_root_page_guard.write();
             new_root_page.as_btree_internal_page();
             *new_root_page.right_child_mut() = new_page_id;
-            *new_root_page.internal_cell_mut(0) = InternalCell { key: median_key, page_id: root_page_id };
+            *new_root_page.internal_cell_mut(0) = InternalCell {
+                key: median_key,
+                page_id: root_page_id,
+            };
             new_root_page.btree_header_mut().num_cells = 1;
         }
 
@@ -155,10 +168,16 @@ pub fn btree_insert(bpm: &Arc<BufferPoolManager>, mut root_page_id: PageId, key:
             leaf_insert(&mut new_page, key, tuple_id);
         }
 
+        // Log changes to WAL
+        log_btree_page(tm, wm, tx_id, &root_page_guard.read())?;
+        log_btree_page(tm, wm, tx_id, &new_page_guard.read())?;
+        log_btree_page(tm, wm, tx_id, &new_root_page_guard.read())?;
+
         root_page_id = new_root_page_id;
     } else {
         let mut root_page = root_page_guard.write();
         leaf_insert(&mut root_page, key, tuple_id);
+        log_btree_page(tm, wm, tx_id, &root_page)?;
     }
     Ok(root_page_id)
 }
@@ -193,4 +212,24 @@ fn leaf_insert(page: &mut Page, key: Key, tuple_id: TupleId) {
 
     *page.leaf_cell_mut(insert_idx) = LeafCell { key, tuple_id };
     page.btree_header_mut().num_cells += 1;
+}
+
+fn log_btree_page(
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    page: &Page,
+) -> io::Result<()> {
+    let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+    let lsn = wm.lock().unwrap().log(
+        tx_id,
+        prev_lsn,
+        &WalRecord::BTreePage {
+            tx_id,
+            page_id: page.id,
+            data: page.data.to_vec(),
+        },
+    )?;
+    tm.set_last_lsn(tx_id, lsn);
+    Ok(())
 }
