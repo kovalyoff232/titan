@@ -206,7 +206,7 @@ pub fn execute(
 ) -> Result<ExecuteResult, ExecutionError> {
     match stmt {
         Statement::Select(select_stmt) => {
-            execute_select(select_stmt, bpm, lm, tx_id, snapshot, false).map(ExecuteResult::ResultSet)
+            execute_select(select_stmt, bpm, lm, tx_id, snapshot).map(ExecuteResult::ResultSet)
         }
         Statement::CreateTable(create_stmt) => {
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
@@ -701,39 +701,55 @@ fn execute_update(
     let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
 
-    // Create a SELECT statement to find the rows to update.
-    let select_stmt = SelectStatement {
-        select_list: vec![SelectItem::Wildcard],
-        from: vec![TableReference::Table {
-            name: stmt.table_name.clone(),
-        }],
-        where_clause: stmt.where_clause.clone(),
-        for_update: true,
-    };
+    // 1. Scan, filter, and collect rows to be updated.
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let rows_to_update_info: Vec<_> = all_rows
+        .into_iter()
+        .filter(|(_, _, parsed_tuple)| {
+            if let Some(where_clause) = &stmt.where_clause {
+                evaluate_expr_for_row(where_clause, parsed_tuple).unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
 
-    // Execute the SELECT with FOR UPDATE to acquire locks.
-    let result_set = execute_select(&select_stmt, bpm, lm, tx_id, snapshot, true)?;
+    // 2. Now, lock the tuples and perform the update.
+    for (page_id, item_id, old_parsed_tuple) in rows_to_update_info {
+        // Lock the specific tuple we intend to update.
+        lm.lock(
+            tx_id,
+            LockableResource::Tuple((page_id, item_id)),
+            LockMode::Exclusive,
+        )?;
 
-    let result_set = execute_select(&select_stmt, bpm, lm, tx_id, snapshot, true)?;
+        let page_guard = bpm.acquire_page(page_id)?;
+        let mut page = page_guard.write();
 
-    for row in result_set.rows {
-        let mut old_parsed_tuple = HashMap::new();
-        for (i, col) in schema.iter().enumerate() {
-            let val = match col.type_id {
-                23 => LiteralValue::Number(row[i].clone()), // INT
-                25 => LiteralValue::String(row[i].clone()), // TEXT
-                _ => LiteralValue::String(row[i].clone()),
-            };
-            old_parsed_tuple.insert(col.name.clone(), val);
+        // Re-check visibility and check for write conflicts after acquiring the lock.
+        // The tuple must still be visible, and its xmax must be 0.
+        // If xmax is not 0, it means another transaction has deleted or updated this tuple
+        // since our snapshot was taken, which is a serialization conflict.
+        if !page.is_visible(snapshot, tx_id, item_id)
+            || page
+                .get_tuple_header_mut(item_id)
+                .map_or(true, |h| h.xmax != 0)
+        {
+            // Unlock and abort.
+            lm.unlock_all(tx_id);
+            println!("[UPDATE] Serialization failure for tx_id {} on tuple ({}, {}). Tuple already modified.", tx_id, page_id, item_id);
+            return Err(ExecutionError::SerializationFailure);
         }
 
-        let mut new_tuple_data = Vec::new();
+
+        // Construct the new tuple data.
         let mut new_parsed_tuple = old_parsed_tuple.clone();
         for (col_name, expr) in &stmt.assignments {
             let new_val = evaluate_expr_for_row_to_val(expr, &old_parsed_tuple)?;
             new_parsed_tuple.insert(col_name.clone(), new_val);
         }
 
+        let mut new_tuple_data = Vec::new();
         for col in &schema {
             if let Some(val) = new_parsed_tuple.get(&col.name) {
                 match val {
@@ -748,57 +764,38 @@ fn execute_update(
             }
         }
 
-        let mut current_page_id_for_update = first_page_id;
-        'page_loop: while current_page_id_for_update != INVALID_PAGE_ID {
-            let page_guard = bpm.acquire_page(current_page_id_for_update)?;
-            let mut page = page_guard.write();
-            for i in 0..page.get_tuple_count() {
-                if page.is_visible(snapshot, tx_id, i) {
-                    if let Some(tuple_data) = page.get_tuple(i) {
-                        let current_parsed_tuple = parse_tuple(tuple_data, &schema);
-                        if current_parsed_tuple == old_parsed_tuple {
-                            // Found the exact tuple version we locked. Now update it.
-                            let old_tuple_raw = page.get_raw_tuple(i).unwrap().to_vec();
+        // Mark the old tuple as deleted by the current transaction.
+        let old_tuple_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
+        if let Some(header) = page.get_tuple_header_mut(item_id) {
+            header.xmax = tx_id;
+        }
 
-                            if let Some(header) = page.get_tuple_header_mut(i) {
-                                if header.xmax != 0 {
-                                    // This version was already deleted by another transaction,
-                                    // which indicates a write-write conflict.
-                                    return Err(ExecutionError::SerializationFailure);
-                                }
-                                header.xmax = tx_id;
-                            }
-
-                            if let Some(new_item_id) = page.add_tuple(&new_tuple_data, tx_id, 0) {
-                                rows_affected += 1;
-                                // Log change to WAL
-                                let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-                                let lsn = wm.lock().unwrap().log(
-                                    tx_id,
-                                    prev_lsn,
-                                    &WalRecord::UpdateTuple {
-                                        tx_id,
-                                        page_id: current_page_id_for_update,
-                                        item_id: new_item_id,
-                                        old_data: old_tuple_raw,
-                                    },
-                                )?;
-                                tm.set_last_lsn(tx_id, lsn);
-                                page.header_mut().lsn = lsn;
-                            } else {
-                                // Not enough space on the page. This is a conflict.
-                                // Revert xmax and signal failure.
-                                if let Some(header) = page.get_tuple_header_mut(i) {
-                                    header.xmax = 0;
-                                }
-                                return Err(ExecutionError::SerializationFailure);
-                            }
-                            break 'page_loop;
-                        }
-                    }
-                }
+        // Try to insert the new version of the tuple.
+        if let Some(new_item_id) = page.add_tuple(&new_tuple_data, tx_id, 0) {
+            rows_affected += 1;
+            // Log the update to the WAL.
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(
+                tx_id,
+                prev_lsn,
+                &WalRecord::UpdateTuple {
+                    tx_id,
+                    page_id,
+                    item_id: new_item_id,
+                    old_data: old_tuple_raw,
+                },
+            )?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
+        } else {
+            // Not enough space on the page for the new tuple.
+            // We must roll back the change to the old tuple's header and abort.
+            if let Some(header) = page.get_tuple_header_mut(item_id) {
+                header.xmax = 0;
             }
-            current_page_id_for_update = page.header().next_page_id;
+            // Unlock and abort.
+            lm.unlock_all(tx_id);
+            return Err(ExecutionError::SerializationFailure);
         }
     }
 
@@ -859,6 +856,10 @@ fn execute_delete(
         }
 
         if let Some(header) = page.get_tuple_header_mut(item_id) {
+            if header.xmax != 0 {
+                // Already deleted by another transaction, this is a conflict.
+                return Err(ExecutionError::SerializationFailure);
+            }
             header.xmax = tx_id;
             rows_affected += 1;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
@@ -885,7 +886,6 @@ fn execute_select(
     lm: &Arc<LockManager>,
     tx_id: u32,
     snapshot: &Snapshot,
-    for_update: bool,
 ) -> Result<ResultSet, ExecutionError> {
     if stmt.from.is_empty() {
         return Err(ExecutionError::GenericError(())); // SELECT without FROM is not supported
@@ -917,13 +917,15 @@ fn execute_select(
     let (left_oid, left_page_id) = find_table(&left_table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(()))?;
     let left_schema = get_table_schema(bpm, left_oid, tx_id, snapshot)?;
-    let left_rows = scan_table(bpm, lm, left_page_id, &left_schema, tx_id, snapshot, for_update)?;
+    let left_rows_with_ids = scan_table(bpm, lm, left_page_id, &left_schema, tx_id, snapshot, stmt.for_update)?;
+    let left_rows: Vec<HashMap<String, LiteralValue>> = left_rows_with_ids.into_iter().map(|(_, _, row)| row).collect();
 
     let (right_schema, right_rows) = if let Some(right_table_name_val) = &right_table_name {
         let (right_oid, right_page_id) = find_table(right_table_name_val, bpm, tx_id, snapshot)?
             .ok_or_else(|| ExecutionError::TableNotFound(()))?;
         let schema = get_table_schema(bpm, right_oid, tx_id, snapshot)?;
-        let rows = scan_table(bpm, lm, right_page_id, &schema, tx_id, snapshot, for_update)?;
+        let rows_with_ids = scan_table(bpm, lm, right_page_id, &schema, tx_id, snapshot, stmt.for_update)?;
+        let rows: Vec<HashMap<String, LiteralValue>> = rows_with_ids.into_iter().map(|(_, _, row)| row).collect();
         (Some(schema), Some(rows))
     } else {
         (None, None)
@@ -1207,7 +1209,7 @@ fn scan_table(
     tx_id: u32,
     snapshot: &Snapshot,
     for_update: bool,
-) -> Result<Vec<HashMap<String, LiteralValue>>, ExecutionError> {
+) -> Result<Vec<(PageId, u16, HashMap<String, LiteralValue>)>, ExecutionError> {
     let mut rows = Vec::new();
     if first_page_id == INVALID_PAGE_ID {
         return Ok(rows);
@@ -1219,14 +1221,12 @@ fn scan_table(
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
                 if for_update {
-                    lm.lock(
-                        tx_id,
-                        LockableResource::Tuple((current_page_id, i)),
-                        LockMode::ReadForUpdate,
-                    )?;
+                    // Lock the tuple before reading it. This will block if another transaction
+                    // holds an exclusive lock.
+                    lm.lock(tx_id, LockableResource::Tuple((current_page_id, i)), LockMode::Exclusive)?;
                 }
                 if let Some(tuple_data) = page.get_tuple(i) {
-                    rows.push(parse_tuple(tuple_data, schema));
+                    rows.push((current_page_id, i, parse_tuple(tuple_data, schema)));
                 }
             }
         }

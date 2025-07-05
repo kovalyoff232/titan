@@ -21,12 +21,13 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Resul
     Ok(())
 }
 
-fn send_error_response(stream: &mut TcpStream, message: &str) -> io::Result<()> {
+fn send_error_response(stream: &mut TcpStream, message: &str, code: &str) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_u8(b'S'); // Severity
     data.put_slice(b"ERROR\0");
     data.put_u8(b'C'); // Code
-    data.put_slice(b"08P01\0"); // protocol_violation
+    data.put_slice(code.as_bytes());
+    data.put_u8(b'\0');
     data.put_u8(b'M'); // Message
     data.put_slice(message.as_bytes());
     data.put_u8(b'\0');
@@ -90,7 +91,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
     let protocol_version = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
     println!("[handle_client] Protocol version: {}", protocol_version);
     if protocol_version != 196608 { // 3.0
-        send_error_response(&mut stream, "Unsupported protocol version")?;
+        send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
         return Ok(());
     }
     
@@ -130,7 +131,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                     Ok(s) => s,
                     Err(e) => {
                         println!("[handle_client] Parsing failed: {:?}", e);
-                        send_error_response(&mut stream, &format!("Parsing failed: {:?}", e))?;
+                        send_error_response(&mut stream, &format!("Parsing failed: {:?}", e), "42601")?;
                         send_ready_for_query(&mut stream)?;
                         continue;
                     }
@@ -139,86 +140,73 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                 let mut last_result: Option<ExecuteResult> = None;
                 
                 for stmt in stmts {
-                    const MAX_RETRIES: u32 = 3;
-                    let mut retries = 0;
-                    loop {
-                        if !in_transaction {
-                            tx_id = tm.begin();
-                            in_transaction = true;
-                            println!("[handle_client] Started transaction with tx_id: {}", tx_id);
+                    if !in_transaction {
+                        tx_id = tm.begin();
+                        in_transaction = true;
+                        println!("[handle_client] Started transaction with tx_id: {}", tx_id);
+                    }
+
+                    println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
+                    let snapshot = tm.create_snapshot(tx_id);
+                    let result = executor::execute(&stmt, &bpm, &tm, &lm, &wal, tx_id, &snapshot);
+
+                    // Handle transaction control statements explicitly
+                    match &stmt {
+                        parser::Statement::Begin => {
+                            in_explicit_transaction = true;
+                            send_command_complete(&mut stream, "BEGIN")?;
+                            last_result = None; 
+                            continue; // Continue to next statement in the query string
                         }
-
-                        println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
-                        let snapshot = tm.create_snapshot(tx_id);
-                        let result = executor::execute(&stmt, &bpm, &tm, &lm, &wal, tx_id, &snapshot);
-
-                        // Handle transaction control statements explicitly
-                        match &stmt {
-                            parser::Statement::Begin => {
-                                in_explicit_transaction = true;
-                                send_command_complete(&mut stream, "BEGIN")?;
-                                last_result = None; 
-                                break; // Exit retry loop for BEGIN
-                            }
-                            parser::Statement::Commit => {
-                                tm.commit(tx_id);
-                                lm.unlock_all(tx_id);
-                                bpm.flush_all_pages()?;
-                                in_transaction = false;
-                                in_explicit_transaction = false;
-                                send_command_complete(&mut stream, "COMMIT")?;
-                                last_result = None; 
-                                break; // Exit retry loop for COMMIT
-                            }
-                            parser::Statement::Rollback => {
-                                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
-                                lm.unlock_all(tx_id);
-                                in_transaction = false;
-                                in_explicit_transaction = false;
-                                send_command_complete(&mut stream, "ROLLBACK")?;
-                                last_result = None; 
-                                break; // Exit retry loop for ROLLBACK
-                            }
-                            _ => {}
+                        parser::Statement::Commit => {
+                            tm.commit(tx_id);
+                            lm.unlock_all(tx_id);
+                            bpm.flush_all_pages()?;
+                            in_transaction = false;
+                            in_explicit_transaction = false;
+                            send_command_complete(&mut stream, "COMMIT")?;
+                            last_result = None; 
+                            continue;
                         }
+                        parser::Statement::Rollback => {
+                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
+                            lm.unlock_all(tx_id);
+                            in_transaction = false;
+                            in_explicit_transaction = false;
+                            send_command_complete(&mut stream, "ROLLBACK")?;
+                            last_result = None; 
+                            continue;
+                        }
+                        _ => {}
+                    }
 
-                        // Handle the result of other statements
-                        match result {
-                            Ok(res) => {
-                                last_result = Some(res);
-                                break; // Success, exit retry loop
-                            }
-                            Err(executor::ExecutionError::SerializationFailure) => {
-                                println!("[handle_client] Serialization failure for tx_id: {}. Retrying...", tx_id);
+                    // Handle the result of other statements
+                    match result {
+                        Ok(res) => {
+                            last_result = Some(res);
+                        }
+                        Err(executor::ExecutionError::SerializationFailure) => {
+                            println!("[handle_client] Serialization failure for tx_id: {}.", tx_id);
+                            send_error_response(&mut stream, "Serialization failure", "40001")?;
+                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
+                            lm.unlock_all(tx_id);
+                            in_transaction = false;
+                            in_explicit_transaction = false;
+                            last_result = None;
+                            break; // Abort processing further statements in the query string
+                        }
+                        Err(e) => {
+                            println!("[handle_client] Execution failed: {:?}", e);
+                            send_error_response(&mut stream, &format!("Execution failed: {:?}", e), "XX000")?;
+                            if in_transaction {
                                 tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                                 lm.unlock_all(tx_id);
                                 in_transaction = false;
-                                retries += 1;
-                                if retries >= MAX_RETRIES {
-                                    send_error_response(&mut stream, "Transaction failed after multiple retries due to serialization conflicts.")?;
-                                    last_result = None;
-                                    break;
-                                }
-                                // Small delay before retrying
-                                std::thread::sleep(std::time::Duration::from_millis(10 * retries as u64));
+                                in_explicit_transaction = false;
                             }
-                            Err(e) => {
-                                println!("[handle_client] Execution failed: {:?}", e);
-                                send_error_response(&mut stream, &format!("Execution failed: {:?}", e))?;
-                                if in_transaction {
-                                    tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                                    lm.unlock_all(tx_id);
-                                    in_transaction = false;
-                                    in_explicit_transaction = false;
-                                }
-                                last_result = None;
-                                break; // Exit retry loop on other errors
-                            }
+                            last_result = None;
+                            break; // Abort processing further statements
                         }
-                    }
-                    if last_result.is_none() && in_explicit_transaction {
-                        // An error occurred inside a BEGIN block, so we break the outer loop
-                        break;
                     }
                 }
 

@@ -3,50 +3,42 @@
 use crate::page::TransactionId;
 use crate::TupleId;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
-/// Represents the different modes of locking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockMode {
     Shared,
     Exclusive,
-    ReadForUpdate,
 }
 
-/// Represents a resource that can be locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockableResource {
-    Table(u32), // OID of the table
+    Table(u32),
     Tuple(TupleId),
 }
 
-/// A request for a lock by a transaction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LockRequest {
     tx_id: TransactionId,
     mode: LockMode,
-    granted: bool,
 }
 
-/// A queue of lock requests for a specific resource.
 #[derive(Debug, Default)]
-struct LockRequestQueue {
-    requests: VecDeque<LockRequest>,
-    // To avoid iterating the whole queue, we can cache the number of granted locks of each type.
-    shared_granted: usize,
-    exclusive_granted: bool,
+struct LockQueue {
+    queue: VecDeque<LockRequest>,
+    sharing: HashSet<TransactionId>,
+    exclusive: Option<TransactionId>,
 }
 
-/// The main lock manager struct.
+#[derive(Debug, Default)]
+struct WaitQueue {
+    queue: Mutex<LockQueue>,
+    cvar: Condvar,
+}
+
 #[derive(Debug, Default)]
 pub struct LockManager {
-    /// The main table mapping resources to their lock queues.
-    lock_table: Mutex<HashMap<LockableResource, LockRequestQueue>>,
-    /// A condition variable to allow transactions to wait for locks.
-    cvar: Condvar,
-    /// The waits-for graph for deadlock detection.
-    /// Maps a waiting transaction to the set of transactions it's waiting for.
-    waits_for: Mutex<HashMap<TransactionId, HashSet<TransactionId>>>,
+    table: Mutex<HashMap<LockableResource, Arc<WaitQueue>>>,
 }
 
 #[derive(Debug)]
@@ -65,195 +57,106 @@ impl LockManager {
         resource: LockableResource,
         mode: LockMode,
     ) -> Result<(), LockError> {
-        let mut lock_table = self.lock_table.lock().unwrap();
+        let wait_queue = {
+            let mut table = self.table.lock().unwrap();
+            table.entry(resource).or_default().clone()
+        };
 
-        // Check if this transaction already holds a lock.
-        // If so, we might need to upgrade it. For now, we don't support lock upgrades.
-        // We'll just assume a transaction doesn't re-lock a resource it already has.
+        let mut guard = wait_queue.queue.lock().unwrap();
 
-        let queue = lock_table.entry(resource).or_default();
-        queue.requests.push_back(LockRequest {
-            tx_id,
-            mode,
-            granted: false,
-        });
+        if guard.exclusive == Some(tx_id) || guard.sharing.contains(&tx_id) {
+            return Ok(());
+        }
+
+        guard.queue.push_back(LockRequest { tx_id, mode });
 
         loop {
-            // Try to grant locks. This function will handle the logic of checking compatibility.
-            self.try_grant_locks(resource, &mut lock_table);
-
-            // Check if our request was granted.
-            let our_request_granted = lock_table
-                .get(&resource)
-                .and_then(|q| q.requests.iter().find(|r| r.tx_id == tx_id))
-                .map_or(false, |r| r.granted);
-
-            if our_request_granted {
-                self.remove_from_waits_for(tx_id, &mut lock_table);
+            if self.try_acquire(&mut guard, tx_id, mode) {
                 return Ok(());
             }
-
-            // If not granted, we must wait. First, update the waits-for graph and check for deadlocks.
-            self.update_waits_for_graph(tx_id, &lock_table);
-            if self.detect_deadlock(tx_id, &lock_table) {
-                // Deadlock detected. We need to abort this transaction.
-                // Remove its request from the queue.
-                let queue = lock_table.get_mut(&resource).unwrap();
-                queue.requests.retain(|r| r.tx_id != tx_id);
-                if queue.requests.is_empty() {
-                    lock_table.remove(&resource);
-                }
-                self.remove_from_waits_for(tx_id, &mut lock_table);
-                self.cvar.notify_all(); // Wake up others
-                return Err(LockError::Deadlock);
-            }
-
-            // Wait for another transaction to release a lock.
-            lock_table = self.cvar.wait(lock_table).unwrap();
+            // TODO: Deadlock detection
+            guard = wait_queue.cvar.wait(guard).unwrap();
         }
+    }
+
+    fn try_acquire(&self, queue: &mut LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
+        if self.is_locked_for(queue, tx_id, mode) {
+            return false;
+        }
+
+        // Check if it's our turn in the queue
+        if let Some(first) = queue.queue.front() {
+            if first.tx_id != tx_id {
+                return false;
+            }
+        } else {
+            // Should not happen if we just pushed to the queue
+            return false;
+        }
+
+        // Grant the lock
+        queue.queue.pop_front();
+        match mode {
+            LockMode::Shared => {
+                queue.sharing.insert(tx_id);
+            }
+            LockMode::Exclusive => {
+                queue.exclusive = Some(tx_id);
+            }
+        }
+        true
+    }
+
+    fn is_locked_for(&self, queue: &LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
+        match mode {
+            LockMode::Shared => {
+                if let Some(ex_tx) = queue.exclusive {
+                    return ex_tx != tx_id;
+                }
+            }
+            LockMode::Exclusive => {
+                if let Some(ex_tx) = queue.exclusive {
+                    return ex_tx != tx_id;
+                }
+                if !queue.sharing.is_empty()
+                    && (queue.sharing.len() > 1 || !queue.sharing.contains(&tx_id))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn unlock_all(&self, tx_id: TransactionId) {
-        let mut lock_table = self.lock_table.lock().unwrap();
-        let mut affected_resources = Vec::new();
+        let table = self.table.lock().unwrap();
+        let mut to_notify = Vec::new();
 
-        lock_table.retain(|resource, queue| {
-            let old_len = queue.requests.len();
-            queue.requests.retain(|req| req.tx_id != tx_id);
-            if queue.requests.len() < old_len {
-                affected_resources.push(*resource);
+        for (resource, wait_queue) in table.iter() {
+            let mut queue = wait_queue.queue.lock().unwrap();
+            let mut changed = false;
+            if queue.exclusive == Some(tx_id) {
+                queue.exclusive = None;
+                changed = true;
             }
-            !queue.requests.is_empty()
-        });
-
-        self.remove_from_waits_for(tx_id, &mut lock_table);
-
-        for resource in affected_resources {
-            if let Some(queue) = lock_table.get_mut(&resource) {
-                // Recalculate granted counts after unlocks
-                queue.shared_granted = queue
-                    .requests
-                    .iter()
-                    .filter(|r| r.granted && r.mode == LockMode::Shared)
-                    .count();
-                queue.exclusive_granted = queue
-                    .requests
-                    .iter()
-                    .any(|r| r.granted && (r.mode == LockMode::Exclusive || r.mode == LockMode::ReadForUpdate));
+            if queue.sharing.remove(&tx_id) {
+                changed = true;
             }
-            self.try_grant_locks(resource, &mut lock_table);
-        }
+            queue.queue.retain(|req| req.tx_id != tx_id);
 
-        self.cvar.notify_all();
-    }
-
-    fn try_grant_locks(
-        &self,
-        resource: LockableResource,
-        lock_table: &mut HashMap<LockableResource, LockRequestQueue>,
-    ) {
-        let queue = match lock_table.get_mut(&resource) {
-            Some(q) => q,
-            None => return,
-        };
-
-        for req in queue.requests.iter_mut() {
-            if req.granted {
-                continue;
-            }
-
-            // ReadForUpdate acts like an exclusive lock for compatibility checks.
-            let compatible = match req.mode {
-                LockMode::Shared => !queue.exclusive_granted,
-                LockMode::Exclusive | LockMode::ReadForUpdate => queue.shared_granted == 0 && !queue.exclusive_granted,
-            };
-
-            if compatible {
-                req.granted = true;
-                match req.mode {
-                    LockMode::Shared => queue.shared_granted += 1,
-                    LockMode::Exclusive | LockMode::ReadForUpdate => queue.exclusive_granted = true,
-                }
-            } else {
-                // First incompatible request stops further grants to maintain FIFO order.
-                break;
-            }
-        }
-    }
-
-    fn update_waits_for_graph(
-        &self,
-        waiter_tx_id: TransactionId,
-        lock_table: &HashMap<LockableResource, LockRequestQueue>,
-    ) {
-        let mut waits_for = self.waits_for.lock().unwrap();
-        let waiting_for_set = waits_for.entry(waiter_tx_id).or_default();
-        waiting_for_set.clear();
-
-        for queue in lock_table.values() {
-            // Find the request of the waiting transaction
-            if let Some(waiter_req) = queue.requests.iter().find(|r| r.tx_id == waiter_tx_id && !r.granted) {
-                // The waiter is waiting for all transactions that hold an incompatible lock on this resource.
-                for holder in queue.requests.iter().filter(|r| r.granted) {
-                    let compatible = match waiter_req.mode {
-                        LockMode::Shared => holder.mode != LockMode::Exclusive && holder.mode != LockMode::ReadForUpdate,
-                        LockMode::Exclusive | LockMode::ReadForUpdate => false,
-                    };
-                    if !compatible && holder.tx_id != waiter_tx_id {
-                        waiting_for_set.insert(holder.tx_id);
-                    }
-                }
-            }
-        }
-    }
-
-    fn remove_from_waits_for(
-        &self,
-        tx_id: TransactionId,
-        _lock_table: &mut HashMap<LockableResource, LockRequestQueue>,
-    ) {
-        let mut waits_for = self.waits_for.lock().unwrap();
-        waits_for.remove(&tx_id);
-        for (_, waiting_set) in waits_for.iter_mut() {
-            waiting_set.remove(&tx_id);
-        }
-    }
-
-    fn detect_deadlock(
-        &self,
-        start_tx_id: TransactionId,
-        _lock_table: &HashMap<LockableResource, LockRequestQueue>,
-    ) -> bool {
-        let waits_for = self.waits_for.lock().unwrap();
-        let mut visited = HashSet::new();
-        let mut path = HashSet::new();
-        self.dfs_detect(start_tx_id, &waits_for, &mut visited, &mut path)
-    }
-
-    fn dfs_detect(
-        &self,
-        current_tx_id: TransactionId,
-        waits_for: &HashMap<TransactionId, HashSet<TransactionId>>,
-        visited: &mut HashSet<TransactionId>,
-        path: &mut HashSet<TransactionId>,
-    ) -> bool {
-        visited.insert(current_tx_id);
-        path.insert(current_tx_id);
-
-        if let Some(waits_for_set) = waits_for.get(&current_tx_id) {
-            for &next_tx_id in waits_for_set {
-                if path.contains(&next_tx_id) {
-                    return true; // Cycle detected
-                }
-                if !visited.contains(&next_tx_id) {
-                    if self.dfs_detect(next_tx_id, waits_for, visited, path) {
-                        return true;
-                    }
-                }
+            if changed {
+                to_notify.push(resource.clone());
             }
         }
 
-        path.remove(&current_tx_id);
-        false
+        // We must release the table lock before notifying
+        drop(table);
+
+        for resource in to_notify {
+            let table = self.table.lock().unwrap();
+            if let Some(wait_queue) = table.get(&resource) {
+                wait_queue.cvar.notify_all();
+            }
+        }
     }
 }
