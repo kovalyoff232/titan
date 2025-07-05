@@ -4,6 +4,8 @@ use crate::{PageId, PAGE_SIZE, transaction::Snapshot};
 pub type TransactionId = u32;
 pub type CommandId = u32;
 
+pub const INVALID_PAGE_ID: PageId = 0;
+
 /// The header of a page on disk.
 /// This structure is laid out in memory exactly as it is on disk.
 #[repr(C)]
@@ -18,8 +20,8 @@ pub struct PageHeaderData {
     pub lower_offset: u16,
     /// Offset to the start of the free space.
     pub upper_offset: u16,
-    /// Reserved for future use.
-    pub special_offset: u16,
+    /// Page ID of the next page in the table's page chain.
+    pub next_page_id: PageId,
 }
 
 /// An item identifier (or tuple pointer) on a page.
@@ -74,7 +76,7 @@ impl Page {
         header.flags = 0;
         header.lower_offset = std::mem::size_of::<PageHeaderData>() as u16;
         header.upper_offset = PAGE_SIZE as u16;
-        header.special_offset = 0;
+        header.next_page_id = INVALID_PAGE_ID;
     }
 
     /// Returns a mutable reference to the page header.
