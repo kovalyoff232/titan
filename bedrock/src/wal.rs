@@ -251,7 +251,7 @@ impl WalManager {
     /// Recovers the database from the WAL using the ARIES Redo algorithm.
     /// Returns the highest transaction ID found in the WAL.
     pub fn recover<P: AsRef<Path>>(wal_path: P, pager: &mut Pager) -> io::Result<u32> {
-        let mut wal_file = OpenOptions::new().read(true).open(wal_path)?;
+        let mut wal_file = OpenOptions::new().read(true).create(true).write(true).open(wal_path)?;
         let mut buf = Vec::new();
         wal_file.read_to_end(&mut buf)?;
 

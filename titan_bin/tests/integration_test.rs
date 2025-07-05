@@ -55,9 +55,12 @@ fn test_rollback_removes_inserted_data() {
 
     // 2. Setup the table in its own transaction
     client.query("CREATE TABLE test_rollback (id INT);");
+    client.query("COMMIT;");
 
     // 3. Run the test transaction
-    let rows_before = client.query("BEGIN; INSERT INTO test_rollback VALUES (100); SELECT * FROM test_rollback;");
+    client.query("BEGIN;");
+    client.query("INSERT INTO test_rollback VALUES (100);");
+    let rows_before = client.query("SELECT * FROM test_rollback;");
     assert_eq!(
         rows_before.len(),
         1,

@@ -4,6 +4,7 @@
 
 pub mod btree;
 pub mod buffer_pool;
+pub mod lock_manager;
 pub mod page;
 pub mod pager;
 pub mod transaction;

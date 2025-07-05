@@ -77,6 +77,7 @@ pub struct SelectStatement {
     pub select_list: Vec<SelectItem>,
     pub from: Vec<TableReference>,
     pub where_clause: Option<Expression>,
+    pub for_update: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -105,6 +106,8 @@ pub enum SelectItem {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum BinaryOperator {
+    Plus,
+    Minus,
     Eq,
     NotEq,
     Lt,
@@ -134,7 +137,7 @@ pub enum LiteralValue {
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -166,6 +169,17 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(column)
             .or(expr.delimited_by(just('(').padded(), just(')').padded()));
 
+        let term = atom.clone()
+            .then(choice((
+                just('+').to(BinaryOperator::Plus),
+                just('-').to(BinaryOperator::Minus),
+            )).padded().then(atom).repeated())
+            .foldl(|left, (op, right)| Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            });
+
         let op = just("=").to(BinaryOperator::Eq)
             .or(just("<>").to(BinaryOperator::NotEq))
             .or(just("<=").to(BinaryOperator::LtEq))
@@ -173,8 +187,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(just(">=").to(BinaryOperator::GtEq))
             .or(just(">").to(BinaryOperator::Gt));
 
-        atom.clone()
-            .then(op.padded().then(atom).repeated())
+        term.clone()
+            .then(op.padded().then(term).repeated())
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
@@ -224,11 +238,13 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             table_reference.separated_by(just(',').padded()).collect()
         ).or_not())
         .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
-        .map(|((select_list, from), where_clause)| {
+        .then(text::keyword("FOR").padded().ignore_then(text::keyword("UPDATE")).padded().or_not())
+        .map(|(((select_list, from), where_clause), for_update)| {
             Statement::Select(SelectStatement {
                 select_list,
                 from: from.unwrap_or_default(),
                 where_clause,
+                for_update: for_update.is_some(),
             })
         });
     
@@ -327,6 +343,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .map(Statement::DumpPage);
 
     let begin = text::keyword("BEGIN").padded().to(Statement::Begin);
+    let start_transaction = text::keyword("START").padded().then(text::keyword("TRANSACTION")).padded().to(Statement::Begin);
     let commit = text::keyword("COMMIT").padded().to(Statement::Commit);
     let rollback = text::keyword("ROLLBACK").padded().to(Statement::Rollback);
 
@@ -342,6 +359,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .or(delete)
         .or(dump_page)
         .or(begin)
+        .or(start_transaction)
         .or(commit)
         .or(rollback)
         .or(vacuum);
