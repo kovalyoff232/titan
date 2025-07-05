@@ -74,8 +74,20 @@ pub enum DataType {
 #[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
     pub select_list: Vec<SelectItem>,
-    pub from_table: Option<String>,
+    pub from: Vec<TableReference>,
     pub where_clause: Option<Expression>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TableReference {
+    Table {
+        name: String,
+    },
+    Join {
+        left: Box<TableReference>,
+        right: Box<TableReference>,
+        on_condition: Expression,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -84,6 +96,8 @@ pub enum SelectItem {
     UnnamedExpr(Expression),
     /// `expr AS alias`
     ExprWithAlias { expr: Expression, alias: String },
+    /// `table.*`
+    QualifiedWildcard(String),
     /// `*`
     Wildcard,
 }
@@ -102,6 +116,7 @@ pub enum BinaryOperator {
 pub enum Expression {
     Literal(LiteralValue),
     Column(String),
+    QualifiedColumn(String, String), // table, column
     Binary {
         left: Box<Expression>,
         op: BinaryOperator,
@@ -118,7 +133,7 @@ pub enum LiteralValue {
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -136,10 +151,17 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .map(LiteralValue::String);
 
     let literal = number.or(string).map(Expression::Literal).padded();
+    
+    let qualified_column = ident.clone()
+        .then_ignore(just('.'))
+        .then(ident.clone())
+        .map(|(table, column)| Expression::QualifiedColumn(table, column));
+
     let column = ident.clone().map(Expression::Column);
 
     let expr = recursive(|expr| {
         let atom = literal
+            .or(qualified_column)
             .or(column)
             .or(expr.delimited_by(just('(').padded(), just(')').padded()));
 
@@ -159,15 +181,36 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             })
     });
 
+    let qualified_wildcard = ident.clone().then_ignore(just('.')).then_ignore(just('*')).map(SelectItem::QualifiedWildcard);
     let wildcard = just('*').padded().to(SelectItem::Wildcard);
 
-    let select_item = wildcard.or(expr
+    let select_item = wildcard.or(qualified_wildcard).or(expr
         .clone()
         .then(text::keyword("AS").padded().ignore_then(ident.clone()).or_not())
         .map(|(expr, alias)| match alias {
             Some(alias) => SelectItem::ExprWithAlias { expr, alias },
             None => SelectItem::UnnamedExpr(expr),
         }));
+
+    let table_reference = recursive(|table_ref| {
+        let table = ident.clone().map(|name| TableReference::Table { name });
+        
+        let join = table.clone()
+            .then(
+                text::keyword("JOIN").padded()
+                .ignore_then(table_ref)
+                .then_ignore(text::keyword("ON").padded())
+                .then(expr.clone())
+                .repeated()
+            )
+            .foldl(|left, (right, on_condition)| TableReference::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                on_condition,
+            });
+        
+        join
+    });
 
     let select = text::keyword("SELECT").padded()
         .ignore_then(
@@ -176,16 +219,18 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .allow_trailing()
                 .collect::<Vec<_>>(),
         )
-        .then(text::keyword("FROM").padded().ignore_then(ident.clone()).or_not())
+        .then(text::keyword("FROM").padded().ignore_then(
+            table_reference.separated_by(just(',').padded()).collect()
+        ).or_not())
         .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
-        .map(|((select_list, from_table), where_clause)| {
+        .map(|((select_list, from), where_clause)| {
             Statement::Select(SelectStatement {
                 select_list,
-                from_table,
+                from: from.unwrap_or_default(),
                 where_clause,
             })
         });
-
+    
     let data_type = text::ident().try_map(|s: String, span| {
         match s.to_uppercase().as_str() {
             "INT" => Ok(DataType::Int),
@@ -193,6 +238,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             _ => Err(Simple::custom(span, format!("unknown type: {}", s))),
         }
     }).padded();
+
 
     let column_def = ident.clone()
         .then(data_type)
@@ -300,4 +346,3 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .then_ignore(end())
         .parse(s)
 }
-

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use bedrock::buffer_pool::{BufferPoolManager};
-use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator, TableReference};
 use bedrock::{PageId, TupleId};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::wal::{WalManager, WalRecord};
@@ -353,7 +353,11 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
         }
 
         // If no space, move to the next page or allocate a new one.
-        let next_page_id = page_guard.read().header().next_page_id;
+        let (next_page_id, page_id_to_link) = {
+            let page = page_guard.read();
+            (page.header().next_page_id, page.id)
+        };
+
         if next_page_id == INVALID_PAGE_ID {
             let new_page_guard = bpm.new_page()?;
             let new_page_id = new_page_guard.read().id;
@@ -361,7 +365,11 @@ fn execute_insert(stmt: &InsertStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
             { // Link the old page to the new one
                 let mut current_page = page_guard.write();
                 current_page.header_mut().next_page_id = new_page_id;
-                // TODO: Log this change to WAL
+                
+                let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+                let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::SetNextPageId { tx_id, page_id: page_id_to_link, next_page_id: new_page_id })?;
+                tm.set_last_lsn(tx_id, lsn);
+                current_page.header_mut().lsn = lsn;
             }
 
             let mut new_page = new_page_guard.write();
@@ -551,45 +559,113 @@ fn execute_delete(stmt: &DeleteStatement, bpm: &Arc<BufferPoolManager>, tm: &Arc
 }
 
 fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u32, snapshot: &Snapshot) -> Result<ResultSet, ExecutionError> {
-    let from_table = stmt.from_table.as_ref().ok_or(ExecutionError::GenericError(()))?;
-    println!("[SELECT] from_table: {}, tx_id: {}", from_table, tx_id);
-    let (table_oid, table_page_id) = find_table(from_table, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
-    println!("[SELECT] table_oid: {}, table_page_id: {}", table_oid, table_page_id);
-    
-    let table_schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    if table_schema.is_empty() {
-        println!("[SELECT] schema not found or empty for table_oid: {}", table_oid);
-        return Ok(ResultSet { columns: vec![], rows: vec![] });
+    if stmt.from.is_empty() {
+        return Err(ExecutionError::GenericError(())); // SELECT without FROM is not supported
     }
 
-    let projected_columns = if stmt.select_list.len() == 1 && matches!(stmt.select_list[0], SelectItem::Wildcard) {
-        table_schema.clone()
-    } else {
-        let mut proj_cols = Vec::new();
-        for item in &stmt.select_list {
-            if let SelectItem::UnnamedExpr(Expression::Column(name)) = item {
-                if let Some(col) = table_schema.iter().find(|c| c.name == *name) {
-                    proj_cols.push(col.clone());
-                } else {
-                    return Err(ExecutionError::ColumnNotFound(()));
-                }
-            }
-            // TODO: Handle expressions and other select items
+    // For now, we only support a single table or a single JOIN clause.
+    let (left_table_name, right_table_name, on_condition) = match &stmt.from[0] {
+        TableReference::Table { name } => (name.clone(), None, None),
+        TableReference::Join { left, right, on_condition } => {
+            let left_name = if let TableReference::Table { name } = &**left { name.clone() } else { return Err(ExecutionError::GenericError(())); };
+            let right_name = if let TableReference::Table { name } = &**right { name.clone() } else { return Err(ExecutionError::GenericError(())); };
+            (left_name, Some(right_name), Some(on_condition.clone()))
         }
-        proj_cols
     };
 
-    let mut rows = Vec::new();
+    // --- Data Loading ---
+    let (left_oid, left_page_id) = find_table(&left_table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
+    let left_schema = get_table_schema(bpm, left_oid, tx_id, snapshot)?;
+    let left_rows = scan_table(bpm, left_page_id, &left_schema, tx_id, snapshot)?;
 
-    // Simple optimization: If there is a WHERE clause on an indexed column, use an index scan.
-    let mut used_index = false;
-    if let Some(Expression::Binary { left, op: BinaryOperator::Eq, right }) = &stmt.where_clause {
-        if let (Expression::Column(col_name), Expression::Literal(LiteralValue::Number(val_str))) = (&**left, &**right) {
-            // This is a simplified check. A real system would check pg_index.
-            if col_name == "id" {
+    let (right_schema, right_rows) = if let Some(right_table_name_val) = &right_table_name {
+        let (right_oid, right_page_id) = find_table(right_table_name_val, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
+        let schema = get_table_schema(bpm, right_oid, tx_id, snapshot)?;
+        let rows = scan_table(bpm, right_page_id, &schema, tx_id, snapshot)?;
+        (Some(schema), Some(rows))
+    } else {
+        (None, None)
+    };
+
+    // --- Column Projection ---
+    let mut projected_columns: Vec<Column> = Vec::new();
+    if right_table_name.is_none() { // Single table case
+        if stmt.select_list.len() == 1 && matches!(stmt.select_list[0], SelectItem::Wildcard) {
+            projected_columns.extend(left_schema.clone());
+        } else {
+            for item in &stmt.select_list {
+                if let SelectItem::UnnamedExpr(Expression::Column(name)) = item {
+                    if let Some(col) = left_schema.iter().find(|c| &c.name == name) {
+                        projected_columns.push(col.clone());
+                    } else {
+                        return Err(ExecutionError::ColumnNotFound(()));
+                    }
+                }
+            }
+        }
+    } else { // JOIN case
+        for item in &stmt.select_list {
+            match item {
+                SelectItem::Wildcard => {
+                    projected_columns.extend(left_schema.iter().map(|c| Column { name: format!("{}.{}", left_table_name, c.name), ..c.clone() }));
+                    if let Some(schema) = &right_schema {
+                        projected_columns.extend(schema.iter().map(|c| Column { name: format!("{}.{}", right_table_name.as_ref().unwrap(), c.name), ..c.clone() }));
+                    }
+                }
+                SelectItem::QualifiedWildcard(table_name) => {
+                     if table_name == &left_table_name {
+                        projected_columns.extend(left_schema.iter().map(|c| Column { name: format!("{}.{}", left_table_name, c.name), ..c.clone() }));
+                     } else if right_table_name.as_ref() == Some(table_name) {
+                        projected_columns.extend(right_schema.as_ref().unwrap().iter().map(|c| Column { name: format!("{}.{}", right_table_name.as_ref().unwrap(), c.name), ..c.clone() }));
+                     }
+                }
+                SelectItem::UnnamedExpr(expr) => {
+                     if let Expression::Column(col_name) = expr {
+                        if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
+                            projected_columns.push(Column { name: format!("{}.{}", left_table_name, col.name), ..col.clone() });
+                        } else if let Some(schema) = &right_schema {
+                            if let Some(col) = schema.iter().find(|c| &c.name == col_name) {
+                                 projected_columns.push(Column { name: format!("{}.{}", right_table_name.as_ref().unwrap(), col.name), ..col.clone() });
+                            }
+                        }
+                     }
+                }
+                _ => {} // Other select items not handled yet
+            }
+        }
+    }
+    
+    // --- Nested Loop Join ---
+    let mut result_rows = Vec::new();
+    if let (Some(right_rows), Some(on_condition)) = (right_rows, on_condition) {
+        for left_row in &left_rows {
+            for right_row in &right_rows {
+                let mut combined_row = HashMap::new();
+                for (k, v) in left_row { combined_row.insert(format!("{}.{}", left_table_name, k), v.clone()); }
+                for (k, v) in right_row { combined_row.insert(format!("{}.{}", right_table_name.as_ref().unwrap(), k), v.clone()); }
+
+                if evaluate_join_condition(&on_condition, &combined_row)? {
+                    let mut row_vec = Vec::new();
+                    for col in &projected_columns {
+                        // This is simplified; assumes col.name is now "table.column"
+                        if let Some(val) = combined_row.get(&col.name) {
+                            row_vec.push(val.to_string());
+                        }
+                    }
+                    result_rows.push(row_vec);
+                }
+            }
+        }
+    } else { // Single table scan
+        let mut final_rows = Vec::new();
+        let mut used_index = false;
+
+        // Index Scan optimization
+        if let Some(Expression::Binary { left, op: BinaryOperator::Eq, right }) = &stmt.where_clause {
+            if let (Expression::Column(col_name), Expression::Literal(LiteralValue::Number(val_str))) = (&**left, &**right) {
                 let index_name = format!("idx_{}", col_name);
                 if let Ok(Some((_index_oid, index_root_page_id))) = find_table(&index_name, bpm, tx_id, snapshot) {
-                    if index_root_page_id != 0 {
+                    if index_root_page_id != INVALID_PAGE_ID {
                         let key = val_str.parse::<i32>().unwrap_or(0);
                         if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, key)? {
                             let (page_id, item_id) = tuple_id;
@@ -597,16 +673,8 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                             let page = page_guard.read();
                             if page.is_visible(snapshot, tx_id, item_id) {
                                 if let Some(tuple_data) = page.get_tuple(item_id) {
-                                     let parsed_tuple = parse_tuple(tuple_data, &table_schema);
-                                     let mut row = Vec::new();
-                                     for col in &projected_columns {
-                                         if let Some(value) = parsed_tuple.get(&col.name) {
-                                             row.push(value.to_string());
-                                         } else {
-                                             row.push("".to_string());
-                                         }
-                                     }
-                                     rows.push(row);
+                                     let parsed_tuple = parse_tuple(tuple_data, &left_schema);
+                                     final_rows.push(parsed_tuple);
                                 }
                             }
                             used_index = true;
@@ -615,45 +683,75 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                 }
             }
         }
-    }
 
-    if !used_index && table_page_id != INVALID_PAGE_ID {
-        let mut current_page_id = table_page_id;
-        while current_page_id != INVALID_PAGE_ID {
-            let page_guard = bpm.acquire_page(current_page_id)?;
-            let page = page_guard.read();
-            println!("[SELECT] scanning page_id: {}, tuple_count: {}", page.id, page.get_tuple_count());
-            for i in 0..page.get_tuple_count() {
-                if page.is_visible(snapshot, tx_id, i) {
-                    if let Some(tuple_data) = page.get_tuple(i) {
-                        let parsed_tuple = parse_tuple(tuple_data, &table_schema);
+        // Full Table Scan if index is not used
+        if !used_index {
+            for row_map in left_rows {
+                let should_include = if let Some(where_clause) = &stmt.where_clause {
+                    evaluate_expr_for_row(where_clause, &row_map)?
+                } else {
+                    true
+                };
 
-                        // Filter rows based on WHERE clause if it exists
-                        let should_include = if let Some(where_clause) = &stmt.where_clause {
-                            evaluate_expr_for_row(where_clause, &parsed_tuple).unwrap_or(false)
-                        } else {
-                            true // No WHERE clause means include all rows
-                        };
-
-                        if should_include {
-                            let mut row = Vec::new();
-                            for col in &projected_columns {
-                                if let Some(value) = parsed_tuple.get(&col.name) {
-                                    row.push(value.to_string());
-                                } else {
-                                    row.push("".to_string()); 
-                                }
-                            }
-                            rows.push(row);
-                        }
-                    }
+                if should_include {
+                    final_rows.push(row_map);
                 }
             }
-            current_page_id = page.header().next_page_id;
+        }
+        
+        for row_map in final_rows {
+             let mut row_vec = Vec::new();
+             for col in &projected_columns {
+                 if let Some(val) = row_map.get(&col.name) {
+                     row_vec.push(val.to_string());
+                 }
+             }
+             result_rows.push(row_vec);
         }
     }
-    println!("[SELECT] found {} rows", rows.len());
-    Ok(ResultSet { columns: projected_columns, rows })
+
+    println!("[SELECT] found {} rows", result_rows.len());
+    Ok(ResultSet { columns: projected_columns, rows: result_rows })
+}
+
+/// Scans a table and returns a vector of rows, where each row is a map of column name to value.
+fn scan_table(bpm: &Arc<BufferPoolManager>, first_page_id: PageId, schema: &Vec<Column>, tx_id: u32, snapshot: &Snapshot) -> Result<Vec<HashMap<String, LiteralValue>>, ExecutionError> {
+    let mut rows = Vec::new();
+    if first_page_id == INVALID_PAGE_ID {
+        return Ok(rows);
+    }
+    let mut current_page_id = first_page_id;
+    while current_page_id != INVALID_PAGE_ID {
+        let page_guard = bpm.acquire_page(current_page_id)?;
+        let page = page_guard.read();
+        for i in 0..page.get_tuple_count() {
+            if page.is_visible(snapshot, tx_id, i) {
+                if let Some(tuple_data) = page.get_tuple(i) {
+                    rows.push(parse_tuple(tuple_data, schema));
+                }
+            }
+        }
+        current_page_id = page.header().next_page_id;
+    }
+    Ok(rows)
+}
+
+fn evaluate_join_condition(expr: &Expression, row: &HashMap<String, LiteralValue>) -> Result<bool, ExecutionError> {
+     match expr {
+        Expression::Binary { left, op, right } => {
+            let left_val = evaluate_expr_for_row_to_val(left, row)?;
+            let right_val = evaluate_expr_for_row_to_val(right, row)?;
+            
+            // This is a simplified comparison, assumes strings or numbers that can be compared as strings.
+            // A real implementation would handle types properly.
+            let result = match op {
+                BinaryOperator::Eq => left_val.to_string() == right_val.to_string(),
+                _ => false // Only equality is supported for now
+            };
+            Ok(result)
+        }
+        _ => Err(ExecutionError::GenericError(())),
+    }
 }
 
 fn evaluate_expr_for_row(expr: &Expression, row: &HashMap<String, LiteralValue>) -> Result<bool, ExecutionError> {
@@ -689,9 +787,12 @@ fn evaluate_expr_for_row_to_val<'a>(expr: &'a Expression, row: &HashMap<String, 
     match expr {
         Expression::Literal(literal) => Ok(literal.clone()),
         Expression::Column(name) => {
-            println!("[evaluate_expr] Looking for column '{}' in row: {:?}", name, row.keys());
             row.get(name).cloned().ok_or_else(|| ExecutionError::ColumnNotFound(()))
         },
+        Expression::QualifiedColumn(table, col) => {
+            let qualified_name = format!("{}.{}", table, col);
+            row.get(&qualified_name).cloned().ok_or_else(|| ExecutionError::ColumnNotFound(()))
+        }
         _ => Err(ExecutionError::GenericError(())),
     }
 }

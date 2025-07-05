@@ -53,6 +53,12 @@ pub enum WalRecord {
     },
     /// A checkpoint record.
     Checkpoint,
+    /// Sets the next_page_id pointer of a page.
+    SetNextPageId {
+        tx_id: u32,
+        page_id: PageId,
+        next_page_id: PageId,
+    },
 }
 
 impl WalRecord {
@@ -64,6 +70,7 @@ impl WalRecord {
             WalRecord::DeleteTuple { tx_id, .. } => *tx_id,
             WalRecord::UpdateTuple { tx_id, .. } => *tx_id,
             WalRecord::BTreePage { tx_id, .. } => *tx_id,
+            WalRecord::SetNextPageId { tx_id, .. } => *tx_id,
             WalRecord::Checkpoint => 0, // Checkpoints don't belong to a tx
         }
     }
@@ -160,6 +167,12 @@ impl WalManager {
                 buf.extend_from_slice(data);
             }
             WalRecord::Checkpoint => buf.push(7),
+            WalRecord::SetNextPageId { tx_id, page_id, next_page_id } => {
+                buf.push(8);
+                buf.extend_from_slice(&tx_id.to_be_bytes());
+                buf.extend_from_slice(&page_id.to_be_bytes());
+                buf.extend_from_slice(&next_page_id.to_be_bytes());
+            }
         }
     }
 
@@ -204,6 +217,12 @@ impl WalManager {
                 Some(WalRecord::BTreePage { tx_id, page_id, data: page_data })
             }
             7 => Some(WalRecord::Checkpoint),
+            8 => {
+                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+                let next_page_id = u32::from_be_bytes(data[8..12].try_into().ok()?);
+                Some(WalRecord::SetNextPageId { tx_id, page_id, next_page_id })
+            }
             _ => None,
         }
     }
@@ -271,6 +290,14 @@ impl WalManager {
                         let mut page = pager.read_page(page_id)?;
                         if page.header().lsn < current_pos as u64 {
                             page.data.copy_from_slice(&data);
+                            page.header_mut().lsn = current_pos as u64;
+                            pager.write_page(&page)?;
+                        }
+                    }
+                    WalRecord::SetNextPageId { page_id, next_page_id, .. } => {
+                        let mut page = pager.read_page(page_id)?;
+                        if page.header().lsn < current_pos as u64 {
+                            page.header_mut().next_page_id = next_page_id;
                             page.header_mut().lsn = current_pos as u64;
                             pager.write_page(&page)?;
                         }
