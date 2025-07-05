@@ -246,20 +246,17 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
         let page = page_guard.read();
         let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
         
-        // Find the column index for the indexed column
         let col_idx = schema.iter().position(|c| c.name == stmt.column_name).ok_or(ExecutionError::ColumnNotFound(()))?;
 
-        println!("[create_index] Scanning {} tuples in page {}", page.get_tuple_count(), table_page_id);
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
                 if let Some(tuple_data) = page.get_tuple(i) {
-                    // This is a simplified key extraction. It assumes the key is the first column and is an i32.
-                    // A real implementation would need a more robust way to parse the key based on the schema.
-                    if tuple_data.len() >= 4 {
-                        let key = i32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
-                        let tuple_id: TupleId = (page.id, i);
-                        println!("[create_index] Inserting key: {}, tid: ({}, {})", key, tuple_id.0, tuple_id.1);
-                        root_page_id = btree::btree_insert(bpm, tm, wm, tx_id, root_page_id, key, tuple_id)?;
+                    let parsed_tuple = parse_tuple(tuple_data, &schema);
+                    if let Some(LiteralValue::Number(key_str)) = parsed_tuple.get(&stmt.column_name) {
+                        if let Ok(key) = key_str.parse::<i32>() {
+                             let tuple_id: TupleId = (page.id, i);
+                             root_page_id = btree::btree_insert(bpm, tm, wm, tx_id, root_page_id, key, tuple_id)?;
+                        }
                     }
                 }
             }
