@@ -97,3 +97,39 @@ fn test_create_index_and_select() {
     assert_eq!(rows.len(), 1, "Should find one row by index");
     assert_eq!(rows[0][0], "two");
 }
+
+#[test]
+#[serial]
+fn test_join_tables() {
+    let _setup = TestSetup::new();
+    let mut client = TestClient::connect("127.0.0.1:5433");
+
+    // Setup tables
+    client.query("CREATE TABLE users (user_id INT, user_name TEXT);");
+    client.query("CREATE TABLE orders (order_id INT, user_id INT, item TEXT);");
+    client.query("COMMIT;");
+
+    // Insert data
+    client.query("INSERT INTO users VALUES (1, 'Alice');");
+    client.query("INSERT INTO users VALUES (2, 'Bob');");
+    client.query("INSERT INTO users VALUES (3, 'Charlie');");
+    client.query("INSERT INTO orders VALUES (101, 1, 'Laptop');");
+    client.query("INSERT INTO orders VALUES (102, 2, 'Mouse');");
+    client.query("INSERT INTO orders VALUES (103, 1, 'Keyboard');");
+    client.query("INSERT INTO orders VALUES (104, 3, 'Monitor');");
+    client.query("COMMIT;");
+
+    // Perform JOIN
+    let result = client.query("SELECT users.user_name, orders.item FROM users JOIN orders ON users.user_id = orders.user_id;");
+    
+    assert_eq!(result.len(), 4, "JOIN should produce 4 rows");
+
+    // Sort results for stable comparison
+    let mut result_strings: Vec<String> = result.into_iter().map(|row| row.join(",")).collect();
+    result_strings.sort();
+
+    assert_eq!(result_strings[0], "Alice,Keyboard");
+    assert_eq!(result_strings[1], "Alice,Laptop");
+    assert_eq!(result_strings[2], "Bob,Mouse");
+    assert_eq!(result_strings[3], "Charlie,Monitor");
+}

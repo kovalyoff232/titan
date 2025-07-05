@@ -620,24 +620,39 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                      }
                 }
                 SelectItem::UnnamedExpr(expr) => {
-                     if let Expression::Column(col_name) = expr {
-                        if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
-                            projected_columns.push(Column { name: format!("{}.{}", left_table_name, col.name), ..col.clone() });
-                        } else if let Some(schema) = &right_schema {
-                            if let Some(col) = schema.iter().find(|c| &c.name == col_name) {
-                                 projected_columns.push(Column { name: format!("{}.{}", right_table_name.as_ref().unwrap(), col.name), ..col.clone() });
+                     match expr {
+                        Expression::Column(col_name) => {
+                            if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
+                                projected_columns.push(Column { name: format!("{}.{}", left_table_name, col.name), ..col.clone() });
+                            } else if let Some(schema) = &right_schema {
+                                if let Some(col) = schema.iter().find(|c| &c.name == col_name) {
+                                     projected_columns.push(Column { name: format!("{}.{}", right_table_name.as_ref().unwrap(), col.name), ..col.clone() });
+                                }
                             }
                         }
+                        Expression::QualifiedColumn(table_name, col_name) => {
+                            if table_name == &left_table_name {
+                                if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
+                                    projected_columns.push(Column { name: format!("{}.{}", table_name, col.name), ..col.clone() });
+                                }
+                            } else if right_table_name.as_ref() == Some(table_name) {
+                                if let Some(col) = right_schema.as_ref().unwrap().iter().find(|c| &c.name == col_name) {
+                                    projected_columns.push(Column { name: format!("{}.{}", table_name, col.name), ..col.clone() });
+                                }
+                            }
+                        }
+                        _ => {}
                      }
                 }
-                _ => {} // Other select items not handled yet
+                _ => {}
             }
         }
     }
     
-    // --- Nested Loop Join ---
+    // --- Execution ---
     let mut result_rows = Vec::new();
     if let (Some(right_rows), Some(on_condition)) = (right_rows, on_condition) {
+        // Nested Loop Join
         for left_row in &left_rows {
             for right_row in &right_rows {
                 let mut combined_row = HashMap::new();
@@ -647,7 +662,6 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                 if evaluate_join_condition(&on_condition, &combined_row)? {
                     let mut row_vec = Vec::new();
                     for col in &projected_columns {
-                        // This is simplified; assumes col.name is now "table.column"
                         if let Some(val) = combined_row.get(&col.name) {
                             row_vec.push(val.to_string());
                         }
@@ -656,7 +670,8 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                 }
             }
         }
-    } else { // Single table scan
+    } else { 
+        // Single Table Scan
         let mut final_rows = Vec::new();
         let mut used_index = false;
 
