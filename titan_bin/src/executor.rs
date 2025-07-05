@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use bedrock::buffer_pool::{BufferPoolManager};
 use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator};
-use bedrock::{PageId, PAGE_SIZE, TupleId};
+use bedrock::{PageId, TupleId};
 use bedrock::wal::{WalManager, WalRecord};
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::btree;
@@ -246,7 +246,7 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
         let page = page_guard.read();
         let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
         
-        let col_idx = schema.iter().position(|c| c.name == stmt.column_name).ok_or(ExecutionError::ColumnNotFound(()))?;
+        let _col_idx = schema.iter().position(|c| c.name == stmt.column_name).ok_or(ExecutionError::ColumnNotFound(()))?;
 
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
@@ -274,7 +274,7 @@ fn execute_create_index(stmt: &CreateIndexStatement, bpm: &Arc<BufferPoolManager
             if let Some(tuple_data) = page.get_tuple(i) {
                 let oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
                 if oid == index_oid {
-                    if let Some(mut tuple) = page.get_raw_tuple_mut(i) {
+                    if let Some(tuple) = page.get_raw_tuple_mut(i) {
                         tuple[4..8].copy_from_slice(&root_page_id.to_be_bytes());
                     }
                     break;

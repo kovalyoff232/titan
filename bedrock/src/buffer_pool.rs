@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
 
 use crate::pager::Pager;
 use crate::{Page, PageId};
