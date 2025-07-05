@@ -102,24 +102,35 @@ pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key
         match current_page.btree_header().page_type {
             BTreePageType::Leaf => {
                 let num_cells = current_page.btree_header().num_cells as usize;
-                // TODO: Binary search would be much faster here.
-                for i in 0..num_cells {
-                    if current_page.leaf_cell(i).key == key {
-                        return Ok(Some(current_page.leaf_cell(i).tuple_id));
+                let mut low = 0;
+                let mut high = num_cells;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    let cell_key = current_page.leaf_cell(mid).key;
+                    match cell_key.cmp(&key) {
+                        std::cmp::Ordering::Less => low = mid + 1,
+                        std::cmp::Ordering::Greater => high = mid,
+                        std::cmp::Ordering::Equal => return Ok(Some(current_page.leaf_cell(mid).tuple_id)),
                     }
                 }
-                // Key not found in this leaf page.
                 return Ok(None);
             }
             BTreePageType::Internal => {
                 let num_cells = current_page.btree_header().num_cells as usize;
+                let mut low = 0;
+                let mut high = num_cells;
                 let mut next_page_id = *current_page.right_child();
-                // TODO: Binary search would be much faster here.
-                for i in 0..num_cells {
-                    if key < current_page.internal_cell(i).key {
-                        next_page_id = current_page.internal_cell(i).page_id;
-                        break;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    let cell_key = current_page.internal_cell(mid).key;
+                    if key < cell_key {
+                        high = mid;
+                    } else {
+                        low = mid + 1;
                     }
+                }
+                if high > 0 {
+                    next_page_id = current_page.internal_cell(high - 1).page_id;
                 }
                 current_page_id = next_page_id;
             }
@@ -200,10 +211,18 @@ fn leaf_split_and_move(old_page: &mut Page, new_page: &mut Page) -> Key {
 
 fn leaf_insert(page: &mut Page, key: Key, tuple_id: TupleId) {
     let num_cells = page.btree_header().num_cells as usize;
-    let mut insert_idx = 0;
-    while insert_idx < num_cells && page.leaf_cell(insert_idx).key < key {
-        insert_idx += 1;
+    
+    let mut low = 0;
+    let mut high = num_cells;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if page.leaf_cell(mid).key < key {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
     }
+    let insert_idx = low;
 
     for i in (insert_idx..num_cells).rev() {
         let cell = *page.leaf_cell(i);
