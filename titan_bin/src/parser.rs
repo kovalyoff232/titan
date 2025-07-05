@@ -22,6 +22,7 @@ pub enum Statement {
     Update(UpdateStatement),
     Delete(DeleteStatement),
     DumpPage(u32),
+    Vacuum(String),
     Begin,
     Commit,
     Rollback,
@@ -124,7 +125,7 @@ pub enum Expression {
     },
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum LiteralValue {
     Number(String),
     String(String),
@@ -133,7 +134,7 @@ pub enum LiteralValue {
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -329,6 +330,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let commit = text::keyword("COMMIT").padded().to(Statement::Commit);
     let rollback = text::keyword("ROLLBACK").padded().to(Statement::Rollback);
 
+    let vacuum = text::keyword("VACUUM").padded()
+        .ignore_then(ident.clone())
+        .map(Statement::Vacuum);
+
     let statement = create_table
         .or(create_index)
         .or(select)
@@ -338,7 +343,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .or(dump_page)
         .or(begin)
         .or(commit)
-        .or(rollback);
+        .or(rollback)
+        .or(vacuum);
 
     statement
         .padded_by(just(';').repeated())

@@ -233,6 +233,43 @@ fn leaf_insert(page: &mut Page, key: Key, tuple_id: TupleId) {
     page.btree_header_mut().num_cells += 1;
 }
 
+pub fn btree_delete(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    root_page_id: PageId,
+    key: Key,
+) -> io::Result<PageId> {
+    // For now, we only handle simple deletion from a leaf page.
+    // A full implementation would require handling underflow and rebalancing.
+    let page_guard = bpm.acquire_page(root_page_id)?;
+    let mut page = page_guard.write();
+    leaf_delete(&mut page, key);
+    log_btree_page(tm, wm, tx_id, &page)?;
+    Ok(root_page_id)
+}
+
+fn leaf_delete(page: &mut Page, key: Key) {
+    let num_cells = page.btree_header().num_cells as usize;
+    let mut found_idx = None;
+
+    for i in 0..num_cells {
+        if page.leaf_cell(i).key == key {
+            found_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(idx) = found_idx {
+        for i in idx..num_cells - 1 {
+            let cell = *page.leaf_cell(i + 1);
+            *page.leaf_cell_mut(i) = cell;
+        }
+        page.btree_header_mut().num_cells -= 1;
+    }
+}
+
 fn log_btree_page(
     tm: &Arc<TransactionManager>,
     wm: &Arc<Mutex<WalManager>>,

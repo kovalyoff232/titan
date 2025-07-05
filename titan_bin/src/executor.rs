@@ -157,6 +157,7 @@ pub fn execute(stmt: &Statement, bpm: &Arc<BufferPoolManager>, tm: &Arc<Transact
         Statement::Insert(insert_stmt) => execute_insert(insert_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Insert),
         Statement::Update(update_stmt) => execute_update(update_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Update),
         Statement::Delete(delete_stmt) => execute_delete(delete_stmt, bpm, tm, wm, tx_id, snapshot).map(ExecuteResult::Delete),
+        Statement::Vacuum(table_name) => execute_vacuum(table_name, bpm, tm, wm, tx_id, snapshot).map(|_| ExecuteResult::Ddl),
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Ok(ExecuteResult::Ddl),
     }
@@ -622,6 +623,7 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                 SelectItem::UnnamedExpr(expr) => {
                      match expr {
                         Expression::Column(col_name) => {
+                            // This is ambiguous, but for now we'll just check left then right
                             if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
                                 projected_columns.push(Column { name: format!("{}.{}", left_table_name, col.name), ..col.clone() });
                             } else if let Some(schema) = &right_schema {
@@ -651,25 +653,27 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
     
     // --- Execution ---
     let mut result_rows = Vec::new();
-    if let (Some(right_rows), Some(on_condition)) = (right_rows, on_condition) {
-        // Nested Loop Join
-        for left_row in &left_rows {
-            for right_row in &right_rows {
-                let mut combined_row = HashMap::new();
-                for (k, v) in left_row { combined_row.insert(format!("{}.{}", left_table_name, k), v.clone()); }
-                for (k, v) in right_row { combined_row.insert(format!("{}.{}", right_table_name.as_ref().unwrap(), k), v.clone()); }
+    if let (Some(right_rows_val), Some(on_condition_val)) = (right_rows, on_condition) {
+        // For now, we'll default to Hash Join if possible, otherwise Nested Loop.
+        // A real optimizer would make a cost-based decision here.
+        let joined_rows = execute_hash_join(
+            &left_rows,
+            &right_rows_val,
+            &on_condition_val,
+            &left_table_name,
+            right_table_name.as_ref().unwrap(),
+        )?;
 
-                if evaluate_join_condition(&on_condition, &combined_row)? {
-                    let mut row_vec = Vec::new();
-                    for col in &projected_columns {
-                        if let Some(val) = combined_row.get(&col.name) {
-                            row_vec.push(val.to_string());
-                        }
-                    }
-                    result_rows.push(row_vec);
+        for combined_row in joined_rows {
+            let mut row_vec = Vec::new();
+            for col in &projected_columns {
+                if let Some(val) = combined_row.get(&col.name) {
+                    row_vec.push(val.to_string());
                 }
             }
+            result_rows.push(row_vec);
         }
+
     } else { 
         // Single Table Scan
         let mut final_rows = Vec::new();
@@ -681,6 +685,7 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                 let index_name = format!("idx_{}", col_name);
                 if let Ok(Some((_index_oid, index_root_page_id))) = find_table(&index_name, bpm, tx_id, snapshot) {
                     if index_root_page_id != INVALID_PAGE_ID {
+                        println!("[SELECT] Attempting to use index '{}' for query.", index_name);
                         let key = val_str.parse::<i32>().unwrap_or(0);
                         if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, key)? {
                             let (page_id, item_id) = tuple_id;
@@ -693,6 +698,9 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
                                 }
                             }
                             used_index = true;
+                            println!("[SELECT] Index scan successful.");
+                        } else {
+                            println!("[SELECT] Key not found with index scan.");
                         }
                     }
                 }
@@ -701,6 +709,7 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
 
         // Full Table Scan if index is not used
         if !used_index {
+            println!("[SELECT] Using full table scan.");
             for row_map in left_rows {
                 let should_include = if let Some(where_clause) = &stmt.where_clause {
                     evaluate_expr_for_row(where_clause, &row_map)?
@@ -729,6 +738,56 @@ fn execute_select(stmt: &SelectStatement, bpm: &Arc<BufferPoolManager>, tx_id: u
     Ok(ResultSet { columns: projected_columns, rows: result_rows })
 }
 
+/// Executes a hash join between two sets of rows.
+fn execute_hash_join(
+    left_rows: &[HashMap<String, LiteralValue>],
+    right_rows: &[HashMap<String, LiteralValue>],
+    on_condition: &Expression,
+    left_table_name: &str,
+    right_table_name: &str,
+) -> Result<Vec<HashMap<String, LiteralValue>>, ExecutionError> {
+    println!("[execute_hash_join] Starting Hash Join execution.");
+    let (left_key_col, right_key_col) = if let Expression::Binary { left, op: BinaryOperator::Eq, right } = on_condition {
+        match (&**left, &**right) {
+            (Expression::QualifiedColumn(lt, lc), Expression::QualifiedColumn(_rt, rc)) => {
+                if lt == left_table_name { (lc.clone(), rc.clone()) } else { (rc.clone(), lc.clone()) }
+            }
+            _ => return Err(ExecutionError::GenericError(())) // Hash join only on simple equality
+        }
+    } else {
+        return Err(ExecutionError::GenericError(())); // Hash join only on equality
+    };
+
+    // Build phase: build a hash table on the smaller relation (let's assume right for now)
+    let mut hash_table: HashMap<LiteralValue, Vec<&HashMap<String, LiteralValue>>> = HashMap::new();
+    println!("[execute_hash_join] Build phase on right table '{}' with key '{}'", right_table_name, right_key_col);
+    for right_row in right_rows {
+        if let Some(key) = right_row.get(&right_key_col) {
+            hash_table.entry(key.clone()).or_default().push(right_row);
+        }
+    }
+    println!("[execute_hash_join] Build phase complete. Hash table size: {}", hash_table.len());
+
+    // Probe phase: iterate through the larger relation and probe the hash table
+    let mut joined_rows = Vec::new();
+    println!("[execute_hash_join] Probe phase on left table '{}' with key '{}'", left_table_name, left_key_col);
+    for left_row in left_rows {
+        if let Some(key) = left_row.get(&left_key_col) {
+            if let Some(matching_right_rows) = hash_table.get(key) {
+                for right_row in matching_right_rows {
+                    let mut combined_row = HashMap::new();
+                    for (k, v) in left_row { combined_row.insert(format!("{}.{}", left_table_name, k), v.clone()); }
+                    for (k, v) in *right_row { combined_row.insert(format!("{}.{}", right_table_name, k), v.clone()); }
+                    joined_rows.push(combined_row);
+                }
+            }
+        }
+    }
+    println!("[execute_hash_join] Probe phase complete. Found {} joined rows.", joined_rows.len());
+
+    Ok(joined_rows)
+}
+
 /// Scans a table and returns a vector of rows, where each row is a map of column name to value.
 fn scan_table(bpm: &Arc<BufferPoolManager>, first_page_id: PageId, schema: &Vec<Column>, tx_id: u32, snapshot: &Snapshot) -> Result<Vec<HashMap<String, LiteralValue>>, ExecutionError> {
     let mut rows = Vec::new();
@@ -751,23 +810,7 @@ fn scan_table(bpm: &Arc<BufferPoolManager>, first_page_id: PageId, schema: &Vec<
     Ok(rows)
 }
 
-fn evaluate_join_condition(expr: &Expression, row: &HashMap<String, LiteralValue>) -> Result<bool, ExecutionError> {
-     match expr {
-        Expression::Binary { left, op, right } => {
-            let left_val = evaluate_expr_for_row_to_val(left, row)?;
-            let right_val = evaluate_expr_for_row_to_val(right, row)?;
-            
-            // This is a simplified comparison, assumes strings or numbers that can be compared as strings.
-            // A real implementation would handle types properly.
-            let result = match op {
-                BinaryOperator::Eq => left_val.to_string() == right_val.to_string(),
-                _ => false // Only equality is supported for now
-            };
-            Ok(result)
-        }
-        _ => Err(ExecutionError::GenericError(())),
-    }
-}
+
 
 fn evaluate_expr_for_row(expr: &Expression, row: &HashMap<String, LiteralValue>) -> Result<bool, ExecutionError> {
     match expr {
@@ -810,4 +853,78 @@ fn evaluate_expr_for_row_to_val<'a>(expr: &'a Expression, row: &HashMap<String, 
         }
         _ => Err(ExecutionError::GenericError(())),
     }
+}
+
+fn execute_vacuum(table_name: &str, bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, wm: &Arc<Mutex<WalManager>>, tx_id: u32, snapshot: &Snapshot) -> Result<(), ExecutionError> {
+    println!("[VACUUM] Starting vacuum for table '{}'", table_name);
+    let (table_oid, old_first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(()))?;
+    if old_first_page_id == INVALID_PAGE_ID {
+        println!("[VACUUM] Table is empty, nothing to do.");
+        return Ok(());
+    }
+
+    // 1. Collect all live tuples from the old pages
+    let mut live_tuples = Vec::new();
+    let mut current_page_id = old_first_page_id;
+    while current_page_id != INVALID_PAGE_ID {
+        let page_guard = bpm.acquire_page(current_page_id)?;
+        let page = page_guard.read();
+        for i in 0..page.get_tuple_count() {
+            // A tuple is live if it's visible to our current snapshot.
+            // This correctly handles tuples deleted by transactions that committed before us,
+            // and tuples created by transactions that committed before us.
+            if page.is_visible(snapshot, tx_id, i) {
+                if let Some(raw_tuple) = page.get_raw_tuple(i) {
+                    live_tuples.push(raw_tuple.to_vec());
+                }
+            }
+        }
+        current_page_id = page.header().next_page_id;
+    }
+    println!("[VACUUM] Found {} live tuples.", live_tuples.len());
+
+    // 2. Write live tuples to a new set of pages
+    let mut new_first_page_id = INVALID_PAGE_ID;
+    let mut new_current_page_id;
+
+    if !live_tuples.is_empty() {
+        let first_page_guard = bpm.new_page()?;
+        new_first_page_id = first_page_guard.read().id;
+        new_current_page_id = new_first_page_id;
+        drop(first_page_guard);
+
+        for tuple_data in live_tuples {
+            let mut inserted = false;
+            while !inserted {
+                let page_guard = bpm.acquire_page(new_current_page_id)?;
+                let mut page = page_guard.write();
+                
+                // The tuple data already includes the header, so we need to extract the data part
+                let header_size = std::mem::size_of::<bedrock::page::HeapTupleHeaderData>();
+                let data_only = &tuple_data[header_size..];
+                
+                // We insert with the current transaction's ID as xmin
+                if page.add_tuple(data_only, tx_id, 0).is_some() {
+                    inserted = true;
+                } else {
+                    // Page is full, create a new one and link it
+                    let new_page_guard = bpm.new_page()?;
+                    let next_new_id = new_page_guard.read().id;
+                    page.header_mut().next_page_id = next_new_id;
+                    new_current_page_id = next_new_id;
+                }
+            }
+        }
+    }
+    println!("[VACUUM] Wrote live tuples to new page chain starting at {}", new_first_page_id);
+
+    // 3. Update pg_class to point to the new page chain
+    update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, new_first_page_id)?;
+    println!("[VACUUM] Updated pg_class for oid {} to point to new page {}", table_oid, new_first_page_id);
+
+    // 4. TODO: The old pages are now orphaned and should be added to a free list
+    // for reuse by the Pager. This is a more advanced feature for later.
+
+    println!("[VACUUM] Completed for table '{}'", table_name);
+    Ok(())
 }

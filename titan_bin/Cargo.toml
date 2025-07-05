@@ -11,3 +11,7 @@ bytes = "1.5.0"
 [dev-dependencies]
 serial_test = "3.0.0"
 tempfile = "3.10.1"
+
+[[test]]
+name = "vacuum_test"
+path = "tests/vacuum_test.rs"
