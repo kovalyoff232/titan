@@ -343,6 +343,22 @@ fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm:
     };
     executor::execute(&parser::Statement::CreateTable(create_pg_attribute), bpm, tm, lm, wal, tx_id, &snapshot)?;
     println!("[initialize_db] pg_attribute table created.");
+
+    // Create pg_statistic
+    println!("[initialize_db] Creating pg_statistic table.");
+    let create_pg_statistic = parser::CreateTableStatement {
+        table_name: "pg_statistic".to_string(),
+        columns: vec![
+            // Table OID
+            parser::ColumnDef { name: "starelid".to_string(), data_type: parser::DataType::Int },
+            // Column number
+            parser::ColumnDef { name: "staattnum".to_string(), data_type: parser::DataType::Int },
+            // Number of distinct values
+            parser::ColumnDef { name: "stadistinct".to_string(), data_type: parser::DataType::Int },
+        ],
+    };
+    executor::execute(&parser::Statement::CreateTable(create_pg_statistic), bpm, tm, lm, wal, tx_id, &snapshot)?;
+    println!("[initialize_db] pg_statistic table created.");
     
     tm.commit(tx_id);
     lm.unlock_all(tx_id);

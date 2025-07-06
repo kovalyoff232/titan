@@ -25,6 +25,7 @@ pub enum Statement {
     Delete(DeleteStatement),
     DumpPage(u32),
     Vacuum(String),
+    Analyze(String),
     Begin,
     Commit,
     Rollback,
@@ -144,7 +145,7 @@ pub enum LiteralValue {
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -367,6 +368,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .ignore_then(ident.clone())
         .map(Statement::Vacuum);
 
+    let analyze = text::keyword("ANALYZE").padded()
+        .ignore_then(ident.clone())
+        .map(Statement::Analyze);
+
     let statement = create_table
         .or(create_index)
         .or(select)
@@ -378,7 +383,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .or(start_transaction)
         .or(commit)
         .or(rollback)
-        .or(vacuum);
+        .or(vacuum)
+        .or(analyze);
 
     statement
         .padded_by(just(';').repeated())

@@ -48,7 +48,7 @@ pub enum ExecutionError {
 }
 
 impl From<std::io::Error> for ExecutionError {
-    fn from(err: std::io::Error) -> Self {
+    fn from(_err: std::io::Error) -> Self {
         ExecutionError::IoError(())
     }
 }
@@ -65,6 +65,7 @@ impl From<LockError> for ExecutionError {
 
 const PG_CLASS_TABLE_OID: PageId = 0;
 const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
+const PG_STATISTIC_TABLE_OID: PageId = 2;
 
 // --- Helper Functions ---
 
@@ -263,6 +264,10 @@ pub fn execute(
             execute_vacuum(table_name, bpm, tm, lm, wm, tx_id, snapshot)
                 .map(|_| ExecuteResult::Ddl)
         }
+        Statement::Analyze(table_name) => {
+            execute_analyze(table_name, bpm, tm, lm, wm, tx_id, snapshot)
+                .map(|_| ExecuteResult::Ddl)
+        }
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Err(ExecutionError::GenericError("Unsupported statement type".to_string())),
     }
@@ -279,11 +284,16 @@ fn execute_physical_plan(
     select_stmt: &SelectStatement,
 ) -> Result<ResultSet, ExecutionError> {
     match plan {
-        PhysicalPlan::TableScan { table_name } => {
+        PhysicalPlan::TableScan { table_name, filter } => {
             let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
             let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-            let rows_with_ids = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, select_stmt.for_update)?;
+            let mut rows_with_ids = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, select_stmt.for_update)?;
+
+            if let Some(predicate) = filter {
+                rows_with_ids.retain(|(_, _, row)| evaluate_expr_for_row(predicate, row).unwrap_or(false));
+            }
+
             let rows: Vec<Vec<String>> = rows_with_ids
                 .into_iter()
                 .map(|(_, _, row)| {
@@ -293,12 +303,12 @@ fn execute_physical_plan(
                             let val = row.get(&col.name).unwrap();
                             match val {
                                 LiteralValue::Bool(b) => {
-                        if *b {
-                            "t".to_string()
-                        } else {
-                            "f".to_string()
-                        }
-                    }
+                                    if *b {
+                                        "t".to_string()
+                                    } else {
+                                        "f".to_string()
+                                    }
+                                }
                                 _ => val.to_string(),
                             }
                         })
@@ -450,7 +460,7 @@ fn execute_physical_plan(
                     // It's also brittle as it assumes the direct children of the join are table scans.
                     // A proper fix would involve a larger refactor of the ResultSet or execution context.
                     fn get_child_schema(plan: &PhysicalPlan, bpm: &Arc<BufferPoolManager>, tx_id: u32, snapshot: &Snapshot) -> Result<Vec<Column>, ExecutionError> {
-                        if let PhysicalPlan::TableScan { table_name } = plan {
+                        if let PhysicalPlan::TableScan { table_name, .. } = plan {
                             let (oid, _) = find_table(table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
                             get_table_schema(bpm, oid, tx_id, snapshot)
                         } else {
@@ -465,8 +475,8 @@ fn execute_physical_plan(
                     let (left_cols, right_cols) = input_result.columns.split_at(left_col_count);
                     let (left_vec, right_vec) = row_vec.split_at(left_col_count);
 
-                    let left_table_name = if let PhysicalPlan::TableScan{table_name} = &**left { Some(table_name.as_str()) } else {None};
-                    let right_table_name = if let PhysicalPlan::TableScan{table_name} = &**right { Some(table_name.as_str()) } else {None};
+                    let left_table_name = if let PhysicalPlan::TableScan{table_name, ..} = &**left { Some(table_name.as_str()) } else {None};
+                    let right_table_name = if let PhysicalPlan::TableScan{table_name, ..} = &**right { Some(table_name.as_str()) } else {None};
 
                     let left_map = row_vec_to_map(left_vec, left_cols, left_table_name);
                     let right_map = row_vec_to_map(right_vec, right_cols, right_table_name);
@@ -1090,4 +1100,120 @@ fn execute_vacuum(
     
     update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, new_first_page_id)?;
     Ok(())
+}
+
+fn execute_analyze(
+    table_name: &str,
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    lm: &Arc<LockManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+) -> Result<(), ExecutionError> {
+    let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+        .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
+    if first_page_id == INVALID_PAGE_ID {
+        return Ok(()); // Nothing to analyze on an empty table
+    }
+
+    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
+
+    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+
+    for (i, column) in schema.iter().enumerate() {
+        let mut distinct_values = std::collections::HashSet::new();
+        for (_, _, parsed_row) in &all_rows {
+            if let Some(value) = parsed_row.get(&column.name) {
+                distinct_values.insert(value.clone());
+            }
+        }
+        let n_distinct = distinct_values.len() as i32;
+
+        // TODO: Delete old statistics for this column first.
+
+        // Now, store this in pg_statistic
+        let mut tuple_data = Vec::new();
+        tuple_data.extend_from_slice(&table_oid.to_be_bytes()); // starelid
+        tuple_data.extend_from_slice(&(i as u32).to_be_bytes()); // staattnum, 
+        tuple_data.extend_from_slice(&n_distinct.to_be_bytes()); // stadistinct
+
+        insert_tuple_into_system_table(
+            &tuple_data,
+            "pg_statistic",
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            snapshot,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// A generic helper to insert a raw tuple into a system catalog.
+/// This avoids the overhead of the full `execute_insert` path.
+fn insert_tuple_into_system_table(
+    tuple_data: &[u8],
+    table_name: &str,
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+) -> Result<(), ExecutionError> {
+    let (table_oid, mut first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+        .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
+
+    if first_page_id == INVALID_PAGE_ID {
+        let new_page_guard = bpm.new_page()?;
+        first_page_id = new_page_guard.read().id;
+        let mut page = new_page_guard.write();
+        let item_id = page.add_tuple(tuple_data, tx_id, 0).unwrap();
+        
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: first_page_id, item_id })?;
+        tm.set_last_lsn(tx_id, lsn);
+        page.header_mut().lsn = lsn;
+        
+        update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
+        return Ok(());
+    }
+
+    let mut current_page_id = first_page_id;
+    loop {
+        let page_guard = bpm.acquire_page(current_page_id)?;
+        let has_space = {
+            let page = page_guard.read();
+            let needed = tuple_data.len() + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>() + std::mem::size_of::<bedrock::page::ItemIdData>();
+            page.header().upper_offset.saturating_sub(page.header().lower_offset) >= needed as u16
+        };
+
+        if has_space {
+            let mut page = page_guard.write();
+            let item_id = page.add_tuple(tuple_data, tx_id, 0).unwrap();
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: current_page_id, item_id })?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
+            return Ok(());
+        }
+
+        let next_page_id = page_guard.read().header().next_page_id;
+        if next_page_id == INVALID_PAGE_ID {
+            let new_page_guard = bpm.new_page()?;
+            let new_page_id = new_page_guard.read().id;
+            page_guard.write().header_mut().next_page_id = new_page_id;
+            let mut new_page = new_page_guard.write();
+            let item_id = new_page.add_tuple(tuple_data, tx_id, 0).unwrap();
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: new_page_id, item_id })?;
+            tm.set_last_lsn(tx_id, lsn);
+            new_page.header_mut().lsn = lsn;
+            return Ok(());
+        }
+        current_page_id = next_page_id;
+    }
 }

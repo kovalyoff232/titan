@@ -9,7 +9,7 @@ use crate::planner::LogicalPlan;
 pub enum PhysicalPlan {
     TableScan {
         table_name: String,
-        // We would add schema info here in a real system
+        filter: Option<Expression>,
     },
     IndexScan {
         table_name: String,
@@ -44,20 +44,17 @@ pub enum PhysicalPlan {
 /// A simple rule-based optimizer.
 pub fn optimize(plan: LogicalPlan) -> Result<PhysicalPlan, ()> {
     match plan {
-        LogicalPlan::Scan { table_name, .. } => Ok(PhysicalPlan::TableScan { table_name }),
+        LogicalPlan::Scan { table_name, filter, .. } => {
+            // For now, we will always use a table scan.
+            // A future improvement would be to check for available indexes and choose
+            // an IndexScan if a suitable one exists.
+            Ok(PhysicalPlan::TableScan { table_name, filter })
+        }
         LogicalPlan::Projection { input, expressions } => {
             let physical_input = optimize(*input)?;
             Ok(PhysicalPlan::Projection {
                 input: Box::new(physical_input),
                 expressions,
-            })
-        }
-        LogicalPlan::Filter { input, predicate } => {
-            // If no specific optimization applies, keep the filter.
-            let physical_input = optimize(*input)?;
-            Ok(PhysicalPlan::Filter {
-                input: Box::new(physical_input),
-                predicate,
             })
         }
         LogicalPlan::Join {

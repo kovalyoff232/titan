@@ -426,7 +426,7 @@ impl WalManager {
         // --- 3. Undo Phase ---
         // For all transactions that were active at the end of the analysis (loser transactions),
         // undo their changes from last to first.
-        let mut to_undo: HashSet<u32> = active_tx_table.keys().cloned().collect();
+        let to_undo: HashSet<u32> = active_tx_table.keys().cloned().collect();
         
         // We need to find the maximum LSN among all loser transactions to start the undo scan.
         let mut max_lsn = 0;
@@ -438,7 +438,7 @@ impl WalManager {
             }
         }
 
-        current_pos = max_lsn as usize;
+        let mut current_pos = max_lsn as usize;
         while current_pos > 0 {
             let header_slice =
                 &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
@@ -455,8 +455,8 @@ impl WalManager {
                     // Then we would apply the actual UNDO operation.
                     // This is a simplified version.
                     match record {
-                        WalRecord::UpdateTuple { page_id, item_id, old_data, .. } => {
-                             let mut page = pager.read_page(page_id)?;
+                        WalRecord::UpdateTuple { page_id, .. } => {
+                             let page = pager.read_page(page_id)?;
                              // We only undo if the change was actually applied.
                              if page.header().lsn >= current_pos as u64 {
                                  // In a real system, we'd get the tuple and restore it.

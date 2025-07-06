@@ -356,7 +356,7 @@ fn btree_delete_recursive(
     tm: &Arc<TransactionManager>,
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
-    parent_page_id: PageId,
+    _parent_page_id: PageId,
     current_page_id: PageId,
     key: Key,
 ) -> io::Result<()> {

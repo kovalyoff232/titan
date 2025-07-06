@@ -9,10 +9,7 @@ pub enum LogicalPlan {
     Scan {
         table_name: String,
         alias: Option<String>,
-    },
-    Filter {
-        input: Box<LogicalPlan>,
-        predicate: Expression,
+        filter: Option<Expression>,
     },
     Projection {
         input: Box<LogicalPlan>,
@@ -36,6 +33,7 @@ pub fn create_logical_plan(stmt: &SelectStatement) -> Result<LogicalPlan, ()> {
         TableReference::Table { name } => LogicalPlan::Scan {
             table_name: name.clone(),
             alias: None,
+            filter: stmt.where_clause.clone(),
         },
         TableReference::Join {
             left,
@@ -53,13 +51,6 @@ pub fn create_logical_plan(stmt: &SelectStatement) -> Result<LogicalPlan, ()> {
     };
 
     let mut plan = from_plan;
-
-    if let Some(predicate) = &stmt.where_clause {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: predicate.clone(),
-        };
-    }
 
     if let Some(order_by) = &stmt.order_by {
         plan = LogicalPlan::Sort {
@@ -81,6 +72,7 @@ fn build_plan_from_table_ref(table_ref: &TableReference) -> Result<LogicalPlan, 
         TableReference::Table { name } => Ok(LogicalPlan::Scan {
             table_name: name.clone(),
             alias: None,
+            filter: None,
         }),
         _ => Err(()), // Nested joins not supported yet
     }

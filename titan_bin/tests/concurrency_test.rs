@@ -10,7 +10,6 @@ mod common;
 fn test_concurrent_updates_conflict() {
     // --- Настройка ---
     let mut test_client = common::setup_server_and_client("concurrency_test");
-    let addr = test_client.addr.clone();
 
     test_client.simple_query("CREATE TABLE accounts (id INT, balance INT);");
     test_client.simple_query("INSERT INTO accounts VALUES (1, 100);");
@@ -18,7 +17,7 @@ fn test_concurrent_updates_conflict() {
     println!("[MAIN] Таблица 'accounts' создана и заполнена.");
 
     // --- Транзакции ---
-    let addr_clone1 = addr.to_string();
+    let addr_clone1 = test_client.addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Поток запущен.");
         let mut client1 = Client::connect(&addr_clone1, NoTls).unwrap();
@@ -45,7 +44,7 @@ fn test_concurrent_updates_conflict() {
         println!("[TX1] Транзакция завершена.");
     });
 
-    let addr_clone2 = addr.to_string();
+    let addr_clone2 = test_client.addr.to_string();
     let handle2 = thread::spawn(move || {
         println!("[TX2] Поток запущен.");
         thread::sleep(Duration::from_millis(100));
@@ -90,7 +89,6 @@ fn test_concurrent_updates_conflict() {
 fn test_deadlock_detection() {
     // --- Setup ---
     let mut test_client = common::setup_server_and_client("deadlock_test");
-    let addr = test_client.addr.clone();
 
     test_client.simple_query("CREATE TABLE deadlock_test (id INT);");
     test_client.simple_query("INSERT INTO deadlock_test VALUES (1);");
@@ -99,7 +97,7 @@ fn test_deadlock_detection() {
     println!("[MAIN] Table 'deadlock_test' created and populated.");
 
     // --- Transactions ---
-    let addr_clone1 = addr.to_string();
+    let addr_clone1 = test_client.addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Thread started.");
         let mut client1 = Client::connect(&addr_clone1, NoTls).unwrap();
@@ -128,7 +126,7 @@ fn test_deadlock_detection() {
         result
     });
 
-    let addr_clone2 = addr.to_string();
+    let addr_clone2 = test_client.addr.to_string();
     let handle2 = thread::spawn(move || {
         println!("[TX2] Thread started.");
         // Give TX1 time to lock resource 1
