@@ -110,7 +110,7 @@ pub enum SelectItem {
     Wildcard,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BinaryOperator {
     Plus,
     Minus,
@@ -120,6 +120,7 @@ pub enum BinaryOperator {
     LtEq,
     Gt,
     GtEq,
+    And,
 }
 
 #[derive(Debug, PartialEq, Clone)]

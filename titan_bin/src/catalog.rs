@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
+use bedrock::wal::WalManager;
 use bedrock::PageId;
 use crate::errors::ExecutionError;
 use crate::types::Column;
 
-const PG_CLASS_TABLE_OID: PageId = 0;
-const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
+pub const PG_CLASS_TABLE_OID: PageId = 0;
+pub const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
 
 pub fn find_table(
     name: &str,
@@ -96,6 +97,7 @@ pub fn get_table_schema(
 pub fn update_pg_class_page_id(
     bpm: &Arc<BufferPoolManager>,
     tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
     table_oid: u32,
@@ -107,6 +109,7 @@ pub fn update_pg_class_page_id(
     let mut old_item_id = None;
     let mut old_tuple_data = None;
 
+    // Find the old entry and mark it as deleted.
     for i in 0..pg_class_page.get_tuple_count() {
         if pg_class_page.is_visible(snapshot, tx_id, i) {
             let oid = {
@@ -125,10 +128,37 @@ pub fn update_pg_class_page_id(
         }
     }
 
+    // Add the new entry with the correct page_id.
     if let Some(mut tuple_data) = old_tuple_data {
         tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
-        pg_class_page.add_tuple(&tuple_data, tx_id, 0)
+        let new_item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0)
             .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_class".to_string()))?;
+        
+        if let Some(old_id) = old_item_id {
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(
+                tx_id,
+                prev_lsn,
+                &bedrock::wal::WalRecord::DeleteTuple {
+                    tx_id,
+                    page_id: PG_CLASS_TABLE_OID,
+                    item_id: old_id,
+                },
+            )?;
+            tm.set_last_lsn(tx_id, lsn);
+        }
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(
+            tx_id,
+            prev_lsn,
+            &bedrock::wal::WalRecord::InsertTuple {
+                tx_id,
+                page_id: PG_CLASS_TABLE_OID,
+                item_id: new_item_id,
+            },
+        )?;
+        tm.set_last_lsn(tx_id, lsn);
+        pg_class_page.header_mut().lsn = lsn;
     }
     Ok(())
 }

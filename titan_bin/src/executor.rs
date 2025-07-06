@@ -6,154 +6,19 @@ use bedrock::buffer_pool::BufferPoolManager;
 use crate::optimizer::{self, PhysicalPlan};
 use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator};
 use crate::planner;
-use bedrock::lock_manager::{LockManager, LockableResource, LockMode, LockError};
+use bedrock::lock_manager::{LockManager, LockableResource, LockMode};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
 use bedrock::{btree, PageId};
 use chrono::prelude::*;
+use crate::catalog::{find_table, get_table_schema, update_pg_class_page_id, PG_CLASS_TABLE_OID, PG_ATTRIBUTE_TABLE_OID};
+use crate::errors::ExecutionError;
+use crate::types::{Column, ExecuteResult, ResultSet};
 
-// --- Result Enums ---
-
-#[derive(Debug)]
-pub enum ExecuteResult {
-    ResultSet(ResultSet),
-    Insert(u32),
-    Delete(u32),
-    Update(u32),
-    Ddl,
-}
-
-#[derive(Clone, Debug)]
-pub struct ResultSet {
-    pub columns: Vec<Column>,
-    pub rows: Vec<Vec<String>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Column {
-    pub name: String,
-    pub type_id: u32,
-}
-
-#[derive(Debug)]
-pub enum ExecutionError {
-    IoError(()),
-    TableNotFound(String),
-    ColumnNotFound(String),
-    GenericError(String),
-    Deadlock,
-    SerializationFailure,
-    PlanningError(String),
-}
-
-impl From<std::io::Error> for ExecutionError {
-    fn from(_err: std::io::Error) -> Self {
-        ExecutionError::IoError(())
-    }
-}
-
-impl From<LockError> for ExecutionError {
-    fn from(err: LockError) -> Self {
-        match err {
-            LockError::Deadlock => ExecutionError::Deadlock,
-        }
-    }
-}
-
-// --- Constants ---
-
-const PG_CLASS_TABLE_OID: PageId = 0;
-const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
 const PG_STATISTIC_TABLE_OID: PageId = 2;
 
 // --- Helper Functions ---
-
-fn find_table(
-    name: &str,
-    bpm: &Arc<BufferPoolManager>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-) -> Result<Option<(u32, u32)>, ExecutionError> {
-    println!(
-        "[find_table] Searching for table '{}' with tx_id: {} and snapshot: {:?}",
-        name, tx_id, snapshot
-    );
-    let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
-    let page = page_guard.read();
-    let mut best_candidate: Option<(bedrock::page::TransactionId, u32, u32)> = None;
-
-    for i in 0..page.get_tuple_count() {
-        if page.is_visible(snapshot, tx_id, i) {
-            if let (Some(tuple_data), Some(item_id_data)) =
-                (page.get_tuple(i), page.get_item_id_data(i))
-            {
-                let header = page.tuple_header(item_id_data.offset);
-                let name_len = tuple_data[8] as usize;
-                if tuple_data.len() >= 9 + name_len {
-                    let table_name = String::from_utf8_lossy(&tuple_data[9..9 + name_len]);
-                    if table_name == name {
-                        println!(
-                            "[find_table] Checking item_id: {}, xmin: {}, xmax: {}, visible: true, name: {}",
-                            i, header.xmin, header.xmax, table_name
-                        );
-                        let table_oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
-                        let table_page_id =
-                            u32::from_be_bytes(tuple_data[4..8].try_into().unwrap());
-
-                        // We want the most recent committed version that is visible to us.
-                        if best_candidate.is_none() || header.xmin > best_candidate.unwrap().0 {
-                            best_candidate = Some((header.xmin, table_oid, table_page_id));
-                            println!(
-                                "[find_table] Found candidate for '{}': oid={}, page_id={}, xmin={}",
-                                name, table_oid, table_page_id, header.xmin
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some((xmin, oid, page_id)) = best_candidate {
-        println!(
-            "[find_table] Selected best candidate for '{}': oid={}, page_id={}, xmin={}",
-            name, oid, page_id, xmin
-        );
-        Ok(Some((oid, page_id)))
-    } else {
-        println!("[find_table] No visible table named '{}' found.", name);
-        Ok(None)
-    }
-}
-
-fn get_table_schema(
-    bpm: &Arc<BufferPoolManager>,
-    table_oid: u32,
-    tx_id: u32,
-    snapshot: &Snapshot,
-) -> Result<Vec<Column>, ExecutionError> {
-    let mut schema_cols = Vec::new();
-    let attr_page_guard = bpm.acquire_page(PG_ATTRIBUTE_TABLE_OID)?;
-    let attr_page = attr_page_guard.read();
-    for i in 0..attr_page.get_tuple_count() {
-        if attr_page.is_visible(snapshot, tx_id, i) {
-            if let Some(tuple_data) = attr_page.get_tuple(i) {
-                let rel_oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
-                if rel_oid == table_oid {
-                    let attnum = u16::from_be_bytes(tuple_data[4..6].try_into().unwrap());
-                    let type_id = u32::from_be_bytes(tuple_data[6..10].try_into().unwrap());
-                    let name_len = tuple_data[10] as usize;
-                    let name =
-                        String::from_utf8_lossy(&tuple_data[11..11 + name_len]).to_string();
-                    schema_cols.push((attnum, Column { name, type_id }));
-                }
-            }
-        }
-    }
-    // Sort columns by attribute number to ensure correct order
-    schema_cols.sort_by_key(|(attnum, _)| *attnum);
-    Ok(schema_cols.into_iter().map(|(_, col)| col).collect())
-}
 
 fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, LiteralValue> {
     let mut offset = 0;
@@ -233,7 +98,7 @@ pub fn execute(
         Statement::Select(select_stmt) => {
             let logical_plan = planner::create_logical_plan(select_stmt)
                 .map_err(|_| ExecutionError::PlanningError("Failed to create logical plan".to_string()))?;
-            let physical_plan = optimizer::optimize(logical_plan)
+            let physical_plan = optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot)
                 .map_err(|_| ExecutionError::PlanningError("Failed to create physical plan".to_string()))?;
             
             println!("[Executor] Physical Plan: {:?}", physical_plan);
@@ -343,10 +208,10 @@ fn execute_physical_plan(
         PhysicalPlan::Filter { input, predicate } => {
             let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
             let mut filtered_rows = Vec::new();
-            for row_vec in input_result.rows {
+            for row_vec in &input_result.rows {
                 let row_map = row_vec_to_map(&row_vec, &input_result.columns, None);
                 if evaluate_expr_for_row(predicate, &row_map)? {
-                    filtered_rows.push(row_vec);
+                    filtered_rows.push(row_vec.clone());
                 }
             }
             Ok(ResultSet {
@@ -745,85 +610,6 @@ fn execute_insert(
     }
 }
 
-/// Helper to update the page_id in the pg_class table for a given table OID.
-fn update_pg_class_page_id(
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    table_oid: u32,
-    new_page_id: PageId,
-) -> Result<(), ExecutionError> {
-    let pg_class_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
-    let mut pg_class_page = pg_class_guard.write();
-
-    let mut old_item_id = None;
-    let mut old_tuple_data = None;
-
-    // Find the old entry and mark it as deleted.
-    for i in 0..pg_class_page.get_tuple_count() {
-        if pg_class_page.is_visible(snapshot, tx_id, i) {
-            let oid = {
-                let tuple_data = pg_class_page.get_tuple(i).unwrap();
-                u32::from_be_bytes(tuple_data[0..4].try_into().unwrap())
-            };
-            if oid == table_oid {
-                let tuple_data_vec = pg_class_page.get_tuple(i).unwrap().to_vec();
-                if let Some(header) = pg_class_page.get_tuple_header_mut(i) {
-                    header.xmax = tx_id;
-                    old_item_id = Some(i);
-                    old_tuple_data = Some(tuple_data_vec);
-                    println!(
-                        "[update_pg_class] Marked pg_class entry for oid {} (item_id {}) as deleted by tx {}",
-                        table_oid, i, tx_id
-                    );
-                }
-                break;
-            }
-        }
-    }
-
-    // Add the new entry with the correct page_id.
-    if let Some(mut tuple_data) = old_tuple_data {
-        tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
-        let new_item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0)
-            .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_class".to_string()))?;
-        println!(
-            "[update_pg_class] Added new pg_class entry for oid {} with page_id {} at item_id {}",
-            table_oid, new_page_id, new_item_id
-        );
-
-        // Log changes to WAL
-        if let Some(old_id) = old_item_id {
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::DeleteTuple {
-                    tx_id,
-                    page_id: PG_CLASS_TABLE_OID,
-                    item_id: old_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-        }
-        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: PG_CLASS_TABLE_OID,
-                item_id: new_item_id,
-            },
-        )?;
-        tm.set_last_lsn(tx_id, lsn);
-        pg_class_page.header_mut().lsn = lsn;
-    }
-    Ok(())
-}
-
 fn execute_update(
     stmt: &UpdateStatement,
     bpm: &Arc<BufferPoolManager>,
@@ -1008,12 +794,14 @@ fn evaluate_expr_for_row_to_val<'a>(
                         BinaryOperator::LtEq => Ok(LiteralValue::Bool(lnum <= rnum)),
                         BinaryOperator::Gt => Ok(LiteralValue::Bool(lnum > rnum)),
                         BinaryOperator::GtEq => Ok(LiteralValue::Bool(lnum >= rnum)),
+                        BinaryOperator::And => Ok(LiteralValue::Bool(lnum != 0 && rnum != 0)),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => {
                     match op {
                         BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
                         BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
+                        BinaryOperator::And => Ok(LiteralValue::Bool(l && r)),
                         _ => Err(ExecutionError::GenericError("Unsupported operator for boolean".to_string())),
                     }
                 }
@@ -1131,7 +919,24 @@ fn execute_analyze(
         }
         let n_distinct = distinct_values.len() as i32;
 
-        // TODO: Delete old statistics for this column first.
+        // Delete old statistics for this column first.
+        let delete_stmt = DeleteStatement {
+            table_name: "pg_statistic".to_string(),
+            where_clause: Some(Expression::Binary {
+                left: Box::new(Expression::Binary {
+                    left: Box::new(Expression::Column("starelid".to_string())),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expression::Literal(LiteralValue::Number(table_oid.to_string()))),
+                }),
+                op: BinaryOperator::And,
+                right: Box::new(Expression::Binary {
+                    left: Box::new(Expression::Column("staattnum".to_string())),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expression::Literal(LiteralValue::Number(i.to_string()))),
+                }),
+            }),
+        };
+        execute_delete_internal(&delete_stmt, bpm, tm, lm, wm, tx_id, snapshot)?;
 
         // Now, store this in pg_statistic
         let mut tuple_data = Vec::new();
@@ -1216,4 +1021,42 @@ fn insert_tuple_into_system_table(
         }
         current_page_id = next_page_id;
     }
+}
+
+fn execute_delete_internal(
+    stmt: &DeleteStatement,
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    lm: &Arc<LockManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+) -> Result<u32, ExecutionError> {
+    let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+        .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
+    if first_page_id == INVALID_PAGE_ID { return Ok(0); }
+
+    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let mut rows_affected = 0;
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let to_delete: Vec<_> = all_rows.into_iter().filter(|(_, _, parsed)| {
+        stmt.where_clause.as_ref().map_or(true, |p| evaluate_expr_for_row(p, parsed).unwrap_or(false))
+    }).collect();
+
+    for (page_id, item_id, _) in to_delete {
+        lm.lock(tx_id, LockableResource::Tuple((page_id, item_id)), LockMode::Exclusive)?;
+        let page_guard = bpm.acquire_page(page_id)?;
+        let mut page = page_guard.write();
+        if !page.is_visible(snapshot, tx_id, item_id) { continue; }
+        if let Some(header) = page.get_tuple_header_mut(item_id) {
+            if header.xmax != 0 { return Err(ExecutionError::SerializationFailure); }
+            header.xmax = tx_id;
+            rows_affected += 1;
+            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { tx_id, page_id, item_id })?;
+            tm.set_last_lsn(tx_id, lsn);
+            page.header_mut().lsn = lsn;
+        }
+    }
+    Ok(rows_affected)
 }

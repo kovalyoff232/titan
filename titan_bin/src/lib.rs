@@ -7,13 +7,17 @@ use bedrock::lock_manager::LockManager;
 use bedrock::pager::Pager;
 use bedrock::transaction::TransactionManager;
 use bedrock::wal::WalManager;
-use crate::executor::{ExecuteResult, ResultSet, Column};
+use crate::types::{Column, ExecuteResult, ResultSet};
+use crate::errors::ExecutionError;
 use bytes::{BufMut, BytesMut};
 
 pub mod parser;
 pub mod executor;
 pub mod planner;
 pub mod optimizer;
+pub mod types;
+pub mod errors;
+pub mod catalog;
 
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
@@ -182,7 +186,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                             continue;
                         }
                         parser::Statement::Rollback => {
-                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm)?;
+                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                             lm.unlock_all(tx_id);
                             in_transaction = false;
                             in_explicit_transaction = false;
@@ -198,7 +202,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                         Ok(res) => {
                             last_result = Some(res);
                         }
-                        Err(executor::ExecutionError::SerializationFailure) => {
+                        Err(errors::ExecutionError::SerializationFailure) => {
                             println!("[handle_client] Serialization failure for tx_id: {}.", tx_id);
                             send_error_response(&mut stream, "Serialization failure", "40001")?;
                             tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
@@ -314,7 +318,7 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
 }
 
 /// Initializes the system catalogs for a new database.
-fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm: &Arc<LockManager>, wal: &Arc<Mutex<WalManager>>) -> Result<(), executor::ExecutionError> {
+fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm: &Arc<LockManager>, wal: &Arc<Mutex<WalManager>>) -> Result<(), errors::ExecutionError> {
     println!("[initialize_db] Starting database initialization.");
     let tx_id = tm.begin();
     let snapshot = tm.create_snapshot(tx_id);

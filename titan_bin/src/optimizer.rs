@@ -4,6 +4,10 @@
 
 use crate::parser::{BinaryOperator, Expression, SelectItem};
 use crate::planner::LogicalPlan;
+use crate::catalog;
+use std::sync::Arc;
+use bedrock::buffer_pool::BufferPoolManager;
+use bedrock::transaction::{Snapshot, TransactionManager};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
@@ -42,16 +46,28 @@ pub enum PhysicalPlan {
 }
 
 /// A simple rule-based optimizer.
-pub fn optimize(plan: LogicalPlan) -> Result<PhysicalPlan, ()> {
+pub fn optimize(
+    plan: LogicalPlan,
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+) -> Result<PhysicalPlan, ()> {
     match plan {
         LogicalPlan::Scan { table_name, filter, .. } => {
-            // For now, we will always use a table scan.
-            // A future improvement would be to check for available indexes and choose
-            // an IndexScan if a suitable one exists.
+            if let Some(Expression::Binary { left, op: BinaryOperator::Eq, right }) = &filter {
+                if let (Expression::Column(col_name), Expression::Literal(crate::parser::LiteralValue::Number(key_str))) = (&**left, &**right) {
+                    let index_name = format!("idx_{}", col_name);
+                    if catalog::find_table(&index_name, bpm, tx_id, snapshot).unwrap().is_some() {
+                        let key = key_str.parse::<i32>().unwrap();
+                        return Ok(PhysicalPlan::IndexScan { table_name, index_name, key });
+                    }
+                }
+            }
             Ok(PhysicalPlan::TableScan { table_name, filter })
         }
         LogicalPlan::Projection { input, expressions } => {
-            let physical_input = optimize(*input)?;
+            let physical_input = optimize(*input, bpm, tm, tx_id, snapshot)?;
             Ok(PhysicalPlan::Projection {
                 input: Box::new(physical_input),
                 expressions,
@@ -62,12 +78,9 @@ pub fn optimize(plan: LogicalPlan) -> Result<PhysicalPlan, ()> {
             right,
             condition,
         } => {
-            let physical_left = optimize(*left)?;
-            let physical_right = optimize(*right)?;
+            let physical_left = optimize(*left, bpm, tm, tx_id, snapshot)?;
+            let physical_right = optimize(*right, bpm, tm, tx_id, snapshot)?;
 
-            // Rule: Choose Join Algorithm
-            // If it's a simple equality on qualified columns, use HashJoin.
-            // Otherwise, fall back to NestedLoopJoin.
             if let Expression::Binary {
                 left: left_expr,
                 op: BinaryOperator::Eq,
@@ -86,7 +99,6 @@ pub fn optimize(plan: LogicalPlan) -> Result<PhysicalPlan, ()> {
                 }
             }
 
-            // Fallback for non-equi joins or complex conditions
             Ok(PhysicalPlan::NestedLoopJoin {
                 left: Box::new(physical_left),
                 right: Box::new(physical_right),
@@ -94,7 +106,7 @@ pub fn optimize(plan: LogicalPlan) -> Result<PhysicalPlan, ()> {
             })
         }
         LogicalPlan::Sort { input, order_by } => {
-            let physical_input = optimize(*input)?;
+            let physical_input = optimize(*input, bpm, tm, tx_id, snapshot)?;
             Ok(PhysicalPlan::Sort {
                 input: Box::new(physical_input),
                 order_by,
