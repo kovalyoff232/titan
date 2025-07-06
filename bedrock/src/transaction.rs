@@ -89,59 +89,95 @@ impl TransactionManager {
         self.state.last_lsns.lock().unwrap().insert(tx_id, lsn);
     }
 
-    /// Aborts a transaction, rolling back its changes.
+    /// Aborts a transaction, rolling back its changes using ARIES-style UNDO.
     pub fn abort(&self, tx_id: TransactionId, wal: &mut WalManager, bpm: &Arc<BufferPoolManager>) -> std::io::Result<()> {
         println!("[TM::abort] Aborting tx_id: {}", tx_id);
 
-        let mut last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+        let mut current_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
 
-        while last_lsn > 0 {
-            let (record, prev_lsn) = wal.read_record(last_lsn)?;
+        while current_lsn > 0 {
+            let (record, prev_lsn) = wal.read_record(current_lsn)?;
 
-            if let Some(rec) = record {
-                if rec.tx_id() != tx_id {
-                    last_lsn = prev_lsn;
+            let rec = match record {
+                Some(r) => r,
+                None => {
+                    // Reached end or corruption
+                    break;
+                }
+            };
+
+            // We only care about records from the transaction we are aborting
+            if rec.tx_id() != tx_id {
+                current_lsn = prev_lsn;
+                continue;
+            }
+
+            // Generate and log a Compensation Log Record (CLR) *before* undoing the change.
+            // The CLR's `undo_next_lsn` points to the `prev_lsn` of the record we are undoing.
+            // This makes UNDO operations idempotent. If we crash during UNDO, we can restart
+            // and the CLRs will tell us which actions have already been undone.
+            let clr = WalRecord::CompensationLogRecord {
+                tx_id,
+                page_id: 0, // Placeholder, specific to record type
+                item_id: 0, // Placeholder
+                undo_next_lsn: prev_lsn,
+            };
+            
+            let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+            let clr_lsn = wal.log(tx_id, last_lsn, &clr)?;
+            self.set_last_lsn(tx_id, clr_lsn);
+
+            // Now, perform the physical UNDO operation.
+            match rec {
+                WalRecord::InsertTuple { page_id, item_id, .. } => {
+                    let page_guard = bpm.acquire_page(page_id)?;
+                    let mut page = page_guard.write();
+                    if let Some(header) = page.get_tuple_header_mut(item_id) {
+                        // Physically mark the tuple as deleted by this abort.
+                        header.xmax = tx_id; 
+                    }
+                    page.header_mut().lsn = clr_lsn;
+                }
+                WalRecord::DeleteTuple { page_id, item_id, .. } => {
+                    let page_guard = bpm.acquire_page(page_id)?;
+                    let mut page = page_guard.write();
+                    if let Some(header) = page.get_tuple_header_mut(item_id) {
+                        // Undo the deletion by clearing the xmax.
+                        if header.xmax == tx_id {
+                            header.xmax = 0;
+                        }
+                    }
+                    page.header_mut().lsn = clr_lsn;
+                }
+                WalRecord::UpdateTuple { page_id, item_id, old_data, .. } => {
+                    let page_guard = bpm.acquire_page(page_id)?;
+                    let mut page = page_guard.write();
+                    if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
+                        // Restore the old version of the tuple.
+                        tuple.copy_from_slice(&old_data);
+                    }
+                    page.header_mut().lsn = clr_lsn;
+                }
+                // CLRs are not undone. We just follow their `undo_next_lsn` pointer.
+                WalRecord::CompensationLogRecord { undo_next_lsn, .. } => {
+                    current_lsn = undo_next_lsn;
                     continue;
                 }
-
-                match rec {
-                    WalRecord::InsertTuple { page_id, item_id, .. } => {
-                        let page_guard = bpm.acquire_page(page_id)?;
-                        let mut page = page_guard.write();
-                        if let Some(header) = page.get_tuple_header_mut(item_id) {
-                            header.xmax = tx_id; // Mark as deleted by this aborting tx
-                        }
-                    }
-                    WalRecord::DeleteTuple { page_id, item_id, .. } => {
-                        let page_guard = bpm.acquire_page(page_id)?;
-                        let mut page = page_guard.write();
-                        if let Some(header) = page.get_tuple_header_mut(item_id) {
-                            if header.xmax == tx_id {
-                                header.xmax = 0;
-                            }
-                        }
-                    }
-                    WalRecord::UpdateTuple { page_id, item_id, old_data, .. } => {
-                        let page_guard = bpm.acquire_page(page_id)?;
-                        let mut page = page_guard.write();
-                        if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
-                            tuple.copy_from_slice(&old_data);
-                        }
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
-            last_lsn = prev_lsn;
+            
+            // Move to the previous record in this transaction's chain.
+            current_lsn = prev_lsn;
         }
+
+        // After undoing all changes, write an Abort record to the WAL.
+        let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+        wal.log(tx_id, last_lsn, &WalRecord::Abort { tx_id })?;
 
         self.state.active_transactions.lock().unwrap().remove(&tx_id);
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
 
-        let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Abort { tx_id })?;
-        self.set_last_lsn(tx_id, lsn);
-
-        println!("[TM::abort] Aborted tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
+        println!("[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
         Ok(())
     }
 
