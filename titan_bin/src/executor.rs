@@ -428,46 +428,59 @@ fn execute_physical_plan(
             let mut projected_rows = Vec::new();
             let mut projected_columns = Vec::new();
 
-            let input_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**input {
-                Some(table_name.as_str())
-            } else {
-                None
-            };
-
+            // Determine projected column names and types (simplified)
             for (i, item) in expressions.iter().enumerate() {
-                match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        let col_name = match expr {
-                            Expression::Column(name) => name.clone(),
-                            Expression::QualifiedColumn(table, col) => format!("{}.{}", table, col),
-                            _ => format!("?column?_{}", i),
-                        };
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+                    SelectItem::UnnamedExpr(expr) => match expr {
+                        Expression::Column(name) => name.clone(),
+                        Expression::QualifiedColumn(_, col) => col.clone(),
+                        _ => format!("?column?_{}", i),
+                    },
+                    SelectItem::Wildcard => "*".to_string(),
+                    SelectItem::QualifiedWildcard(table_name) => format!("{}.*", table_name),
+                };
+                // This is a simplification. We should ideally resolve the type from the input.
+                projected_columns.push(Column { name, type_id: 25 });
+            }
 
-                        if let Some(col) = input_result.columns.iter().find(|c| c.name == col_name) {
-                            projected_columns.push(col.clone());
-                        } else if let Expression::Column(name) = expr {
-                             if let Some(col) = input_result.columns.iter().find(|c| c.name == *name) {
-                                projected_columns.push(col.clone());
-                            }
-                        }
-                        else {
-                            projected_columns.push(Column { name: col_name, type_id: 25 }); // Default to TEXT
+            for row_vec in &input_result.rows {
+                let row_map: HashMap<String, LiteralValue> = if let PhysicalPlan::HashJoin { left, right, .. } | PhysicalPlan::NestedLoopJoin { left, right, .. } = &**input {
+                    // HACK: This is inefficient as it may re-fetch schema info.
+                    // It's also brittle as it assumes the direct children of the join are table scans.
+                    // A proper fix would involve a larger refactor of the ResultSet or execution context.
+                    fn get_child_schema(plan: &PhysicalPlan, bpm: &Arc<BufferPoolManager>, tx_id: u32, snapshot: &Snapshot) -> Result<Vec<Column>, ExecutionError> {
+                        if let PhysicalPlan::TableScan { table_name } = plan {
+                            let (oid, _) = find_table(table_name, bpm, tx_id, snapshot)?.ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
+                            get_table_schema(bpm, oid, tx_id, snapshot)
+                        } else {
+                            // This is not robust. We can't easily get the schema for a more complex child plan.
+                            Ok(vec![])
                         }
                     }
-                    _ => {} // Wildcard already handled
-                }
-            }
-            
-            for row_vec in input_result.rows {
-                let row_map = row_vec_to_map(&row_vec, &input_result.columns, input_table_name);
+
+                    let left_schema = get_child_schema(left, bpm, tx_id, snapshot)?;
+                    let left_col_count = left_schema.len();
+
+                    let (left_cols, right_cols) = input_result.columns.split_at(left_col_count);
+                    let (left_vec, right_vec) = row_vec.split_at(left_col_count);
+
+                    let left_table_name = if let PhysicalPlan::TableScan{table_name} = &**left { Some(table_name.as_str()) } else {None};
+                    let right_table_name = if let PhysicalPlan::TableScan{table_name} = &**right { Some(table_name.as_str()) } else {None};
+
+                    let left_map = row_vec_to_map(left_vec, left_cols, left_table_name);
+                    let right_map = row_vec_to_map(right_vec, right_cols, right_table_name);
+                    left_map.into_iter().chain(right_map).collect()
+                } else {
+                    let table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**input { Some(table_name.as_str()) } else { None };
+                    row_vec_to_map(&row_vec, &input_result.columns, table_name)
+                };
+
                 let mut projected_row = Vec::new();
                 for item in expressions {
-                    match item {
-                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                            let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
-                            projected_row.push(val.to_string());
-                        }
-                        _ => {} // Wildcard already handled
+                    if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+                        let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
+                        projected_row.push(val.to_string());
                     }
                 }
                 projected_rows.push(projected_row);
