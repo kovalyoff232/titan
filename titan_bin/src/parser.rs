@@ -1,21 +1,9 @@
+use chumsky::prelude::*;
 use std::fmt;
 
-// ... (весь остальной код файла)
+// --- AST ---
 
-impl fmt::Display for LiteralValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LiteralValue::Number(s) => write!(f, "{}", s),
-            LiteralValue::String(s) => write!(f, "{}", s),
-            LiteralValue::Bool(b) => write!(f, "{}", if *b { "t" } else { "f" }),
-            LiteralValue::Date(s) => write!(f, "{}", s),
-        }
-    }
-}
-
-use chumsky::prelude::*;
-
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
@@ -23,61 +11,15 @@ pub enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
-    DumpPage(u32),
     Vacuum(String),
     Analyze(String),
     Begin,
     Commit,
     Rollback,
+    DumpPage(u32),
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub struct UpdateStatement {
-    pub table_name: String,
-    pub assignments: Vec<(String, Expression)>,
-    pub where_clause: Option<Expression>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct DeleteStatement {
-    pub table_name: String,
-    pub where_clause: Option<Expression>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct InsertStatement {
-    pub table_name: String,
-    pub values: Vec<Expression>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct CreateTableStatement {
-    pub table_name: String,
-    pub columns: Vec<ColumnDef>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct CreateIndexStatement {
-    pub index_name: String,
-    pub table_name: String,
-    pub column_name: String,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: DataType,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum DataType {
-    Int,
-    Text,
-    Bool,
-    Date,
-}
-
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SelectStatement {
     pub select_list: Vec<SelectItem>,
     pub from: Vec<TableReference>,
@@ -86,7 +28,18 @@ pub struct SelectStatement {
     pub for_update: bool,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SelectItem {
+    UnnamedExpr(Expression),
+    ExprWithAlias {
+        expr: Expression,
+        alias: String,
+    },
+    Wildcard,
+    QualifiedWildcard(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TableReference {
     Table {
         name: String,
@@ -98,16 +51,70 @@ pub enum TableReference {
     },
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum SelectItem {
-    /// An expression, e.g., `1`, `1 + 2`, `foo`
-    UnnamedExpr(Expression),
-    /// `expr AS alias`
-    ExprWithAlias { expr: Expression, alias: String },
-    /// `table.*`
-    QualifiedWildcard(String),
-    /// `*`
-    Wildcard,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateTableStatement {
+    pub table_name: String,
+    pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DataType {
+    Int,
+    Text,
+    Bool,
+    Date,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateIndexStatement {
+    pub index_name: String,
+    pub table_name: String,
+    pub column_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InsertStatement {
+    pub table_name: String,
+    pub values: Vec<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UpdateStatement {
+    pub table_name: String,
+    pub assignments: Vec<(String, Expression)>,
+    pub where_clause: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeleteStatement {
+    pub table_name: String,
+    pub where_clause: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Expression {
+    Literal(LiteralValue),
+    Column(String),
+    QualifiedColumn(String, String),
+    Binary {
+        left: Box<Expression>,
+        op: BinaryOperator,
+        right: Box<Expression>,
+    },
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, PartialOrd)]
+pub enum LiteralValue {
+    Number(String),
+    String(String),
+    Bool(bool),
+    Date(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -123,25 +130,45 @@ pub enum BinaryOperator {
     And,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum Expression {
-    Literal(LiteralValue),
-    Column(String),
-    QualifiedColumn(String, String), // table, column
-    Binary {
-        left: Box<Expression>,
-        op: BinaryOperator,
-        right: Box<Expression>,
-    },
+impl fmt::Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expression::Literal(lit) => write!(f, "{}", lit),
+            Expression::Column(name) => write!(f, "{}", name),
+            Expression::QualifiedColumn(table, col) => write!(f, "{}.{}", table, col),
+            Expression::Binary { left, op, right } => write!(f, "({} {} {})", left, op, right),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, PartialOrd)]
-pub enum LiteralValue {
-    Number(String),
-    String(String),
-    Bool(bool),
-    Date(String),
+impl fmt::Display for LiteralValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LiteralValue::Number(s) => write!(f, "{}", s),
+            LiteralValue::String(s) => write!(f, "{}", s),
+            LiteralValue::Bool(b) => write!(f, "{}", b),
+            LiteralValue::Date(s) => write!(f, "{}", s),
+        }
+    }
 }
+
+impl fmt::Display for BinaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinaryOperator::Plus => write!(f, "+"),
+            BinaryOperator::Minus => write!(f, "-"),
+            BinaryOperator::Eq => write!(f, "="),
+            BinaryOperator::NotEq => write!(f, "<>"),
+            BinaryOperator::Lt => write!(f, "<"),
+            BinaryOperator::LtEq => write!(f, "<="),
+            BinaryOperator::Gt => write!(f, ">"),
+            BinaryOperator::GtEq => write!(f, ">="),
+            BinaryOperator::And => write!(f, "AND"),
+        }
+    }
+}
+
+// --- Parser ---
 
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
@@ -246,7 +273,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             select_item
                 .separated_by(just(',').padded())
                 .allow_trailing()
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
         )
         .then(text::keyword("FROM").padded().ignore_then(
             table_reference.separated_by(just(',').padded()).collect()

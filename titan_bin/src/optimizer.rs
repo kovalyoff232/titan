@@ -36,6 +36,12 @@ pub enum PhysicalPlan {
         left_key: Expression,
         right_key: Expression,
     },
+    MergeJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_key: Expression,
+        right_key: Expression,
+    },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -174,6 +180,19 @@ pub fn optimize(
                 right: right_expr,
             } = &condition
             {
+                // Check if inputs are sorted on join keys
+                let left_sorted = is_sorted_by(&physical_left, left_expr);
+                let right_sorted = is_sorted_by(&physical_right, right_expr);
+
+                if left_sorted && right_sorted {
+                    return Ok(PhysicalPlan::MergeJoin {
+                        left: Box::new(physical_left),
+                        right: Box::new(physical_right),
+                        left_key: *left_expr.clone(),
+                        right_key: *right_expr.clone(),
+                    });
+                }
+
                 if let (Expression::QualifiedColumn(..), Expression::QualifiedColumn(..)) =
                     (&**left_expr, &**right_expr)
                 {
@@ -201,3 +220,11 @@ pub fn optimize(
         }
     }
 }
+
+fn is_sorted_by(plan: &PhysicalPlan, key: &Expression) -> bool {
+    match plan {
+        PhysicalPlan::Sort { order_by, .. } => !order_by.is_empty() && &order_by[0] == key,
+        _ => false,
+    }
+}
+
