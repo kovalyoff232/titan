@@ -194,7 +194,11 @@ fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, Liter
     parsed_tuple
 }
 
-fn row_vec_to_map(row_vec: &[String], columns: &[Column]) -> HashMap<String, LiteralValue> {
+fn row_vec_to_map(
+    row_vec: &[String],
+    columns: &[Column],
+    table_name: Option<&str>,
+) -> HashMap<String, LiteralValue> {
     let mut map = HashMap::new();
     for (i, col) in columns.iter().enumerate() {
         let val_str = &row_vec[i];
@@ -205,6 +209,9 @@ fn row_vec_to_map(row_vec: &[String], columns: &[Column]) -> HashMap<String, Lit
             1082 => LiteralValue::Date(val_str.clone()),
             _ => LiteralValue::String(val_str.clone()),
         };
+        if let Some(table) = table_name {
+            map.insert(format!("{}.{}", table, col.name), literal.clone());
+        }
         map.insert(col.name.clone(), literal);
     }
     map
@@ -327,7 +334,7 @@ fn execute_physical_plan(
             let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
             let mut filtered_rows = Vec::new();
             for row_vec in input_result.rows {
-                let row_map = row_vec_to_map(&row_vec, &input_result.columns);
+                let row_map = row_vec_to_map(&row_vec, &input_result.columns, None);
                 if evaluate_expr_for_row(predicate, &row_map)? {
                     filtered_rows.push(row_vec);
                 }
@@ -345,11 +352,22 @@ fn execute_physical_plan(
             let mut joined_columns = left_result.columns.clone();
             joined_columns.extend(right_result.columns.clone());
 
+            let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
+                Some(table_name.as_str())
+            } else {
+                None
+            };
+            let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
+                Some(table_name.as_str())
+            } else {
+                None
+            };
+
             for left_row_vec in &left_result.rows {
                 for right_row_vec in &right_result.rows {
-                    let left_map = row_vec_to_map(left_row_vec, &left_result.columns);
-                    let right_map = row_vec_to_map(right_row_vec, &right_result.columns);
-                    let combined_map = left_map.into_iter().chain(right_map).collect();
+                    let left_map = row_vec_to_map(left_row_vec, &left_result.columns, left_table_name);
+                    let right_map = row_vec_to_map(right_row_vec, &right_result.columns, right_table_name);
+                    let combined_map: HashMap<String, LiteralValue> = left_map.into_iter().chain(right_map).collect();
                     
                     if evaluate_expr_for_row(condition, &combined_map)? {
                         let mut joined_row_vec = left_row_vec.clone();
@@ -368,17 +386,28 @@ fn execute_physical_plan(
             let mut joined_columns = left_result.columns.clone();
             joined_columns.extend(right_result.columns.clone());
 
+            let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
+                Some(table_name.as_str())
+            } else {
+                None
+            };
+            let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
+                Some(table_name.as_str())
+            } else {
+                None
+            };
+
             // Build phase
             let mut hash_table: HashMap<LiteralValue, Vec<&Vec<String>>> = HashMap::new();
             for right_row_vec in &right_result.rows {
-                let right_row_map = row_vec_to_map(right_row_vec, &right_result.columns);
+                let right_row_map = row_vec_to_map(right_row_vec, &right_result.columns, right_table_name);
                 let key = evaluate_expr_for_row_to_val(right_key, &right_row_map)?;
                 hash_table.entry(key).or_default().push(right_row_vec);
             }
 
             // Probe phase
             for left_row_vec in &left_result.rows {
-                let left_row_map = row_vec_to_map(left_row_vec, &left_result.columns);
+                let left_row_map = row_vec_to_map(left_row_vec, &left_result.columns, left_table_name);
                 let key = evaluate_expr_for_row_to_val(left_key, &left_row_map)?;
                 if let Some(matching_rows) = hash_table.get(&key) {
                     for right_row_vec in matching_rows {
@@ -399,16 +428,30 @@ fn execute_physical_plan(
             let mut projected_rows = Vec::new();
             let mut projected_columns = Vec::new();
 
+            let input_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**input {
+                Some(table_name.as_str())
+            } else {
+                None
+            };
+
             for (i, item) in expressions.iter().enumerate() {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        if let Expression::Column(name) = expr {
-                            if let Some(col) = input_result.columns.iter().find(|c| c.name == *name) {
+                        let col_name = match expr {
+                            Expression::Column(name) => name.clone(),
+                            Expression::QualifiedColumn(table, col) => format!("{}.{}", table, col),
+                            _ => format!("?column?_{}", i),
+                        };
+
+                        if let Some(col) = input_result.columns.iter().find(|c| c.name == col_name) {
+                            projected_columns.push(col.clone());
+                        } else if let Expression::Column(name) = expr {
+                             if let Some(col) = input_result.columns.iter().find(|c| c.name == *name) {
                                 projected_columns.push(col.clone());
                             }
-                        } else {
-                            // Handle more complex expressions if necessary
-                            projected_columns.push(Column { name: format!("?column?_{}", i), type_id: 25 }); // Default to TEXT
+                        }
+                        else {
+                            projected_columns.push(Column { name: col_name, type_id: 25 }); // Default to TEXT
                         }
                     }
                     _ => {} // Wildcard already handled
@@ -416,7 +459,7 @@ fn execute_physical_plan(
             }
             
             for row_vec in input_result.rows {
-                let row_map = row_vec_to_map(&row_vec, &input_result.columns);
+                let row_map = row_vec_to_map(&row_vec, &input_result.columns, input_table_name);
                 let mut projected_row = Vec::new();
                 for item in expressions {
                     match item {
@@ -924,7 +967,7 @@ fn evaluate_expr_for_row_to_val<'a>(
         Expression::Column(name) => row.get(name).cloned().ok_or_else(|| ExecutionError::ColumnNotFound(name.clone())),
         Expression::QualifiedColumn(table, col) => {
             let qname = format!("{}.{}", table, col);
-            row.get(&qname).cloned().or_else(|| row.get(col).cloned()).ok_or_else(|| ExecutionError::ColumnNotFound(qname))
+            row.get(&qname).cloned().ok_or_else(|| ExecutionError::ColumnNotFound(qname))
         }
         Expression::Binary { left, op, right } => {
             let lval = evaluate_expr_for_row_to_val(left, row)?;
