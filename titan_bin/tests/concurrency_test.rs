@@ -25,7 +25,7 @@ fn test_concurrent_updates_conflict() {
         client1.simple_query("BEGIN;").unwrap();
         println!("[TX1] Транзакция начата.");
 
-        let result = client1
+        let _result = client1
             .simple_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE")
             .unwrap();
         println!("[TX1] Прочитан баланс: 100");
@@ -74,9 +74,10 @@ fn test_concurrent_updates_conflict() {
     handle2.join().unwrap();
 
     println!("[MAIN] Оба потока завершены. Проверяем итоговый результат.");
-    let final_result = test_client.simple_query("SELECT balance FROM accounts WHERE id = 1");
-    let final_balance: i32 = final_result[0].parse().unwrap();
-
+    let final_rows = test_client.simple_query("SELECT balance FROM accounts WHERE id = 1");
+    assert_eq!(final_rows.len(), 1, "Должна остаться одна запись");
+    assert_eq!(final_rows[0].len(), 1, "В записи должен быть один столбец");
+    let final_balance: i32 = final_rows[0][0].parse().unwrap();
     println!("[MAIN] Итоговый баланс: {}.", final_balance);
     assert_eq!(
         final_balance, 110,
@@ -171,7 +172,7 @@ fn test_deadlock_detection() {
     println!("[MAIN] Verifying final state.");
     // Check the final state of the table. It should either be the state from TX1 or TX2 committing.
     let final_rows = test_client.simple_query("SELECT * FROM deadlock_test;");
-    let mut final_state: Vec<String> = final_rows.into_iter().collect();
+    let mut final_state: Vec<String> = final_rows.into_iter().flatten().collect();
     final_state.sort();
 
     let tx1_committed = final_state == vec!["10", "20"];

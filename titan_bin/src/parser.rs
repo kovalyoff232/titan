@@ -7,7 +7,7 @@ impl fmt::Display for LiteralValue {
         match self {
             LiteralValue::Number(s) => write!(f, "{}", s),
             LiteralValue::String(s) => write!(f, "{}", s),
-            LiteralValue::Bool(b) => write!(f, "{}", if *b { "TRUE" } else { "FALSE" }),
+            LiteralValue::Bool(b) => write!(f, "{}", if *b { "t" } else { "f" }),
             LiteralValue::Date(s) => write!(f, "{}", s),
         }
     }
@@ -81,6 +81,7 @@ pub struct SelectStatement {
     pub select_list: Vec<SelectItem>,
     pub from: Vec<TableReference>,
     pub where_clause: Option<Expression>,
+    pub order_by: Option<Vec<Expression>>,
     pub for_update: bool,
 }
 
@@ -143,7 +144,7 @@ pub enum LiteralValue {
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -249,12 +250,14 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             table_reference.separated_by(just(',').padded()).collect()
         ).or_not())
         .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
+        .then(text::keyword("ORDER").padded().ignore_then(text::keyword("BY")).padded().ignore_then(expr.clone().separated_by(just(',').padded()).collect()).or_not())
         .then(text::keyword("FOR").padded().ignore_then(text::keyword("UPDATE")).padded().or_not())
-        .map(|(((select_list, from), where_clause), for_update)| {
+        .map(|((((select_list, from), where_clause), order_by), for_update)| {
             Statement::Select(SelectStatement {
                 select_list,
                 from: from.unwrap_or_default(),
                 where_clause,
+                order_by,
                 for_update: for_update.is_some(),
             })
         });

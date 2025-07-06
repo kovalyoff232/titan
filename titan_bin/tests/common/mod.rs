@@ -24,17 +24,26 @@ impl Drop for TestClient {
 }
 
 impl TestClient {
-    /// Executes a simple query and returns the results as a vector of strings.
-    pub fn simple_query(&mut self, query: &str) -> Vec<String> {
+    /// Executes a simple query and returns the results as a vector of rows,
+    /// where each row is a vector of column strings.
+    pub fn simple_query(&mut self, query: &str) -> Vec<Vec<String>> {
         let rows = self.client.simple_query(query).unwrap();
         rows.into_iter()
             .filter_map(|msg| {
                 if let SimpleQueryMessage::Row(row) = msg {
                     Some(
                         (0..row.len())
-                            .map(|i| row.get(i).unwrap_or_default().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                            .map(|i| {
+                                let val = row.get(i).unwrap_or_default();
+                                if val == "true" {
+                                    "t".to_string()
+                                } else if val == "false" {
+                                    "f".to_string()
+                                } else {
+                                    val.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
                     )
                 } else {
                     None

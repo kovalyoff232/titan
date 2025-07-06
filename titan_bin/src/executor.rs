@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use bedrock::buffer_pool::BufferPoolManager;
-use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator, TableReference};
+use crate::optimizer::{self, PhysicalPlan};
+use crate::parser::{CreateTableStatement, CreateIndexStatement, Expression, InsertStatement, UpdateStatement, DeleteStatement, LiteralValue, SelectItem, SelectStatement, Statement, DataType, BinaryOperator};
+use crate::planner;
 use bedrock::lock_manager::{LockManager, LockableResource, LockMode, LockError};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
-use bedrock::{btree, PageId, TupleId};
+use bedrock::{btree, PageId};
 use chrono::prelude::*;
 
 // --- Result Enums ---
@@ -37,16 +39,16 @@ pub struct Column {
 #[derive(Debug)]
 pub enum ExecutionError {
     IoError(()),
-    TableNotFound(()),
-    ColumnNotFound(()),
-    GenericError(()),
+    TableNotFound(String),
+    ColumnNotFound(String),
+    GenericError(String),
     Deadlock,
     SerializationFailure,
+    PlanningError(String),
 }
 
 impl From<std::io::Error> for ExecutionError {
     fn from(err: std::io::Error) -> Self {
-        println!("[ExecutionError] IO Error: {}", err);
         ExecutionError::IoError(())
     }
 }
@@ -54,10 +56,7 @@ impl From<std::io::Error> for ExecutionError {
 impl From<LockError> for ExecutionError {
     fn from(err: LockError) -> Self {
         match err {
-            LockError::Deadlock => {
-                println!("[ExecutionError] Deadlock detected");
-                ExecutionError::Deadlock
-            }
+            LockError::Deadlock => ExecutionError::Deadlock,
         }
     }
 }
@@ -160,51 +159,34 @@ fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, Liter
     let mut parsed_tuple = HashMap::new();
 
     for col in schema {
-        if offset >= tuple_data.len() {
-            break;
-        }
+        if offset >= tuple_data.len() { break; }
         match col.type_id {
             16 => { // BOOLEAN
-                if offset + 1 > tuple_data.len() {
-                    break;
-                }
-                let val = tuple_data[offset] != 0;
+                if offset + 1 > tuple_data.len() { break; }
+                parsed_tuple.insert(col.name.clone(), LiteralValue::Bool(tuple_data[offset] != 0));
                 offset += 1;
-                parsed_tuple.insert(col.name.clone(), LiteralValue::Bool(val));
             }
-            23 => {
-                // INT
-                if offset + 4 > tuple_data.len() {
-                    break;
-                }
+            23 => { // INT
+                if offset + 4 > tuple_data.len() { break; }
                 let val = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
-                offset += 4;
                 parsed_tuple.insert(col.name.clone(), LiteralValue::Number(val.to_string()));
-            }
-            25 => {
-                // TEXT
-                if offset + 4 > tuple_data.len() {
-                    break;
-                }
-                let len =
-                    u32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
-                if offset + len > tuple_data.len() {
-                    break;
-                }
+            }
+            25 => { // TEXT
+                if offset + 4 > tuple_data.len() { break; }
+                let len = u32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + len > tuple_data.len() { break; }
                 let val = String::from_utf8_lossy(&tuple_data[offset..offset + len]);
-                offset += len;
                 parsed_tuple.insert(col.name.clone(), LiteralValue::String(val.into_owned()));
+                offset += len;
             }
             1082 => { // DATE
-                if offset + 4 > tuple_data.len() {
-                    break;
-                }
-                let days_since_epoch = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
-                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                let date = epoch + chrono::Duration::days(days_since_epoch as i64);
-                offset += 4;
+                if offset + 4 > tuple_data.len() { break; }
+                let days = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
+                let date = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap() + chrono::Duration::days(days as i64);
                 parsed_tuple.insert(col.name.clone(), LiteralValue::Date(date.format("%Y-%m-%d").to_string()));
+                offset += 4;
             }
             _ => {}
         }
@@ -212,7 +194,23 @@ fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, Liter
     parsed_tuple
 }
 
-// --- Main Executor ---
+fn row_vec_to_map(row_vec: &[String], columns: &[Column]) -> HashMap<String, LiteralValue> {
+    let mut map = HashMap::new();
+    for (i, col) in columns.iter().enumerate() {
+        let val_str = &row_vec[i];
+        let literal = match col.type_id {
+            16 => LiteralValue::Bool(val_str == "t"),
+            23 => LiteralValue::Number(val_str.clone()),
+            25 => LiteralValue::String(val_str.clone()),
+            1082 => LiteralValue::Date(val_str.clone()),
+            _ => LiteralValue::String(val_str.clone()),
+        };
+        map.insert(col.name.clone(), literal);
+    }
+    map
+}
+
+// --- Orchestrator ---
 
 pub fn execute(
     stmt: &Statement,
@@ -225,7 +223,15 @@ pub fn execute(
 ) -> Result<ExecuteResult, ExecutionError> {
     match stmt {
         Statement::Select(select_stmt) => {
-            execute_select(select_stmt, bpm, lm, tx_id, snapshot).map(ExecuteResult::ResultSet)
+            let logical_plan = planner::create_logical_plan(select_stmt)
+                .map_err(|_| ExecutionError::PlanningError("Failed to create logical plan".to_string()))?;
+            let physical_plan = optimizer::optimize(logical_plan)
+                .map_err(|_| ExecutionError::PlanningError("Failed to create physical plan".to_string()))?;
+            
+            println!("[Executor] Physical Plan: {:?}", physical_plan);
+
+            execute_physical_plan(&physical_plan, bpm, lm, tx_id, snapshot, select_stmt)
+                .map(ExecuteResult::ResultSet)
         }
         Statement::CreateTable(create_stmt) => {
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
@@ -251,7 +257,236 @@ pub fn execute(
                 .map(|_| ExecuteResult::Ddl)
         }
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
-        _ => Ok(ExecuteResult::Ddl),
+        _ => Err(ExecutionError::GenericError("Unsupported statement type".to_string())),
+    }
+}
+
+// --- Physical Plan Executor ---
+
+fn execute_physical_plan(
+    plan: &PhysicalPlan,
+    bpm: &Arc<BufferPoolManager>,
+    lm: &Arc<LockManager>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    select_stmt: &SelectStatement,
+) -> Result<ResultSet, ExecutionError> {
+    match plan {
+        PhysicalPlan::TableScan { table_name } => {
+            let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
+            let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            let rows_with_ids = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, select_stmt.for_update)?;
+            let rows: Vec<Vec<String>> = rows_with_ids
+                .into_iter()
+                .map(|(_, _, row)| {
+                    schema
+                        .iter()
+                        .map(|col| {
+                            let val = row.get(&col.name).unwrap();
+                            match val {
+                                LiteralValue::Bool(b) => {
+                        if *b {
+                            "t".to_string()
+                        } else {
+                            "f".to_string()
+                        }
+                    }
+                                _ => val.to_string(),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(ResultSet { columns: schema, rows })
+        }
+        PhysicalPlan::IndexScan { table_name, key, .. } => {
+            let (table_oid, _first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
+            let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            
+            let index_name = format!("idx_id"); // Simplified
+            let (_index_oid, index_root_page_id) = find_table(&index_name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(index_name))?;
+
+            let mut rows = Vec::new();
+            if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, *key)? {
+                let (page_id, item_id) = tuple_id;
+                let page_guard = bpm.acquire_page(page_id)?;
+                let page = page_guard.read();
+                if page.is_visible(snapshot, tx_id, item_id) {
+                    if let Some(tuple_data) = page.get_tuple(item_id) {
+                        let parsed = parse_tuple(tuple_data, &schema);
+                        rows.push(schema.iter().map(|col| parsed.get(&col.name).unwrap().to_string()).collect());
+                    }
+                }
+            }
+            Ok(ResultSet { columns: schema, rows })
+        }
+        PhysicalPlan::Filter { input, predicate } => {
+            let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let mut filtered_rows = Vec::new();
+            for row_vec in input_result.rows {
+                let row_map = row_vec_to_map(&row_vec, &input_result.columns);
+                if evaluate_expr_for_row(predicate, &row_map)? {
+                    filtered_rows.push(row_vec);
+                }
+            }
+            Ok(ResultSet {
+                columns: input_result.columns,
+                rows: filtered_rows,
+            })
+        }
+        PhysicalPlan::NestedLoopJoin { left, right, condition } => {
+            let left_result = execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let right_result = execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
+            
+            let mut joined_rows = Vec::new();
+            let mut joined_columns = left_result.columns.clone();
+            joined_columns.extend(right_result.columns.clone());
+
+            for left_row_vec in &left_result.rows {
+                for right_row_vec in &right_result.rows {
+                    let left_map = row_vec_to_map(left_row_vec, &left_result.columns);
+                    let right_map = row_vec_to_map(right_row_vec, &right_result.columns);
+                    let combined_map = left_map.into_iter().chain(right_map).collect();
+                    
+                    if evaluate_expr_for_row(condition, &combined_map)? {
+                        let mut joined_row_vec = left_row_vec.clone();
+                        joined_row_vec.extend(right_row_vec.clone());
+                        joined_rows.push(joined_row_vec);
+                    }
+                }
+            }
+            Ok(ResultSet { columns: joined_columns, rows: joined_rows })
+        }
+        PhysicalPlan::HashJoin { left, right, left_key, right_key } => {
+            let left_result = execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let right_result = execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
+
+            let mut joined_rows = Vec::new();
+            let mut joined_columns = left_result.columns.clone();
+            joined_columns.extend(right_result.columns.clone());
+
+            // Build phase
+            let mut hash_table: HashMap<LiteralValue, Vec<&Vec<String>>> = HashMap::new();
+            for right_row_vec in &right_result.rows {
+                let right_row_map = row_vec_to_map(right_row_vec, &right_result.columns);
+                let key = evaluate_expr_for_row_to_val(right_key, &right_row_map)?;
+                hash_table.entry(key).or_default().push(right_row_vec);
+            }
+
+            // Probe phase
+            for left_row_vec in &left_result.rows {
+                let left_row_map = row_vec_to_map(left_row_vec, &left_result.columns);
+                let key = evaluate_expr_for_row_to_val(left_key, &left_row_map)?;
+                if let Some(matching_rows) = hash_table.get(&key) {
+                    for right_row_vec in matching_rows {
+                        let mut joined_row = left_row_vec.clone();
+                        joined_row.extend((*right_row_vec).clone());
+                        joined_rows.push(joined_row);
+                    }
+                }
+            }
+            Ok(ResultSet { columns: joined_columns, rows: joined_rows })
+        }
+        PhysicalPlan::Projection { input, expressions } => {
+            let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            if expressions.iter().any(|item| matches!(item, SelectItem::Wildcard)) {
+                return Ok(input_result);
+            }
+
+            let mut projected_rows = Vec::new();
+            let mut projected_columns = Vec::new();
+
+            for (i, item) in expressions.iter().enumerate() {
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        if let Expression::Column(name) = expr {
+                            if let Some(col) = input_result.columns.iter().find(|c| c.name == *name) {
+                                projected_columns.push(col.clone());
+                            }
+                        } else {
+                            // Handle more complex expressions if necessary
+                            projected_columns.push(Column { name: format!("?column?_{}", i), type_id: 25 }); // Default to TEXT
+                        }
+                    }
+                    _ => {} // Wildcard already handled
+                }
+            }
+            
+            for row_vec in input_result.rows {
+                let row_map = row_vec_to_map(&row_vec, &input_result.columns);
+                let mut projected_row = Vec::new();
+                for item in expressions {
+                    match item {
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                            let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
+                            projected_row.push(val.to_string());
+                        }
+                        _ => {} // Wildcard already handled
+                    }
+                }
+                projected_rows.push(projected_row);
+            }
+
+            Ok(ResultSet {
+                columns: projected_columns,
+                rows: projected_rows,
+            })
+        }
+        PhysicalPlan::Sort { input, order_by } => {
+            let mut input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+
+            // For simplicity, we only support sorting by a single column expression for now.
+            if order_by.len() != 1 {
+                return Err(ExecutionError::GenericError(
+                    "ORDER BY only supports a single column".to_string(),
+                ));
+            }
+            let sort_expr = &order_by[0];
+
+            // Find the index and type of the sort key column
+            let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
+                input_result
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .map(|i| (i, input_result.columns[i].type_id))
+                    .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
+            } else {
+                return Err(ExecutionError::GenericError(
+                    "ORDER BY only supports column names".to_string(),
+                ));
+            };
+
+            // Sort the rows
+            input_result.rows.sort_by(|a, b| {
+                let val_a = &a[sort_col_idx];
+                let val_b = &b[sort_col_idx];
+                match sort_col_type {
+                    23 => { // INT
+                        let num_a = val_a.parse::<i32>().unwrap_or(0);
+                        let num_b = val_b.parse::<i32>().unwrap_or(0);
+                        num_a.cmp(&num_b)
+                    }
+                    25 => val_a.cmp(val_b), // TEXT
+                    1082 => { // DATE
+                        let date_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d").unwrap();
+                        let date_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d").unwrap();
+                        date_a.cmp(&date_b)
+                    }
+                    16 => { // BOOL
+                        let bool_a = val_a == "t";
+                        let bool_b = val_b == "t";
+                        bool_a.cmp(&bool_b)
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+
+            Ok(input_result)
+        }
     }
 }
 
@@ -264,86 +499,48 @@ fn execute_create_table(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
 ) -> Result<(), ExecutionError> {
-    println!(
-        "[execute_create_table] Creating table '{}' in tx_id {}",
-        stmt.table_name, tx_id
-    );
     let new_table_oid = tm.get_next_oid();
+    let mut tuple_data = Vec::new();
+    tuple_data.extend_from_slice(&new_table_oid.to_be_bytes());
+    tuple_data.extend_from_slice(&INVALID_PAGE_ID.to_be_bytes());
+    tuple_data.push(stmt.table_name.len() as u8);
+    tuple_data.extend_from_slice(stmt.table_name.as_bytes());
+    
+    let pg_class_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
+    let mut pg_class_page = pg_class_guard.write();
+    let item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0)
+        .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_class".to_string()))?;
+    
+    let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+    let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id })?;
+    tm.set_last_lsn(tx_id, lsn);
+    pg_class_page.header_mut().lsn = lsn;
+    drop(pg_class_page);
+    drop(pg_class_guard);
 
-    // Insert into pg_class
-    {
-        println!("[execute_create_table] Acquiring lock on PG_CLASS_TABLE_OID");
-        let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
-        let mut page = page_guard.write();
-        let mut tuple_data = Vec::new();
-        tuple_data.extend_from_slice(&new_table_oid.to_be_bytes());
-        // PageId is initially 0, will be updated on first insert
-        tuple_data.extend_from_slice(&0u32.to_be_bytes());
-        tuple_data.push(stmt.table_name.len() as u8);
-        tuple_data.extend_from_slice(stmt.table_name.as_bytes());
-        let item_id = page
-            .add_tuple(&tuple_data, tx_id, 0)
-            .ok_or(ExecutionError::GenericError(()))?;
-
+    let pg_attr_guard = bpm.acquire_page(PG_ATTRIBUTE_TABLE_OID)?;
+    let mut pg_attr_page = pg_attr_guard.write();
+    for (i, col) in stmt.columns.iter().enumerate() {
+        let mut attr_tuple_data = Vec::new();
+        attr_tuple_data.extend_from_slice(&new_table_oid.to_be_bytes());
+        attr_tuple_data.extend_from_slice(&(i as u16).to_be_bytes());
+        let type_id: u32 = match col.data_type {
+            DataType::Int => 23,
+            DataType::Text => 25,
+            DataType::Bool => 16,
+            DataType::Date => 1082,
+        };
+        attr_tuple_data.extend_from_slice(&type_id.to_be_bytes());
+        attr_tuple_data.push(col.name.len() as u8);
+        attr_tuple_data.extend_from_slice(col.name.as_bytes());
+        let item_id = pg_attr_page.add_tuple(&attr_tuple_data, tx_id, 0)
+            .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_attribute".to_string()))?;
+        
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: PG_CLASS_TABLE_OID,
-                item_id,
-            },
-        )?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_ATTRIBUTE_TABLE_OID, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
-        page.header_mut().lsn = lsn;
-        println!(
-            "[execute_create_table] Added to pg_class with oid {}",
-            new_table_oid
-        );
+        pg_attr_page.header_mut().lsn = lsn;
     }
-
-    // Insert into pg_attribute
-    {
-        println!("[execute_create_table] Acquiring lock on PG_ATTRIBUTE_TABLE_OID");
-        let page_guard = bpm.acquire_page(PG_ATTRIBUTE_TABLE_OID)?;
-        let mut page = page_guard.write();
-        for (i, col) in stmt.columns.iter().enumerate() {
-            let mut tuple_data = Vec::new();
-            tuple_data.extend_from_slice(&new_table_oid.to_be_bytes());
-            tuple_data.extend_from_slice(&(i as u16).to_be_bytes());
-            let type_id: u32 = match col.data_type {
-                DataType::Int => 23,
-                DataType::Text => 25,
-                DataType::Bool => 16,
-                DataType::Date => 1082,
-            };
-            tuple_data.extend_from_slice(&type_id.to_be_bytes());
-            tuple_data.push(col.name.len() as u8);
-            tuple_data.extend_from_slice(col.name.as_bytes());
-            let item_id = page
-                .add_tuple(&tuple_data, tx_id, 0)
-                .ok_or(ExecutionError::GenericError(()))?;
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: PG_ATTRIBUTE_TABLE_OID,
-                    item_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
-        }
-        println!(
-            "[execute_create_table] Added {} columns to pg_attribute for oid {}",
-            stmt.columns.len(),
-            new_table_oid
-        );
-    }
-
     Ok(())
 }
 
@@ -357,22 +554,15 @@ fn execute_create_index(
     snapshot: &Snapshot,
 ) -> Result<(), ExecutionError> {
     let (table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
+        .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-    // Lock the table in exclusive mode to prevent concurrent modifications.
-    lm.lock(
-        tx_id,
-        LockableResource::Table(table_oid),
-        LockMode::Exclusive,
-    )?;
+    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Exclusive)?;
 
-    // Create a new B-Tree root page
     let root_page_guard = bpm.new_page()?;
     let mut root_page_id = root_page_guard.read().id;
     root_page_guard.write().as_btree_leaf_page();
     drop(root_page_guard);
 
-    // Create a new relation for the index in pg_class
     let index_oid = tm.get_next_oid();
     {
         let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
@@ -382,77 +572,26 @@ fn execute_create_index(
         tuple_data.extend_from_slice(&root_page_id.to_be_bytes());
         tuple_data.push(stmt.index_name.len() as u8);
         tuple_data.extend_from_slice(stmt.index_name.as_bytes());
-        let item_id = page
-            .add_tuple(&tuple_data, tx_id, 0)
-            .ok_or(ExecutionError::GenericError(()))?;
-
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: PG_CLASS_TABLE_OID,
-                item_id,
-            },
-        )?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: PG_CLASS_TABLE_OID, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
     }
 
-    // Populate the index by scanning the entire table
-    println!(
-        "[create_index] Populating index '{}' for table '{}'...",
-        stmt.index_name, stmt.table_name
-    );
-    if table_page_id != 0 {
-        let page_guard = bpm.acquire_page(table_page_id)?;
-        let page = page_guard.read();
+    if table_page_id != INVALID_PAGE_ID {
         let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-
-        let _col_idx = schema
-            .iter()
-            .position(|c| c.name == stmt.column_name)
-            .ok_or(ExecutionError::ColumnNotFound(()))?;
-
-        for i in 0..page.get_tuple_count() {
-            if page.is_visible(snapshot, tx_id, i) {
-                if let Some(tuple_data) = page.get_tuple(i) {
-                    let parsed_tuple = parse_tuple(tuple_data, &schema);
-                    if let Some(LiteralValue::Number(key_str)) =
-                        parsed_tuple.get(&stmt.column_name)
-                    {
-                        if let Ok(key) = key_str.parse::<i32>() {
-                            let tuple_id: TupleId = (page.id, i);
-                            root_page_id =
-                                btree::btree_insert(bpm, tm, wm, tx_id, root_page_id, key, tuple_id)?;
-                        }
-                    }
-                }
-            }
-        }
-        println!("[create_index] Finished populating index.");
-    } else {
-        println!("[create_index] Table is empty, no data to populate.");
-    }
-
-    // Update the root_page_id in pg_class
-    {
-        let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
-        let mut page = page_guard.write();
-        for i in 0..page.get_tuple_count() {
-            if let Some(tuple_data) = page.get_tuple(i) {
-                let oid = u32::from_be_bytes(tuple_data[0..4].try_into().unwrap());
-                if oid == index_oid {
-                    if let Some(tuple) = page.get_raw_tuple_mut(i) {
-                        tuple[4..8].copy_from_slice(&root_page_id.to_be_bytes());
-                    }
-                    break;
+        let rows_with_ids = scan_table(bpm, lm, table_page_id, &schema, tx_id, snapshot, false)?;
+        for (page_id, item_id, parsed_tuple) in rows_with_ids {
+            if let Some(LiteralValue::Number(key_str)) = parsed_tuple.get(&stmt.column_name) {
+                if let Ok(key) = key_str.parse::<i32>() {
+                    root_page_id = btree::btree_insert(bpm, tm, wm, tx_id, root_page_id, key, (page_id, item_id))?;
                 }
             }
         }
     }
-
+    
+    update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, index_oid, root_page_id)?;
     Ok(())
 }
 
@@ -467,166 +606,73 @@ fn execute_insert(
     tx_id: u32,
     snapshot: &Snapshot,
 ) -> Result<u32, ExecutionError> {
-    println!("[INSERT] table: '{}', tx_id: {}", stmt.table_name, tx_id);
     let (table_oid, mut first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
+        .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-    // Lock the table in a shared mode to prevent DDL operations, but allow concurrent inserts.
-    lm.lock(
-        tx_id,
-        LockableResource::Table(table_oid),
-        LockMode::Shared,
-    )?;
+    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
 
     let mut tuple_data = Vec::new();
     for value in &stmt.values {
         match value {
-            Expression::Literal(LiteralValue::Number(n)) => {
-                tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes())
-            }
+            Expression::Literal(LiteralValue::Number(n)) => tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes()),
             Expression::Literal(LiteralValue::String(s)) => {
                 tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
                 tuple_data.extend_from_slice(s.as_bytes());
             }
-            Expression::Literal(LiteralValue::Bool(b)) => {
-                tuple_data.push(if *b { 1 } else { 0 });
-            }
+            Expression::Literal(LiteralValue::Bool(b)) => tuple_data.push(if *b { 1 } else { 0 }),
             Expression::Literal(LiteralValue::Date(s)) => {
                 let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
                 let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                let days_since_epoch = date.signed_duration_since(epoch).num_days() as i32;
-                tuple_data.extend_from_slice(&days_since_epoch.to_be_bytes());
+                let days = date.signed_duration_since(epoch).num_days() as i32;
+                tuple_data.extend_from_slice(&days.to_be_bytes());
             }
             _ => {}
         }
     }
 
-    // Handle the very first insertion into a table.
     if first_page_id == INVALID_PAGE_ID {
-        println!(
-            "[INSERT] First insert for table '{}' (oid {}). Allocating a new page.",
-            stmt.table_name, table_oid
-        );
         let new_page_guard = bpm.new_page()?;
-        let new_page_id = new_page_guard.read().id;
-        first_page_id = new_page_id;
-        println!(
-            "[INSERT] Allocated new page {} for table '{}'",
-            new_page_id, stmt.table_name
-        );
-
+        first_page_id = new_page_guard.read().id;
         let mut page = new_page_guard.write();
-        let item_id = page
-            .add_tuple(&tuple_data, tx_id, 0)
-            .ok_or(ExecutionError::GenericError(()))?;
-
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: first_page_id,
-                item_id,
-            },
-        )?;
+        let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: first_page_id, item_id })?;
         tm.set_last_lsn(tx_id, lsn);
         page.header_mut().lsn = lsn;
-
-        // Update pg_class to point to the new page.
         update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
         return Ok(1);
     }
 
-    // Find a page with enough space in the chain.
     let mut current_page_id = first_page_id;
     loop {
         let page_guard = bpm.acquire_page(current_page_id)?;
-
-        // Check for space first with a read lock.
         let has_space = {
             let page = page_guard.read();
-            let tuple_header_len = std::mem::size_of::<bedrock::page::HeapTupleHeaderData>();
-            let tuple_len = tuple_data.len() + tuple_header_len;
-            let item_id_len = std::mem::size_of::<bedrock::page::ItemIdData>();
-            let needed_space = tuple_len + item_id_len;
-            page.header()
-                .upper_offset
-                .saturating_sub(page.header().lower_offset)
-                >= needed_space as u16
+            let needed = tuple_data.len() + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>() + std::mem::size_of::<bedrock::page::ItemIdData>();
+            page.header().upper_offset.saturating_sub(page.header().lower_offset) >= needed as u16
         };
 
         if has_space {
             let mut page = page_guard.write();
-            let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap(); // Should not fail
+            let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: current_page_id,
-                    item_id,
-                },
-            )?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: current_page_id, item_id })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
-            println!(
-                "[INSERT] Successfully inserted tuple with item_id {} into page {}",
-                item_id, current_page_id
-            );
             return Ok(1);
         }
 
-        // If no space, move to the next page or allocate a new one.
-        let (next_page_id, page_id_to_link) = {
-            let page = page_guard.read();
-            (page.header().next_page_id, page.id)
-        };
-
+        let next_page_id = page_guard.read().header().next_page_id;
         if next_page_id == INVALID_PAGE_ID {
             let new_page_guard = bpm.new_page()?;
             let new_page_id = new_page_guard.read().id;
-
-            {
-                // Link the old page to the new one
-                let mut current_page = page_guard.write();
-                current_page.header_mut().next_page_id = new_page_id;
-
-                let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-                let lsn = wm.lock().unwrap().log(
-                    tx_id,
-                    prev_lsn,
-                    &WalRecord::SetNextPageId {
-                        tx_id,
-                        page_id: page_id_to_link,
-                        next_page_id: new_page_id,
-                    },
-                )?;
-                tm.set_last_lsn(tx_id, lsn);
-                current_page.header_mut().lsn = lsn;
-            }
-
+            page_guard.write().header_mut().next_page_id = new_page_id;
             let mut new_page = new_page_guard.write();
-            let item_id = new_page
-                .add_tuple(&tuple_data, tx_id, 0)
-                .ok_or(ExecutionError::GenericError(()))?;
+            let item_id = new_page.add_tuple(&tuple_data, tx_id, 0).unwrap();
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: new_page_id,
-                    item_id,
-                },
-            )?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::InsertTuple { tx_id, page_id: new_page_id, item_id })?;
             tm.set_last_lsn(tx_id, lsn);
             new_page.header_mut().lsn = lsn;
-            println!(
-                "[INSERT] Allocated new page {} and inserted tuple.",
-                new_page_id
-            );
             return Ok(1);
         }
         current_page_id = next_page_id;
@@ -675,9 +721,8 @@ fn update_pg_class_page_id(
     // Add the new entry with the correct page_id.
     if let Some(mut tuple_data) = old_tuple_data {
         tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
-        let new_item_id = pg_class_page
-            .add_tuple(&tuple_data, tx_id, 0)
-            .ok_or(ExecutionError::GenericError(()))?;
+        let new_item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0)
+            .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_class".to_string()))?;
         println!(
             "[update_pg_class] Added new pg_class entry for oid {} with page_id {} at item_id {}",
             table_oid, new_page_id, new_item_id
@@ -723,121 +768,65 @@ fn execute_update(
     snapshot: &Snapshot,
 ) -> Result<u32, ExecutionError> {
     let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
-    if first_page_id == INVALID_PAGE_ID {
-        return Ok(0);
-    }
+        .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
+    if first_page_id == INVALID_PAGE_ID { return Ok(0); }
 
     let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
-
-    // 1. Scan, filter, and collect rows to be updated.
     let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
-    let rows_to_update_info: Vec<_> = all_rows
-        .into_iter()
-        .filter(|(_, _, parsed_tuple)| {
-            if let Some(where_clause) = &stmt.where_clause {
-                evaluate_expr_for_row(where_clause, parsed_tuple).unwrap_or(false)
-            } else {
-                true
-            }
-        })
-        .collect();
+    let rows_to_update: Vec<_> = all_rows.into_iter().filter(|(_, _, parsed)| {
+        stmt.where_clause.as_ref().map_or(true, |p| evaluate_expr_for_row(p, parsed).unwrap_or(false))
+    }).collect();
 
-    // 2. Now, lock the tuples and perform the update.
-    for (page_id, item_id, old_parsed_tuple) in rows_to_update_info {
-        // Lock the specific tuple we intend to update.
-        lm.lock(
-            tx_id,
-            LockableResource::Tuple((page_id, item_id)),
-            LockMode::Exclusive,
-        )?;
-
+    for (page_id, item_id, old_parsed) in rows_to_update {
+        lm.lock(tx_id, LockableResource::Tuple((page_id, item_id)), LockMode::Exclusive)?;
         let page_guard = bpm.acquire_page(page_id)?;
         let mut page = page_guard.write();
-
-        // Re-check visibility and check for write conflicts after acquiring the lock.
-        // The tuple must still be visible, and its xmax must be 0.
-        // If xmax is not 0, it means another transaction has deleted or updated this tuple
-        // since our snapshot was taken, which is a serialization conflict.
-        if !page.is_visible(snapshot, tx_id, item_id)
-            || page
-                .get_tuple_header_mut(item_id)
-                .map_or(true, |h| h.xmax != 0)
-        {
-            // Unlock and abort.
+        if !page.is_visible(snapshot, tx_id, item_id) || page.get_tuple_header_mut(item_id).map_or(true, |h| h.xmax != 0) {
             lm.unlock_all(tx_id);
-            println!("[UPDATE] Serialization failure for tx_id {} on tuple ({}, {}). Tuple already modified.", tx_id, page_id, item_id);
             return Err(ExecutionError::SerializationFailure);
         }
 
-
-        // Construct the new tuple data.
-        let mut new_parsed_tuple = old_parsed_tuple.clone();
+        let mut new_parsed = old_parsed.clone();
         for (col_name, expr) in &stmt.assignments {
-            let new_val = evaluate_expr_for_row_to_val(expr, &old_parsed_tuple)?;
-            new_parsed_tuple.insert(col_name.clone(), new_val);
+            new_parsed.insert(col_name.clone(), evaluate_expr_for_row_to_val(expr, &old_parsed)?);
         }
 
-        let mut new_tuple_data = Vec::new();
+        let mut new_data = Vec::new();
         for col in &schema {
-            if let Some(val) = new_parsed_tuple.get(&col.name) {
+            if let Some(val) = new_parsed.get(&col.name) {
                 match val {
-                    LiteralValue::Number(n) => {
-                        new_tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes())
-                    }
+                    LiteralValue::Number(n) => new_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes()),
                     LiteralValue::String(s) => {
-                        new_tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                        new_tuple_data.extend_from_slice(s.as_bytes());
+                        new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                        new_data.extend_from_slice(s.as_bytes());
                     }
-                    LiteralValue::Bool(b) => {
-                        new_tuple_data.push(if *b { 1 } else { 0 });
-                    }
+                    LiteralValue::Bool(b) => new_data.push(if *b { 1 } else { 0 }),
                     LiteralValue::Date(s) => {
                         let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
                         let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                        let days_since_epoch = date.signed_duration_since(epoch).num_days() as i32;
-                        new_tuple_data.extend_from_slice(&days_since_epoch.to_be_bytes());
+                        let days = date.signed_duration_since(epoch).num_days() as i32;
+                        new_data.extend_from_slice(&days.to_be_bytes());
                     }
                 }
             }
         }
 
-        // Mark the old tuple as deleted by the current transaction.
-        let old_tuple_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
-        if let Some(header) = page.get_tuple_header_mut(item_id) {
-            header.xmax = tx_id;
-        }
+        let old_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
+        page.get_tuple_header_mut(item_id).unwrap().xmax = tx_id;
 
-        // Try to insert the new version of the tuple.
-        if let Some(new_item_id) = page.add_tuple(&new_tuple_data, tx_id, 0) {
+        if let Some(new_item_id) = page.add_tuple(&new_data, tx_id, 0) {
             rows_affected += 1;
-            // Log the update to the WAL.
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::UpdateTuple {
-                    tx_id,
-                    page_id,
-                    item_id: new_item_id,
-                    old_data: old_tuple_raw,
-                },
-            )?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::UpdateTuple { tx_id, page_id, item_id: new_item_id, old_data: old_raw })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
         } else {
-            // Not enough space on the page for the new tuple.
-            // We must roll back the change to the old tuple's header and abort.
-            if let Some(header) = page.get_tuple_header_mut(item_id) {
-                header.xmax = 0;
-            }
-            // Unlock and abort.
+            page.get_tuple_header_mut(item_id).unwrap().xmax = 0;
             lm.unlock_all(tx_id);
             return Err(ExecutionError::SerializationFailure);
         }
     }
-
     Ok(rows_affected)
 }
 
@@ -851,393 +840,35 @@ fn execute_delete(
     snapshot: &Snapshot,
 ) -> Result<u32, ExecutionError> {
     let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
-    if first_page_id == INVALID_PAGE_ID {
-        return Ok(0);
-    }
+        .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
+    if first_page_id == INVALID_PAGE_ID { return Ok(0); }
 
     let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
-    let mut to_delete: Vec<(PageId, u16)> = Vec::new();
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let to_delete: Vec<_> = all_rows.into_iter().filter(|(_, _, parsed)| {
+        stmt.where_clause.as_ref().map_or(true, |p| evaluate_expr_for_row(p, parsed).unwrap_or(false))
+    }).collect();
 
-    // First, collect all tuples to be deleted
-    let mut current_page_id = first_page_id;
-    while current_page_id != INVALID_PAGE_ID {
-        let page_guard = bpm.acquire_page(current_page_id)?;
-        let page = page_guard.read();
-        for i in 0..page.get_tuple_count() {
-            if page.is_visible(snapshot, tx_id, i) {
-                if let Some(where_clause) = &stmt.where_clause {
-                    if let Some(tuple_data) = page.get_tuple(i) {
-                        let parsed_tuple = parse_tuple(tuple_data, &schema);
-                        if evaluate_expr_for_row(where_clause, &parsed_tuple)? {
-                            to_delete.push((current_page_id, i));
-                        }
-                    }
-                } else {
-                    to_delete.push((current_page_id, i));
-                }
-            }
-        }
-        current_page_id = page.header().next_page_id;
-    }
-
-    // Now, lock and perform the deletions
-    for tuple_id in to_delete {
-        lm.lock(tx_id, LockableResource::Tuple(tuple_id), LockMode::Exclusive)?;
-        let (page_id, item_id) = tuple_id;
+    for (page_id, item_id, _) in to_delete {
+        lm.lock(tx_id, LockableResource::Tuple((page_id, item_id)), LockMode::Exclusive)?;
         let page_guard = bpm.acquire_page(page_id)?;
         let mut page = page_guard.write();
-
-        // Re-check visibility after acquiring the lock
-        if !page.is_visible(snapshot, tx_id, item_id) {
-            continue;
-        }
-
+        if !page.is_visible(snapshot, tx_id, item_id) { continue; }
         if let Some(header) = page.get_tuple_header_mut(item_id) {
-            if header.xmax != 0 {
-                // Already deleted by another transaction, this is a conflict.
-                return Err(ExecutionError::SerializationFailure);
-            }
+            if header.xmax != 0 { return Err(ExecutionError::SerializationFailure); }
             header.xmax = tx_id;
             rows_affected += 1;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::DeleteTuple {
-                    tx_id,
-                    page_id,
-                    item_id,
-                },
-            )?;
+            let lsn = wm.lock().unwrap().log(tx_id, prev_lsn, &WalRecord::DeleteTuple { tx_id, page_id, item_id })?;
             tm.set_last_lsn(tx_id, lsn);
             page.header_mut().lsn = lsn;
         }
     }
-
     Ok(rows_affected)
 }
 
-fn execute_select(
-    stmt: &SelectStatement,
-    bpm: &Arc<BufferPoolManager>,
-    lm: &Arc<LockManager>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-) -> Result<ResultSet, ExecutionError> {
-    if stmt.from.is_empty() {
-        return Err(ExecutionError::GenericError(())); // SELECT without FROM is not supported
-    }
 
-    // For now, we only support a single table or a single JOIN clause.
-    let (left_table_name, right_table_name, on_condition) = match &stmt.from[0] {
-        TableReference::Table { name } => (name.clone(), None, None),
-        TableReference::Join {
-            left,
-            right,
-            on_condition,
-        } => {
-            let left_name = if let TableReference::Table { name } = &**left {
-                name.clone()
-            } else {
-                return Err(ExecutionError::GenericError(()));
-            };
-            let right_name = if let TableReference::Table { name } = &**right {
-                name.clone()
-            } else {
-                return Err(ExecutionError::GenericError(()));
-            };
-            (left_name, Some(right_name), Some(on_condition.clone()))
-        }
-    };
-
-    // --- Data Loading ---
-    let (left_oid, left_page_id) = find_table(&left_table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
-    let left_schema = get_table_schema(bpm, left_oid, tx_id, snapshot)?;
-    let left_rows_with_ids = scan_table(bpm, lm, left_page_id, &left_schema, tx_id, snapshot, stmt.for_update)?;
-    let left_rows: Vec<HashMap<String, LiteralValue>> = left_rows_with_ids.into_iter().map(|(_, _, row)| row).collect();
-
-    let (right_schema, right_rows) = if let Some(right_table_name_val) = &right_table_name {
-        let (right_oid, right_page_id) = find_table(right_table_name_val, bpm, tx_id, snapshot)?
-            .ok_or_else(|| ExecutionError::TableNotFound(()))?;
-        let schema = get_table_schema(bpm, right_oid, tx_id, snapshot)?;
-        let rows_with_ids = scan_table(bpm, lm, right_page_id, &schema, tx_id, snapshot, stmt.for_update)?;
-        let rows: Vec<HashMap<String, LiteralValue>> = rows_with_ids.into_iter().map(|(_, _, row)| row).collect();
-        (Some(schema), Some(rows))
-    } else {
-        (None, None)
-    };
-
-    // --- Column Projection ---
-    let mut projected_columns: Vec<Column> = Vec::new();
-    if right_table_name.is_none() {
-        // Single table case
-        if stmt.select_list.len() == 1 && matches!(stmt.select_list[0], SelectItem::Wildcard) {
-            projected_columns.extend(left_schema.clone());
-        } else {
-            for item in &stmt.select_list {
-                if let SelectItem::UnnamedExpr(Expression::Column(name)) = item {
-                    if let Some(col) = left_schema.iter().find(|c| &c.name == name) {
-                        projected_columns.push(col.clone());
-                    } else {
-                        return Err(ExecutionError::ColumnNotFound(()));
-                    }
-                }
-            }
-        }
-    } else {
-        // JOIN case
-        for item in &stmt.select_list {
-            match item {
-                SelectItem::Wildcard => {
-                    projected_columns.extend(left_schema.iter().map(|c| Column {
-                        name: format!("{}.{}", left_table_name, c.name),
-                        ..c.clone()
-                    }));
-                    if let Some(schema) = &right_schema {
-                        projected_columns.extend(schema.iter().map(|c| Column {
-                            name: format!("{}.{}", right_table_name.as_ref().unwrap(), c.name),
-                            ..c.clone()
-                        }));
-                    }
-                }
-                SelectItem::QualifiedWildcard(table_name) => {
-                    if table_name == &left_table_name {
-                        projected_columns.extend(left_schema.iter().map(|c| Column {
-                            name: format!("{}.{}", left_table_name, c.name),
-                            ..c.clone()
-                        }));
-                    } else if right_table_name.as_ref() == Some(table_name) {
-                        projected_columns.extend(
-                            right_schema.as_ref().unwrap().iter().map(|c| Column {
-                                name: format!("{}.{}", right_table_name.as_ref().unwrap(), c.name),
-                                ..c.clone()
-                            }),
-                        );
-                    }
-                }
-                SelectItem::UnnamedExpr(expr) => match expr {
-                    Expression::Column(col_name) => {
-                        // This is ambiguous, but for now we'll just check left then right
-                        if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
-                            projected_columns.push(Column {
-                                name: format!("{}.{}", left_table_name, col.name),
-                                ..col.clone()
-                            });
-                        } else if let Some(schema) = &right_schema {
-                            if let Some(col) = schema.iter().find(|c| &c.name == col_name) {
-                                projected_columns.push(Column {
-                                    name: format!(
-                                        "{}.{}",
-                                        right_table_name.as_ref().unwrap(),
-                                        col.name
-                                    ),
-                                    ..col.clone()
-                                });
-                            }
-                        }
-                    }
-                    Expression::QualifiedColumn(table_name, col_name) => {
-                        if table_name == &left_table_name {
-                            if let Some(col) = left_schema.iter().find(|c| &c.name == col_name) {
-                                projected_columns.push(Column {
-                                    name: format!("{}.{}", table_name, col.name),
-                                    ..col.clone()
-                                });
-                            }
-                        } else if right_table_name.as_ref() == Some(table_name) {
-                            if let Some(col) =
-                                right_schema.as_ref().unwrap().iter().find(|c| &c.name == col_name)
-                            {
-                                projected_columns.push(Column {
-                                    name: format!("{}.{}", table_name, col.name),
-                                    ..col.clone()
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-    }
-
-    // --- Execution ---
-    let mut result_rows = Vec::new();
-    if let (Some(right_rows_val), Some(on_condition_val)) = (right_rows, on_condition) {
-        // For now, we'll default to Hash Join if possible, otherwise Nested Loop.
-        // A real optimizer would make a cost-based decision here.
-        let joined_rows = execute_hash_join(
-            &left_rows,
-            &right_rows_val,
-            &on_condition_val,
-            &left_table_name,
-            right_table_name.as_ref().unwrap(),
-        )?;
-
-        for combined_row in joined_rows {
-            let mut row_vec = Vec::new();
-            for col in &projected_columns {
-                if let Some(val) = combined_row.get(&col.name) {
-                    row_vec.push(val.to_string());
-                }
-            }
-            result_rows.push(row_vec);
-        }
-    } else {
-        // Single Table Scan
-        let mut final_rows = Vec::new();
-        let mut used_index = false;
-
-        // Index Scan optimization
-        if let Some(Expression::Binary {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        }) = &stmt.where_clause
-        {
-            if let (Expression::Column(col_name), Expression::Literal(LiteralValue::Number(val_str))) =
-                (&**left, &**right)
-            {
-                let index_name = format!("idx_{}", col_name);
-                if let Ok(Some((_index_oid, index_root_page_id))) =
-                    find_table(&index_name, bpm, tx_id, snapshot)
-                {
-                    if index_root_page_id != INVALID_PAGE_ID {
-                        println!("[SELECT] Attempting to use index '{}' for query.", index_name);
-                        let key = val_str.parse::<i32>().unwrap_or(0);
-                        if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, key)? {
-                            let (page_id, item_id) = tuple_id;
-                            let page_guard = bpm.acquire_page(page_id)?;
-                            let page = page_guard.read();
-                            if page.is_visible(snapshot, tx_id, item_id) {
-                                if let Some(tuple_data) = page.get_tuple(item_id) {
-                                    let parsed_tuple = parse_tuple(tuple_data, &left_schema);
-                                    final_rows.push(parsed_tuple);
-                                }
-                            }
-                            used_index = true;
-                            println!("[SELECT] Index scan successful.");
-                        } else {
-                            println!("[SELECT] Key not found with index scan.");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Full Table Scan if index is not used
-        if !used_index {
-            println!("[SELECT] Using full table scan.");
-            for row_map in left_rows {
-                let should_include = if let Some(where_clause) = &stmt.where_clause {
-                    evaluate_expr_for_row(where_clause, &row_map)?
-                } else {
-                    true
-                };
-
-                if should_include {
-                    final_rows.push(row_map);
-                }
-            }
-        }
-
-        for row_map in final_rows {
-            let mut row_vec = Vec::new();
-            for col in &projected_columns {
-                if let Some(val) = row_map.get(&col.name) {
-                    row_vec.push(val.to_string());
-                }
-            }
-            result_rows.push(row_vec);
-        }
-    }
-
-    println!("[SELECT] found {} rows", result_rows.len());
-    Ok(ResultSet {
-        columns: projected_columns,
-        rows: result_rows,
-    })
-}
-
-/// Executes a hash join between two sets of rows.
-fn execute_hash_join(
-    left_rows: &[HashMap<String, LiteralValue>],
-    right_rows: &[HashMap<String, LiteralValue>],
-    on_condition: &Expression,
-    left_table_name: &str,
-    right_table_name: &str,
-) -> Result<Vec<HashMap<String, LiteralValue>>, ExecutionError> {
-    println!("[execute_hash_join] Starting Hash Join execution.");
-    let (left_key_col, right_key_col) =
-        if let Expression::Binary {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } = on_condition
-        {
-            match (&**left, &**right) {
-                (Expression::QualifiedColumn(lt, lc), Expression::QualifiedColumn(_rt, rc)) => {
-                    if lt == left_table_name {
-                        (lc.clone(), rc.clone())
-                    } else {
-                        (rc.clone(), lc.clone())
-                    }
-                }
-                _ => return Err(ExecutionError::GenericError(())), // Hash join only on simple equality
-            }
-        } else {
-            return Err(ExecutionError::GenericError(())); // Hash join only on equality
-        };
-
-    // Build phase: build a hash table on the smaller relation (let's assume right for now)
-    let mut hash_table: HashMap<LiteralValue, Vec<&HashMap<String, LiteralValue>>> = HashMap::new();
-    println!(
-        "[execute_hash_join] Build phase on right table '{}' with key '{}'",
-        right_table_name, right_key_col
-    );
-    for right_row in right_rows {
-        if let Some(key) = right_row.get(&right_key_col) {
-            hash_table.entry(key.clone()).or_default().push(right_row);
-        }
-    }
-    println!(
-        "[execute_hash_join] Build phase complete. Hash table size: {}",
-        hash_table.len()
-    );
-
-    // Probe phase: iterate through the larger relation and probe the hash table
-    let mut joined_rows = Vec::new();
-    println!(
-        "[execute_hash_join] Probe phase on left table '{}' with key '{}'",
-        left_table_name, left_key_col
-    );
-    for left_row in left_rows {
-        if let Some(key) = left_row.get(&left_key_col) {
-            if let Some(matching_right_rows) = hash_table.get(key) {
-                for right_row in matching_right_rows {
-                    let mut combined_row = HashMap::new();
-                    for (k, v) in left_row {
-                        combined_row.insert(format!("{}.{}", left_table_name, k), v.clone());
-                    }
-                    for (k, v) in *right_row {
-                        combined_row.insert(format!("{}.{}", right_table_name, k), v.clone());
-                    }
-                    joined_rows.push(combined_row);
-                }
-            }
-        }
-    }
-    println!(
-        "[execute_hash_join] Probe phase complete. Found {} joined rows.",
-        joined_rows.len()
-    );
-
-    Ok(joined_rows)
-}
 
 /// Scans a table and returns a vector of rows, where each row is a map of column name to value.
 fn scan_table(
@@ -1280,7 +911,7 @@ fn evaluate_expr_for_row(
 ) -> Result<bool, ExecutionError> {
     match evaluate_expr_for_row_to_val(expr, row)? {
         LiteralValue::Bool(b) => Ok(b),
-        _ => Err(ExecutionError::GenericError(())), // Type error
+        _ => Err(ExecutionError::GenericError("Expression did not evaluate to a boolean".to_string())),
     }
 }
 
@@ -1289,57 +920,51 @@ fn evaluate_expr_for_row_to_val<'a>(
     row: &HashMap<String, LiteralValue>,
 ) -> Result<LiteralValue, ExecutionError> {
     match expr {
-        Expression::Literal(literal) => Ok(literal.clone()),
-        Expression::Column(name) => row
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ExecutionError::ColumnNotFound(())),
+        Expression::Literal(lit) => Ok(lit.clone()),
+        Expression::Column(name) => row.get(name).cloned().ok_or_else(|| ExecutionError::ColumnNotFound(name.clone())),
         Expression::QualifiedColumn(table, col) => {
-            let qualified_name = format!("{}.{}", table, col);
-            row.get(&qualified_name)
-                .cloned()
-                .ok_or_else(|| ExecutionError::ColumnNotFound(()))
+            let qname = format!("{}.{}", table, col);
+            row.get(&qname).cloned().or_else(|| row.get(col).cloned()).ok_or_else(|| ExecutionError::ColumnNotFound(qname))
         }
         Expression::Binary { left, op, right } => {
-            let left_val = evaluate_expr_for_row_to_val(left, row)?;
-            let right_val = evaluate_expr_for_row_to_val(right, row)?;
-
-            match (left_val, right_val) {
+            let lval = evaluate_expr_for_row_to_val(left, row)?;
+            let rval = evaluate_expr_for_row_to_val(right, row)?;
+            match (lval, rval) {
                 (LiteralValue::Number(l), LiteralValue::Number(r)) => {
-                    let l_num = l.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?;
-                    let r_num = r.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?;
-                     match op {
-                        BinaryOperator::Plus => Ok(LiteralValue::Number((l_num + r_num).to_string())),
-                        BinaryOperator::Minus => Ok(LiteralValue::Number((l_num - r_num).to_string())),
-                        BinaryOperator::Eq => Ok(LiteralValue::Bool(l_num == r_num)),
-                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(l_num != r_num)),
-                        BinaryOperator::Lt => Ok(LiteralValue::Bool(l_num < r_num)),
-                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(l_num <= r_num)),
-                        BinaryOperator::Gt => Ok(LiteralValue::Bool(l_num > r_num)),
-                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(l_num >= r_num)),
+                    let lnum = l.parse::<i32>().unwrap();
+                    let rnum = r.parse::<i32>().unwrap();
+                    match op {
+                        BinaryOperator::Plus => Ok(LiteralValue::Number((lnum + rnum).to_string())),
+                        BinaryOperator::Minus => Ok(LiteralValue::Number((lnum - rnum).to_string())),
+                        BinaryOperator::Eq => Ok(LiteralValue::Bool(lnum == rnum)),
+                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(lnum != rnum)),
+                        BinaryOperator::Lt => Ok(LiteralValue::Bool(lnum < rnum)),
+                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(lnum <= rnum)),
+                        BinaryOperator::Gt => Ok(LiteralValue::Bool(lnum > rnum)),
+                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(lnum >= rnum)),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => {
-                     match op {
+                    match op {
                         BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
                         BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
-                        _ => Err(ExecutionError::GenericError(())) // Unsupported op for bool
+                        _ => Err(ExecutionError::GenericError("Unsupported operator for boolean".to_string())),
                     }
                 }
                 (LiteralValue::Date(l), LiteralValue::Date(r)) => {
-                    let l_date = NaiveDate::parse_from_str(&l, "%Y-%m-%d").map_err(|_| ExecutionError::GenericError(()))?;
-                    let r_date = NaiveDate::parse_from_str(&r, "%Y-%m-%d").map_err(|_| ExecutionError::GenericError(()))?;
-                    match op {
-                        BinaryOperator::Eq => Ok(LiteralValue::Bool(l_date == r_date)),
-                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(l_date != r_date)),
-                        BinaryOperator::Lt => Ok(LiteralValue::Bool(l_date < r_date)),
-                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(l_date <= r_date)),
-                        BinaryOperator::Gt => Ok(LiteralValue::Bool(l_date > r_date)),
-                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(l_date >= r_date)),
-                        _ => Err(ExecutionError::GenericError(())) // Unsupported op for date
+                    let ldate = NaiveDate::parse_from_str(&l, "%Y-%m-%d").unwrap();
+                    let rdate = NaiveDate::parse_from_str(&r, "%Y-%m-%d").unwrap();
+                     match op {
+                        BinaryOperator::Eq => Ok(LiteralValue::Bool(ldate == rdate)),
+                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(ldate != rdate)),
+                        BinaryOperator::Lt => Ok(LiteralValue::Bool(ldate < rdate)),
+                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(ldate <= rdate)),
+                        BinaryOperator::Gt => Ok(LiteralValue::Bool(ldate > rdate)),
+                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(ldate >= rdate)),
+                        _ => Err(ExecutionError::GenericError("Unsupported operator for date".to_string())),
                     }
                 }
-                _ => Err(ExecutionError::GenericError(())) // Type mismatch
+                _ => Err(ExecutionError::GenericError("Type mismatch in binary expression".to_string())),
             }
         }
     }
@@ -1354,90 +979,59 @@ fn execute_vacuum(
     tx_id: u32,
     snapshot: &Snapshot,
 ) -> Result<(), ExecutionError> {
-    println!("[VACUUM] Starting vacuum for table '{}'", table_name);
     let (table_oid, old_first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
-        .ok_or_else(|| ExecutionError::TableNotFound(()))?;
+        .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
+    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Exclusive)?;
+    if old_first_page_id == INVALID_PAGE_ID { return Ok(()); }
 
-    // Lock the table in exclusive mode to prevent any other operations.
-    lm.lock(
-        tx_id,
-        LockableResource::Table(table_oid),
-        LockMode::Exclusive,
-    )?;
+    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let live_tuples: Vec<_> = scan_table(bpm, lm, old_first_page_id, &schema, tx_id, snapshot, false)?
+        .into_iter().map(|(_, _, parsed)| parsed).collect();
 
-    if old_first_page_id == INVALID_PAGE_ID {
-        println!("[VACUUM] Table is empty, nothing to do.");
-        return Ok(());
-    }
-
-    // 1. Collect all live tuples from the old pages
-    let mut live_tuples = Vec::new();
-    let mut current_page_id = old_first_page_id;
-    while current_page_id != INVALID_PAGE_ID {
-        let page_guard = bpm.acquire_page(current_page_id)?;
-        let page = page_guard.read();
-        for i in 0..page.get_tuple_count() {
-            // A tuple is live if it's visible to our current snapshot.
-            // This correctly handles tuples deleted by transactions that committed before us,
-            // and tuples created by transactions that committed before us.
-            if page.is_visible(snapshot, tx_id, i) {
-                if let Some(raw_tuple) = page.get_raw_tuple(i) {
-                    live_tuples.push(raw_tuple.to_vec());
-                }
-            }
-        }
-        current_page_id = page.header().next_page_id;
-    }
-    println!("[VACUUM] Found {} live tuples.", live_tuples.len());
-
-    // 2. Write live tuples to a new set of pages
     let mut new_first_page_id = INVALID_PAGE_ID;
-    let mut new_current_page_id;
-
     if !live_tuples.is_empty() {
         let first_page_guard = bpm.new_page()?;
         new_first_page_id = first_page_guard.read().id;
-        new_current_page_id = new_first_page_id;
         drop(first_page_guard);
+        let mut current_new_page_id = new_first_page_id;
 
-        for tuple_data in live_tuples {
+        for tuple in live_tuples {
+            let mut tuple_data = Vec::new();
+            for col in &schema {
+                if let Some(val) = tuple.get(&col.name) {
+                     match val {
+                        LiteralValue::Number(n) => tuple_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes()),
+                        LiteralValue::String(s) => {
+                            tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                            tuple_data.extend_from_slice(s.as_bytes());
+                        }
+                        LiteralValue::Bool(b) => tuple_data.push(if *b { 1 } else { 0 }),
+                        LiteralValue::Date(s) => {
+                            let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+                            let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                            let days = date.signed_duration_since(epoch).num_days() as i32;
+                            tuple_data.extend_from_slice(&days.to_be_bytes());
+                        }
+                    }
+                }
+            }
+            
             let mut inserted = false;
             while !inserted {
-                let page_guard = bpm.acquire_page(new_current_page_id)?;
+                let page_guard = bpm.acquire_page(current_new_page_id)?;
                 let mut page = page_guard.write();
-
-                // The tuple data already includes the header, so we need to extract the data part
-                let header_size = std::mem::size_of::<bedrock::page::HeapTupleHeaderData>();
-                let data_only = &tuple_data[header_size..];
-
-                // We insert with the current transaction's ID as xmin
-                if page.add_tuple(data_only, tx_id, 0).is_some() {
+                if page.add_tuple(&tuple_data, tx_id, 0).is_some() {
                     inserted = true;
                 } else {
-                    // Page is full, create a new one and link it
                     let new_page_guard = bpm.new_page()?;
-                    let next_new_id = new_page_guard.read().id;
-                    page.header_mut().next_page_id = next_new_id;
-                    new_current_page_id = next_new_id;
+                    let next_id = new_page_guard.read().id;
+                    page.header_mut().next_page_id = next_id;
+                    current_new_page_id = next_id;
                 }
             }
         }
     }
-    println!(
-        "[VACUUM] Wrote live tuples to new page chain starting at {}",
-        new_first_page_id
-    );
-
-    // 3. Update pg_class to point to the new page chain
+    
     update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, new_first_page_id)?;
-    println!(
-        "[VACUUM] Updated pg_class for oid {} to point to new page {}",
-        table_oid, new_first_page_id
-    );
-
-    // 4. TODO: The old pages are now orphaned and should be added to a free list
-    // for reuse by the Pager. This is a more advanced feature for later.
-
-    println!("[VACUUM] Completed for table '{}'", table_name);
     Ok(())
 }

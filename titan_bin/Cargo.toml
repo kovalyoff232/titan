@@ -17,3 +17,7 @@ tempfile = "3.10.1"
 [[test]]
 name = "vacuum_test"
 path = "tests/vacuum_test.rs"
+
+[[test]]
+name = "optimizer_test"
+path = "tests/optimizer_test.rs"

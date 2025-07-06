@@ -12,6 +12,8 @@ use bytes::{BufMut, BytesMut};
 
 pub mod parser;
 pub mod executor;
+pub mod planner;
+pub mod optimizer;
 
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
@@ -73,7 +75,7 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
     data.put_i16(row.len() as i16);
     for (i, val) in row.iter().enumerate() {
         let final_val = if columns[i].type_id == 16 { // Bool
-            if val.to_lowercase() == "true" { "t" } else { "f" }
+            if val.to_lowercase() == "t" { "t" } else { "f" }
         } else {
             val.as_str()
         };

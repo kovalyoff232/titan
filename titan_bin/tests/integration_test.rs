@@ -18,7 +18,7 @@ fn test_rollback_removes_inserted_data() {
         1,
         "Data should be visible within the transaction"
     );
-    assert_eq!(rows_before[0], "100");
+    assert_eq!(rows_before[0][0], "100");
 
     client.simple_query("ROLLBACK;");
 
@@ -43,7 +43,7 @@ fn test_create_index_and_select() {
 
     let rows = client.simple_query("SELECT name FROM test_index WHERE id = 2;");
     assert_eq!(rows.len(), 1, "Should find one row by index");
-    assert_eq!(rows[0], "two");
+    assert_eq!(rows[0][0], "two");
 }
 
 #[test]
@@ -64,17 +64,16 @@ fn test_join_tables() {
     client.simple_query("INSERT INTO orders VALUES (104, 3, 'Monitor');");
     client.simple_query("COMMIT;");
 
-    let result = client.simple_query("SELECT users.user_name, orders.item FROM users JOIN orders ON users.user_id = orders.user_id;");
+    let mut result = client.simple_query("SELECT users.user_name, orders.item FROM users JOIN orders ON users.user_id = orders.user_id;");
     
     assert_eq!(result.len(), 4, "JOIN should produce 4 rows");
 
-    let mut result_strings = result;
-    result_strings.sort();
+    result.sort();
 
-    assert_eq!(result_strings[0], "Alice, Keyboard");
-    assert_eq!(result_strings[1], "Alice, Laptop");
-    assert_eq!(result_strings[2], "Bob, Mouse");
-    assert_eq!(result_strings[3], "Charlie, Monitor");
+    assert_eq!(result[0], vec!["Alice", "Keyboard"]);
+    assert_eq!(result[1], vec!["Alice", "Laptop"]);
+    assert_eq!(result[2], vec!["Bob", "Mouse"]);
+    assert_eq!(result[3], vec!["Charlie", "Monitor"]);
 }
 
 #[test]
@@ -91,23 +90,23 @@ fn test_boolean_type() {
     client.simple_query("COMMIT;");
 
     // Test selecting all
-    let mut all_rows = client.simple_query("SELECT id, is_active FROM test_bool;");
-    all_rows.sort();
+    let all_rows = client.simple_query("SELECT id, is_active FROM test_bool ORDER BY id;");
+    println!("All rows: {:?}", all_rows);
     assert_eq!(all_rows.len(), 3);
-    assert_eq!(all_rows[0], "1, t");
-    assert_eq!(all_rows[1], "2, f");
-    assert_eq!(all_rows[2], "3, t");
+    assert_eq!(all_rows[0], vec!["1", "t"]);
+    assert_eq!(all_rows[1], vec!["2", "f"]);
+    assert_eq!(all_rows[2], vec!["3", "t"]);
 
     // Test filtering by TRUE
     let true_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = TRUE;");
     assert_eq!(true_rows.len(), 2);
-    assert!(true_rows.contains(&"1".to_string()));
-    assert!(true_rows.contains(&"3".to_string()));
+    assert!(true_rows.contains(&vec!["1".to_string()]));
+    assert!(true_rows.contains(&vec!["3".to_string()]));
 
     // Test filtering by FALSE
     let false_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = FALSE;");
     assert_eq!(false_rows.len(), 1);
-    assert_eq!(false_rows[0], "2");
+    assert_eq!(false_rows[0][0], "2");
 }
 
 #[test]
@@ -124,17 +123,15 @@ fn test_date_type() {
     client.simple_query("COMMIT;");
 
     // Test selecting all
-    let mut all_rows = client.simple_query("SELECT id, event_date FROM events;");
-    all_rows.sort();
+    let all_rows = client.simple_query("SELECT id, event_date FROM events ORDER BY id;");
     assert_eq!(all_rows.len(), 3);
-    assert_eq!(all_rows[0], "1, 2024-01-15");
-    assert_eq!(all_rows[1], "2, 2025-07-06");
-    assert_eq!(all_rows[2], "3, 2024-01-15");
+    assert_eq!(all_rows[0], vec!["1", "2024-01-15"]);
+    assert_eq!(all_rows[1], vec!["2", "2025-07-06"]);
+    assert_eq!(all_rows[2], vec!["3", "2024-01-15"]);
 
     // Test filtering by date
     let filtered_rows = client.simple_query("SELECT id FROM events WHERE event_date = DATE '2024-01-15';");
     assert_eq!(filtered_rows.len(), 2);
-    assert!(filtered_rows.contains(&"1".to_string()));
-    assert!(filtered_rows.contains(&"3".to_string()));
+    assert!(filtered_rows.contains(&vec!["1".to_string()]));
+    assert!(filtered_rows.contains(&vec!["3".to_string()]));
 }
-
