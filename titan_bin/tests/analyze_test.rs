@@ -24,7 +24,7 @@ fn test_analyze_calculates_distinct_values() {
     // 3. Query pg_statistic to verify the results
     // We expect 6 distinct values for 'id' (1, 2, 3, 4, 5, 6)
     // We expect 3 distinct values for 'category' ('A', 'B', 'C')
-    let stats = client.simple_query("SELECT staattnum, stadistinct FROM pg_statistic;");
+    let stats = client.simple_query("SELECT staattnum, stadistinct FROM pg_statistic WHERE stakind = 1;");
 
     assert_eq!(stats.len(), 2, "Should have statistics for 2 columns");
 

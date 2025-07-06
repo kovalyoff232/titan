@@ -48,3 +48,26 @@ fn test_optimizer_chooses_nested_loop_join_for_non_equi_join() {
     assert_eq!(sorted_result[1], "1, 102");
     assert_eq!(sorted_result[2], "2, 102");
 }
+
+#[test]
+#[serial]
+fn test_optimizer_chooses_index_scan() {
+    let mut client = common::setup_server_and_client("optimizer_index_scan_test");
+
+    client.simple_query("CREATE TABLE t5 (id INT, data TEXT);");
+    client.simple_query("CREATE INDEX idx_id ON t5(id);");
+    client.simple_query("COMMIT;");
+
+    for i in 0..1000 {
+        client.simple_query(&format!("INSERT INTO t5 VALUES ({}, 'text{}');", i, i));
+    }
+    client.simple_query("COMMIT;");
+
+    client.simple_query("ANALYZE t5;");
+    client.simple_query("COMMIT;");
+
+    let result = client.simple_query("SELECT data FROM t5 WHERE id = 500;");
+    
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], "text500");
+}

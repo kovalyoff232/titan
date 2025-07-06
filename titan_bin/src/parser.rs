@@ -135,7 +135,7 @@ pub enum Expression {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, PartialOrd)]
 pub enum LiteralValue {
     Number(String),
     String(String),

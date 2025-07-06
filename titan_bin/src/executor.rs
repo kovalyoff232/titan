@@ -96,7 +96,7 @@ pub fn execute(
 ) -> Result<ExecuteResult, ExecutionError> {
     match stmt {
         Statement::Select(select_stmt) => {
-            let logical_plan = planner::create_logical_plan(select_stmt)
+            let logical_plan = planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot)
                 .map_err(|_| ExecutionError::PlanningError("Failed to create logical plan".to_string()))?;
             let physical_plan = optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot)
                 .map_err(|_| ExecutionError::PlanningError("Failed to create physical plan".to_string()))?;
@@ -723,7 +723,7 @@ fn execute_delete(
 
 
 /// Scans a table and returns a vector of rows, where each row is a map of column name to value.
-fn scan_table(
+pub fn scan_table(
     bpm: &Arc<BufferPoolManager>,
     lm: &Arc<LockManager>,
     first_page_id: PageId,
@@ -890,6 +890,9 @@ fn execute_vacuum(
     Ok(())
 }
 
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+
 fn execute_analyze(
     table_name: &str,
     bpm: &Arc<BufferPoolManager>,
@@ -899,27 +902,24 @@ fn execute_analyze(
     tx_id: u32,
     snapshot: &Snapshot,
 ) -> Result<(), ExecutionError> {
+    const RESERVOIR_SIZE: usize = 1000;
+    const MCV_LIST_SIZE: usize = 10;
+    const HISTOGRAM_BINS: usize = 100;
+
     let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     if first_page_id == INVALID_PAGE_ID {
-        return Ok(()); // Nothing to analyze on an empty table
+        return Ok(());
     }
 
     lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
 
     let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let total_rows = all_rows.len();
 
     for (i, column) in schema.iter().enumerate() {
-        let mut distinct_values = std::collections::HashSet::new();
-        for (_, _, parsed_row) in &all_rows {
-            if let Some(value) = parsed_row.get(&column.name) {
-                distinct_values.insert(value.clone());
-            }
-        }
-        let n_distinct = distinct_values.len() as i32;
-
-        // Delete old statistics for this column first.
+        // --- Delete old statistics for this column ---
         let delete_stmt = DeleteStatement {
             table_name: "pg_statistic".to_string(),
             where_clause: Some(Expression::Binary {
@@ -938,21 +938,95 @@ fn execute_analyze(
         };
         execute_delete_internal(&delete_stmt, bpm, tm, lm, wm, tx_id, snapshot)?;
 
-        // Now, store this in pg_statistic
+        let mut column_values: Vec<LiteralValue> = all_rows
+            .iter()
+            .filter_map(|(_, _, parsed_row)| parsed_row.get(&column.name).cloned())
+            .collect();
+
+        // --- 1. N_DISTINCT ---
+        let n_distinct = column_values.iter().collect::<std::collections::HashSet<_>>().len() as i32;
         let mut tuple_data = Vec::new();
         tuple_data.extend_from_slice(&table_oid.to_be_bytes()); // starelid
-        tuple_data.extend_from_slice(&(i as u32).to_be_bytes()); // staattnum, 
+        tuple_data.extend_from_slice(&(i as u32).to_be_bytes()); // staattnum
         tuple_data.extend_from_slice(&n_distinct.to_be_bytes()); // stadistinct
+        tuple_data.extend_from_slice(&1i32.to_be_bytes()); // stakind = 1 (n_distinct)
+        tuple_data.extend_from_slice(&0i32.to_be_bytes()); // staop
+        let empty_text = "";
+        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes()); // stanumbers
+        tuple_data.extend_from_slice(empty_text.as_bytes());
+        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes()); // stavalues
+        tuple_data.extend_from_slice(empty_text.as_bytes());
+        insert_tuple_into_system_table(&tuple_data, "pg_statistic", bpm, tm, wm, tx_id, snapshot)?;
 
-        insert_tuple_into_system_table(
-            &tuple_data,
-            "pg_statistic",
-            bpm,
-            tm,
-            wm,
-            tx_id,
-            snapshot,
-        )?;
+
+        if total_rows == 0 { continue; }
+
+        // --- Reservoir Sampling ---
+        let mut reservoir = Vec::with_capacity(RESERVOIR_SIZE);
+        let mut rng = thread_rng();
+        for (idx, val) in column_values.iter().enumerate() {
+            if idx < RESERVOIR_SIZE {
+                reservoir.push(val.clone());
+            } else {
+                let j = rand::Rng::gen_range(&mut rng, 0..=idx);
+                if j < RESERVOIR_SIZE {
+                    reservoir[j] = val.clone();
+                }
+            }
+        }
+
+        // --- 2. MCV (Most Common Values) ---
+        let mut counts = HashMap::new();
+        for val in &reservoir {
+            *counts.entry(val).or_insert(0) += 1;
+        }
+        let mut mcv_list: Vec<_> = counts.into_iter().collect();
+        mcv_list.sort_by(|a, b| b.1.cmp(&a.1));
+        let mcvs: Vec<String> = mcv_list.iter().take(MCV_LIST_SIZE).map(|(val, _)| val.to_string()).collect();
+        
+        if !mcvs.is_empty() {
+            let mcv_str = mcvs.join(",");
+            let mut tuple_data = Vec::new();
+            tuple_data.extend_from_slice(&table_oid.to_be_bytes());
+            tuple_data.extend_from_slice(&(i as u32).to_be_bytes());
+            tuple_data.extend_from_slice(&0i32.to_be_bytes()); // stadistinct
+            tuple_data.extend_from_slice(&2i32.to_be_bytes()); // stakind = 2 (mcv)
+            tuple_data.extend_from_slice(&0i32.to_be_bytes()); // staop
+            tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
+            tuple_data.extend_from_slice(empty_text.as_bytes());
+            tuple_data.extend_from_slice(&(mcv_str.len() as u32).to_be_bytes());
+            tuple_data.extend_from_slice(mcv_str.as_bytes());
+            insert_tuple_into_system_table(&tuple_data, "pg_statistic", bpm, tm, wm, tx_id, snapshot)?;
+        }
+
+        // --- 3. HISTOGRAM ---
+        column_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut histogram_bounds = Vec::new();
+        if column_values.len() > 1 {
+            let step = column_values.len() / (HISTOGRAM_BINS + 1);
+            if step > 0 {
+                for j in 1..=HISTOGRAM_BINS {
+                    if let Some(val) = column_values.get(j * step) {
+                        histogram_bounds.push(val.to_string());
+                    }
+                }
+            }
+        }
+
+        if !histogram_bounds.is_empty() {
+            let hist_str = histogram_bounds.join(",");
+            let mut tuple_data = Vec::new();
+            tuple_data.extend_from_slice(&table_oid.to_be_bytes());
+            tuple_data.extend_from_slice(&(i as u32).to_be_bytes());
+            tuple_data.extend_from_slice(&0i32.to_be_bytes());
+            tuple_data.extend_from_slice(&3i32.to_be_bytes()); // stakind = 3 (histogram)
+            tuple_data.extend_from_slice(&0i32.to_be_bytes());
+            tuple_data.extend_from_slice(&(hist_str.len() as u32).to_be_bytes());
+            tuple_data.extend_from_slice(hist_str.as_bytes());
+            tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
+            tuple_data.extend_from_slice(empty_text.as_bytes());
+            insert_tuple_into_system_table(&tuple_data, "pg_statistic", bpm, tm, wm, tx_id, snapshot)?;
+        }
     }
 
     Ok(())

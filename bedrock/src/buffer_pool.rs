@@ -20,7 +20,7 @@ struct Frame {
 
 /// The buffer pool manager.
 pub struct BufferPoolManager {
-    pager: Mutex<Pager>,
+    pub pager: Mutex<Pager>,
     frames: Vec<Arc<Frame>>,
     page_table: RwLock<HashMap<PageId, usize>>,
     free_list: Mutex<Vec<usize>>,

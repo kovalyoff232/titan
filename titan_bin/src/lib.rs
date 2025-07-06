@@ -359,6 +359,14 @@ fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm:
             parser::ColumnDef { name: "staattnum".to_string(), data_type: parser::DataType::Int },
             // Number of distinct values
             parser::ColumnDef { name: "stadistinct".to_string(), data_type: parser::DataType::Int },
+            // Kind of statistics
+            parser::ColumnDef { name: "stakind".to_string(), data_type: parser::DataType::Int },
+            // Operator used
+            parser::ColumnDef { name: "staop".to_string(), data_type: parser::DataType::Int },
+            // Histogram bounds
+            parser::ColumnDef { name: "stanumbers".to_string(), data_type: parser::DataType::Text },
+            // Most common values
+            parser::ColumnDef { name: "stavalues".to_string(), data_type: parser::DataType::Text },
         ],
     };
     executor::execute(&parser::Statement::CreateTable(create_pg_statistic), bpm, tm, lm, wal, tx_id, &snapshot)?;
