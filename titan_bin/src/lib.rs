@@ -55,19 +55,29 @@ fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resul
         data.put_i32(0); // Table OID (unknown)
         data.put_i16(i as i16 + 1); // Column index
         data.put_i32(col.type_id as i32); // Type OID
-        data.put_i16(if col.type_id == 23 { 4 } else { -1 }); // Type size (-1 for variable)
+        let type_size = match col.type_id {
+            16 => 1, // bool
+            23 => 4, // int4
+            _ => -1, // variable-length
+        };
+        data.put_i16(type_size);
         data.put_i32(-1); // Type modifier
         data.put_i16(0); // Format code (text)
     }
     write_message(stream, b'T', &data)
 }
 
-fn send_data_row(stream: &mut TcpStream, row: &[String]) -> io::Result<()> {
+fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_i16(row.len() as i16);
-    for val in row {
-        data.put_i32(val.len() as i32);
-        data.put_slice(val.as_bytes());
+    for (i, val) in row.iter().enumerate() {
+        let final_val = if columns[i].type_id == 16 { // Bool
+            if val.to_lowercase() == "true" { "t" } else { "f" }
+        } else {
+            val
+        };
+        data.put_i32(final_val.len() as i32);
+        data.put_slice(final_val.as_bytes());
     }
     write_message(stream, b'D', &data)
 }
@@ -220,7 +230,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                             send_row_description(&mut stream, &columns)?;
                             let row_count = rows.len();
                             for row in &rows {
-                                send_data_row(&mut stream, &row)?;
+                                send_data_row(&mut stream, &columns, &row)?;
                             }
                             send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
                         }

@@ -163,6 +163,14 @@ fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, Liter
             break;
         }
         match col.type_id {
+            16 => { // BOOLEAN
+                if offset + 1 > tuple_data.len() {
+                    break;
+                }
+                let val = tuple_data[offset] != 0;
+                offset += 1;
+                parsed_tuple.insert(col.name.clone(), LiteralValue::Bool(val));
+            }
             23 => {
                 // INT
                 if offset + 4 > tuple_data.len() {
@@ -296,6 +304,7 @@ fn execute_create_table(
             let type_id: u32 = match col.data_type {
                 DataType::Int => 23,
                 DataType::Text => 25,
+                DataType::Bool => 16,
             };
             tuple_data.extend_from_slice(&type_id.to_be_bytes());
             tuple_data.push(col.name.len() as u8);
@@ -466,6 +475,9 @@ fn execute_insert(
             Expression::Literal(LiteralValue::String(s)) => {
                 tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
                 tuple_data.extend_from_slice(s.as_bytes());
+            }
+            Expression::Literal(LiteralValue::Bool(b)) => {
+                tuple_data.push(if *b { 1 } else { 0 });
             }
             _ => {}
         }
@@ -759,6 +771,9 @@ fn execute_update(
                     LiteralValue::String(s) => {
                         new_tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
                         new_tuple_data.extend_from_slice(s.as_bytes());
+                    }
+                    LiteralValue::Bool(b) => {
+                        new_tuple_data.push(if *b { 1 } else { 0 });
                     }
                 }
             }
@@ -1239,37 +1254,9 @@ fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<bool, ExecutionError> {
-    match expr {
-        Expression::Binary { left, op, right } => {
-            let left_val = evaluate_expr_for_row_to_val(left, row)?;
-            let right_val = evaluate_expr_for_row_to_val(right, row)?;
-
-            let left_num = match left_val {
-                LiteralValue::Number(s) => {
-                    s.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?
-                }
-                _ => return Err(ExecutionError::GenericError(())),
-            };
-            let right_num = match right_val {
-                LiteralValue::Number(s) => {
-                    s.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?
-                }
-                _ => return Err(ExecutionError::GenericError(())),
-            };
-
-            let result = match op {
-                BinaryOperator::Eq => left_num == right_num,
-                BinaryOperator::NotEq => left_num != right_num,
-                BinaryOperator::Lt => left_num < right_num,
-                BinaryOperator::LtEq => left_num <= right_num,
-                BinaryOperator::Gt => left_num > right_num,
-                BinaryOperator::GtEq => left_num >= right_num,
-                BinaryOperator::Plus => left_num + right_num == left_num + right_num,
-                BinaryOperator::Minus => left_num - right_num == left_num - right_num,
-            };
-            Ok(result)
-        }
-        _ => Err(ExecutionError::GenericError(())),
+    match evaluate_expr_for_row_to_val(expr, row)? {
+        LiteralValue::Bool(b) => Ok(b),
+        _ => Err(ExecutionError::GenericError(())), // Type error
     }
 }
 
@@ -1293,30 +1280,30 @@ fn evaluate_expr_for_row_to_val<'a>(
             let left_val = evaluate_expr_for_row_to_val(left, row)?;
             let right_val = evaluate_expr_for_row_to_val(right, row)?;
 
-            let left_num = match left_val {
-                LiteralValue::Number(s) => {
-                    s.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?
+            match (left_val, right_val) {
+                (LiteralValue::Number(l), LiteralValue::Number(r)) => {
+                    let l_num = l.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?;
+                    let r_num = r.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?;
+                     match op {
+                        BinaryOperator::Plus => Ok(LiteralValue::Number((l_num + r_num).to_string())),
+                        BinaryOperator::Minus => Ok(LiteralValue::Number((l_num - r_num).to_string())),
+                        BinaryOperator::Eq => Ok(LiteralValue::Bool(l_num == r_num)),
+                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(l_num != r_num)),
+                        BinaryOperator::Lt => Ok(LiteralValue::Bool(l_num < r_num)),
+                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(l_num <= r_num)),
+                        BinaryOperator::Gt => Ok(LiteralValue::Bool(l_num > r_num)),
+                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(l_num >= r_num)),
+                    }
                 }
-                _ => return Err(ExecutionError::GenericError(())),
-            };
-            let right_num = match right_val {
-                LiteralValue::Number(s) => {
-                    s.parse::<i32>().map_err(|_| ExecutionError::GenericError(()))?
+                (LiteralValue::Bool(l), LiteralValue::Bool(r)) => {
+                     match op {
+                        BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
+                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
+                        _ => Err(ExecutionError::GenericError(())) // Unsupported op for bool
+                    }
                 }
-                _ => return Err(ExecutionError::GenericError(())),
-            };
-
-            let result = match op {
-                BinaryOperator::Plus => left_num + right_num,
-                BinaryOperator::Minus => left_num - right_num,
-                BinaryOperator::Eq => (left_num == right_num) as i32,
-                BinaryOperator::NotEq => (left_num != right_num) as i32,
-                BinaryOperator::Lt => (left_num < right_num) as i32,
-                BinaryOperator::LtEq => (left_num <= right_num) as i32,
-                BinaryOperator::Gt => (left_num > right_num) as i32,
-                BinaryOperator::GtEq => (left_num >= right_num) as i32,
-            };
-            Ok(LiteralValue::Number(result.to_string()))
+                _ => Err(ExecutionError::GenericError(())) // Type mismatch
+            }
         }
     }
 }

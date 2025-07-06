@@ -7,6 +7,7 @@ impl fmt::Display for LiteralValue {
         match self {
             LiteralValue::Number(s) => write!(f, "{}", s),
             LiteralValue::String(s) => write!(f, "{}", s),
+            LiteralValue::Bool(b) => write!(f, "{}", if *b { "TRUE" } else { "FALSE" }),
         }
     }
 }
@@ -70,6 +71,7 @@ pub struct ColumnDef {
 pub enum DataType {
     Int,
     Text,
+    Bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -132,12 +134,13 @@ pub enum Expression {
 pub enum LiteralValue {
     Number(String),
     String(String),
+    Bool(bool),
 }
 
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -154,7 +157,9 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .collect::<String>()
         .map(LiteralValue::String);
 
-    let literal = number.or(string).map(Expression::Literal).padded();
+    let boolean = text::keyword("TRUE").to(true).or(text::keyword("FALSE").to(false)).map(LiteralValue::Bool);
+
+    let literal = number.or(string).or(boolean).map(Expression::Literal).padded();
     
     let qualified_column = ident.clone()
         .then_ignore(just('.'))
@@ -252,6 +257,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         match s.to_uppercase().as_str() {
             "INT" => Ok(DataType::Int),
             "TEXT" => Ok(DataType::Text),
+            "BOOLEAN" => Ok(DataType::Bool),
             _ => Err(Simple::custom(span, format!("unknown type: {}", s))),
         }
     }).padded();

@@ -77,3 +77,36 @@ fn test_join_tables() {
     assert_eq!(result_strings[3], "Charlie, Monitor");
 }
 
+#[test]
+#[serial]
+fn test_boolean_type() {
+    let mut client = common::setup_server_and_client("boolean_test");
+
+    client.simple_query("CREATE TABLE test_bool (id INT, is_active BOOLEAN);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO test_bool VALUES (1, TRUE);");
+    client.simple_query("INSERT INTO test_bool VALUES (2, FALSE);");
+    client.simple_query("INSERT INTO test_bool VALUES (3, TRUE);");
+    client.simple_query("COMMIT;");
+
+    // Test selecting all
+    let mut all_rows = client.simple_query("SELECT id, is_active FROM test_bool;");
+    all_rows.sort();
+    assert_eq!(all_rows.len(), 3);
+    assert_eq!(all_rows[0], "1, t");
+    assert_eq!(all_rows[1], "2, f");
+    assert_eq!(all_rows[2], "3, t");
+
+    // Test filtering by TRUE
+    let true_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = TRUE;");
+    assert_eq!(true_rows.len(), 2);
+    assert!(true_rows.contains(&"1".to_string()));
+    assert!(true_rows.contains(&"3".to_string()));
+
+    // Test filtering by FALSE
+    let false_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = FALSE;");
+    assert_eq!(false_rows.len(), 1);
+    assert_eq!(false_rows[0], "2");
+}
+
