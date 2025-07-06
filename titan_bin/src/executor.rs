@@ -9,6 +9,7 @@ use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
 use bedrock::{btree, PageId, TupleId};
+use chrono::prelude::*;
 
 // --- Result Enums ---
 
@@ -195,6 +196,16 @@ fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, Liter
                 offset += len;
                 parsed_tuple.insert(col.name.clone(), LiteralValue::String(val.into_owned()));
             }
+            1082 => { // DATE
+                if offset + 4 > tuple_data.len() {
+                    break;
+                }
+                let days_since_epoch = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
+                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                let date = epoch + chrono::Duration::days(days_since_epoch as i64);
+                offset += 4;
+                parsed_tuple.insert(col.name.clone(), LiteralValue::Date(date.format("%Y-%m-%d").to_string()));
+            }
             _ => {}
         }
     }
@@ -305,6 +316,7 @@ fn execute_create_table(
                 DataType::Int => 23,
                 DataType::Text => 25,
                 DataType::Bool => 16,
+                DataType::Date => 1082,
             };
             tuple_data.extend_from_slice(&type_id.to_be_bytes());
             tuple_data.push(col.name.len() as u8);
@@ -478,6 +490,12 @@ fn execute_insert(
             }
             Expression::Literal(LiteralValue::Bool(b)) => {
                 tuple_data.push(if *b { 1 } else { 0 });
+            }
+            Expression::Literal(LiteralValue::Date(s)) => {
+                let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                let days_since_epoch = date.signed_duration_since(epoch).num_days() as i32;
+                tuple_data.extend_from_slice(&days_since_epoch.to_be_bytes());
             }
             _ => {}
         }
@@ -774,6 +792,12 @@ fn execute_update(
                     }
                     LiteralValue::Bool(b) => {
                         new_tuple_data.push(if *b { 1 } else { 0 });
+                    }
+                    LiteralValue::Date(s) => {
+                        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+                        let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                        let days_since_epoch = date.signed_duration_since(epoch).num_days() as i32;
+                        new_tuple_data.extend_from_slice(&days_since_epoch.to_be_bytes());
                     }
                 }
             }
@@ -1300,6 +1324,19 @@ fn evaluate_expr_for_row_to_val<'a>(
                         BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
                         BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
                         _ => Err(ExecutionError::GenericError(())) // Unsupported op for bool
+                    }
+                }
+                (LiteralValue::Date(l), LiteralValue::Date(r)) => {
+                    let l_date = NaiveDate::parse_from_str(&l, "%Y-%m-%d").map_err(|_| ExecutionError::GenericError(()))?;
+                    let r_date = NaiveDate::parse_from_str(&r, "%Y-%m-%d").map_err(|_| ExecutionError::GenericError(()))?;
+                    match op {
+                        BinaryOperator::Eq => Ok(LiteralValue::Bool(l_date == r_date)),
+                        BinaryOperator::NotEq => Ok(LiteralValue::Bool(l_date != r_date)),
+                        BinaryOperator::Lt => Ok(LiteralValue::Bool(l_date < r_date)),
+                        BinaryOperator::LtEq => Ok(LiteralValue::Bool(l_date <= r_date)),
+                        BinaryOperator::Gt => Ok(LiteralValue::Bool(l_date > r_date)),
+                        BinaryOperator::GtEq => Ok(LiteralValue::Bool(l_date >= r_date)),
+                        _ => Err(ExecutionError::GenericError(())) // Unsupported op for date
                     }
                 }
                 _ => Err(ExecutionError::GenericError(())) // Type mismatch

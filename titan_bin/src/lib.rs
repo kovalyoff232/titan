@@ -58,6 +58,7 @@ fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resul
         let type_size = match col.type_id {
             16 => 1, // bool
             23 => 4, // int4
+            1082 => 4, // date
             _ => -1, // variable-length
         };
         data.put_i16(type_size);
@@ -74,7 +75,7 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
         let final_val = if columns[i].type_id == 16 { // Bool
             if val.to_lowercase() == "true" { "t" } else { "f" }
         } else {
-            val
+            val.as_str()
         };
         data.put_i32(final_val.len() as i32);
         data.put_slice(final_val.as_bytes());

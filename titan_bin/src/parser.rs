@@ -8,6 +8,7 @@ impl fmt::Display for LiteralValue {
             LiteralValue::Number(s) => write!(f, "{}", s),
             LiteralValue::String(s) => write!(f, "{}", s),
             LiteralValue::Bool(b) => write!(f, "{}", if *b { "TRUE" } else { "FALSE" }),
+            LiteralValue::Date(s) => write!(f, "{}", s),
         }
     }
 }
@@ -72,6 +73,7 @@ pub enum DataType {
     Int,
     Text,
     Bool,
+    Date,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -135,12 +137,13 @@ pub enum LiteralValue {
     Number(String),
     String(String),
     Bool(bool),
+    Date(String),
 }
 
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident = text::ident().padded().try_map(|ident: String, span| {
         match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" =>
+            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" =>
                 Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
             _ => Ok(ident),
         }
@@ -151,15 +154,18 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .collect::<String>()
         .map(LiteralValue::Number);
 
-    let string = just('\'')
-        .ignore_then(filter(|c| *c != '\'').repeated())
-        .then_ignore(just('\''))
-        .collect::<String>()
-        .map(LiteralValue::String);
+    let string_literal = just('\'').ignore_then(filter(|c| *c != '\'').repeated()).then_ignore(just('\'')).collect::<String>();
+
+    let string = string_literal.clone().map(LiteralValue::String);
 
     let boolean = text::keyword("TRUE").to(true).or(text::keyword("FALSE").to(false)).map(LiteralValue::Bool);
 
-    let literal = number.or(string).or(boolean).map(Expression::Literal).padded();
+    let date = text::keyword("DATE")
+        .padded()
+        .ignore_then(string_literal)
+        .map(LiteralValue::Date);
+
+    let literal = number.or(string).or(boolean).or(date).map(Expression::Literal).padded();
     
     let qualified_column = ident.clone()
         .then_ignore(just('.'))
@@ -258,6 +264,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             "INT" => Ok(DataType::Int),
             "TEXT" => Ok(DataType::Text),
             "BOOLEAN" => Ok(DataType::Bool),
+            "DATE" => Ok(DataType::Date),
             _ => Err(Simple::custom(span, format!("unknown type: {}", s))),
         }
     }).padded();

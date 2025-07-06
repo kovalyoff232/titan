@@ -110,3 +110,31 @@ fn test_boolean_type() {
     assert_eq!(false_rows[0], "2");
 }
 
+#[test]
+#[serial]
+fn test_date_type() {
+    let mut client = common::setup_server_and_client("date_test");
+
+    client.simple_query("CREATE TABLE events (id INT, event_date DATE);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO events VALUES (1, DATE '2024-01-15');");
+    client.simple_query("INSERT INTO events VALUES (2, DATE '2025-07-06');");
+    client.simple_query("INSERT INTO events VALUES (3, DATE '2024-01-15');");
+    client.simple_query("COMMIT;");
+
+    // Test selecting all
+    let mut all_rows = client.simple_query("SELECT id, event_date FROM events;");
+    all_rows.sort();
+    assert_eq!(all_rows.len(), 3);
+    assert_eq!(all_rows[0], "1, 2024-01-15");
+    assert_eq!(all_rows[1], "2, 2025-07-06");
+    assert_eq!(all_rows[2], "3, 2024-01-15");
+
+    // Test filtering by date
+    let filtered_rows = client.simple_query("SELECT id FROM events WHERE event_date = DATE '2024-01-15';");
+    assert_eq!(filtered_rows.len(), 2);
+    assert!(filtered_rows.contains(&"1".to_string()));
+    assert!(filtered_rows.contains(&"3".to_string()));
+}
+
