@@ -19,7 +19,4 @@ log.txt
 # Environment variables
 .env
 
-# Project-specific files
-idea.txt
-prompt.txt
-Screenshot_*.png
+
