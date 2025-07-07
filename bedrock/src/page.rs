@@ -9,6 +9,7 @@ pub const INVALID_PAGE_ID: PageId = 0;
 /// The header of a page on disk.
 /// This structure is laid out in memory exactly as it is on disk.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct PageHeaderData {
     /// Log Sequence Number of the latest log record modifying this page.
     pub lsn: u64,
@@ -70,24 +71,28 @@ impl Page {
 
     /// Initializes the page header.
     pub fn initialize(&mut self) {
-        let header = self.header_mut();
+        let mut header = self.read_header();
         header.lsn = 0;
         header.checksum = 0;
         header.flags = 0;
         header.lower_offset = std::mem::size_of::<PageHeaderData>() as u16;
         header.upper_offset = PAGE_SIZE as u16;
         header.next_page_id = INVALID_PAGE_ID;
+        self.write_header(&header);
     }
 
     /// Returns a mutable reference to the page header.
-    pub fn header_mut(&mut self) -> &mut PageHeaderData {
-        unsafe { &mut *(self.data.as_mut_ptr() as *mut PageHeaderData) }
+    pub fn read_header(&self) -> PageHeaderData {
+        unsafe { std::ptr::read_unaligned(self.data.as_ptr() as *const PageHeaderData) }
     }
 
-    /// Returns a reference to the page header.
-    pub fn header(&self) -> &PageHeaderData {
-        unsafe { &*(self.data.as_ptr() as *const PageHeaderData) }
+    pub fn write_header(&mut self, header: &PageHeaderData) {
+        unsafe {
+            std::ptr::write_unaligned(self.data.as_mut_ptr() as *mut PageHeaderData, *header);
+        }
     }
+
+    
 
     /// Adds a new tuple to the page.
     /// Returns the item id of the new tuple, or None if there is not enough space.
@@ -102,7 +107,7 @@ impl Page {
         let item_id_len = std::mem::size_of::<ItemIdData>();
         let needed_space = tuple_len + item_id_len;
 
-        let header = self.header();
+        let header = self.read_header();
         println!(
             "[Page::add_tuple] PageId: {}, Needed space: {}, Free space: {}",
             self.id,
@@ -134,9 +139,10 @@ impl Page {
         let tuple_data = self.tuple_mut(tuple_data_offset, tuple.len());
         tuple_data.copy_from_slice(tuple);
 
-        let header = self.header_mut();
+        let mut header = self.read_header();
         header.lower_offset += item_id_len as u16;
         header.upper_offset = tuple_offset;
+        self.write_header(&header);
 
         println!(
             "[Page::add_tuple] Added tuple to page {}, item_id_index: {}, xmin: {}, xmax: {}",
@@ -186,12 +192,12 @@ impl Page {
         let item_id_size = std::mem::size_of::<ItemIdData>() as u16;
         let item_id_offset = header_size + item_id * item_id_size;
 
-        if item_id_offset + item_id_size > self.header().lower_offset {
+        if item_id_offset + item_id_size > self.read_header().lower_offset {
             return None;
         }
         let item_id_data = *self.item_id(item_id_offset);
 
-        if item_id_data.offset < self.header().lower_offset
+        if item_id_data.offset < self.read_header().lower_offset
             || item_id_data.offset + item_id_data.length > PAGE_SIZE as u16
         {
             return None;
@@ -232,7 +238,7 @@ impl Page {
     pub fn get_tuple_count(&self) -> u16 {
         let header_size = std::mem::size_of::<PageHeaderData>() as u16;
         let item_id_size = std::mem::size_of::<ItemIdData>() as u16;
-        let lower = self.header().lower_offset;
+        let lower = self.read_header().lower_offset;
 
         if lower < header_size {
             return 0;

@@ -22,7 +22,6 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .open(path_ref)?;
 
         let file_size = file.metadata()?.len();
@@ -106,33 +105,29 @@ impl Pager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::tempdir;
 
     #[test]
-    fn test_pager() -> io::Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let mut pager = Pager::open(temp_file.path())?;
+    fn test_pager() {
+        let temp_dir = tempdir().unwrap();
+        let temp_path = temp_dir.path().join("test.db");
 
-        // Allocate a new page
-        let page_id = pager.allocate_page()?;
+        let mut pager = Pager::open(temp_path.to_str().unwrap()).unwrap();
+
+        let page_id = pager.allocate_page().unwrap();
         assert_eq!(page_id, 0);
 
-        // Write some data to the page
-        let mut page = pager.read_page(page_id)?;
-        page.data[0..5].copy_from_slice(b"hello");
-        pager.write_page(&page)?;
+        let mut page = pager.read_page(page_id).unwrap();
+        let mut header = page.read_header();
+        header.lsn = 123;
+        page.write_header(&header);
+        pager.write_page(&page).unwrap();
 
-        // Read the page back and verify the data
-        let page = pager.read_page(page_id)?;
-        assert_eq!(&page.data[0..5], b"hello");
-
-        // Verify the header
-        let header = page.header();
-        assert_eq!(
-            header.lower_offset,
-            std::mem::size_of::<crate::page::PageHeaderData>() as u16
-        );
-
-        Ok(())
+        // Re-open the pager and check if the page is there
+        drop(pager);
+        let mut pager = Pager::open(temp_path.to_str().unwrap()).unwrap();
+        let page = pager.read_page(page_id).unwrap();
+        let header = page.read_header();
+        assert_eq!(header.lsn, 123);
     }
 }

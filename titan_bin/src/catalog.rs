@@ -160,7 +160,9 @@ pub fn update_pg_class_page_id(
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
-        pg_class_page.header_mut().lsn = lsn;
+        let mut header = pg_class_page.read_header();
+        header.lsn = lsn;
+        pg_class_page.write_header(&header);
     }
     Ok(())
 }

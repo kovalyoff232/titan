@@ -677,7 +677,9 @@ fn execute_create_table(
         },
     )?;
     tm.set_last_lsn(tx_id, lsn);
-    pg_class_page.header_mut().lsn = lsn;
+    let mut header = pg_class_page.read_header();
+    header.lsn = lsn;
+    pg_class_page.write_header(&header);
     drop(pg_class_page);
     drop(pg_class_guard);
 
@@ -713,7 +715,9 @@ fn execute_create_table(
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
-        pg_attr_page.header_mut().lsn = lsn;
+        let mut header = pg_attr_page.read_header();
+        header.lsn = lsn;
+        pg_attr_page.write_header(&header);
     }
     Ok(())
 }
@@ -762,7 +766,9 @@ fn execute_create_index(
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
-        page.header_mut().lsn = lsn;
+        let mut header = page.read_header();
+        header.lsn = lsn;
+        page.write_header(&header);
     }
 
     if table_page_id != INVALID_PAGE_ID {
@@ -842,7 +848,9 @@ fn execute_insert(
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
-        page.header_mut().lsn = lsn;
+        let mut header = page.read_header();
+        header.lsn = lsn;
+        page.write_header(&header);
         update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
         return Ok(1);
     }
@@ -855,9 +863,10 @@ fn execute_insert(
             let needed = tuple_data.len()
                 + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
                 + std::mem::size_of::<bedrock::page::ItemIdData>();
-            page.header()
+            let header = page.read_header();
+            header
                 .upper_offset
-                .saturating_sub(page.header().lower_offset)
+                .saturating_sub(header.lower_offset)
                 >= needed as u16
         };
 
@@ -875,15 +884,20 @@ fn execute_insert(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
+            let mut header = page.read_header();
+            header.lsn = lsn;
+            page.write_header(&header);
             return Ok(1);
         }
 
-        let next_page_id = page_guard.read().header().next_page_id;
+        let next_page_id = page_guard.read().read_header().next_page_id;
         if next_page_id == INVALID_PAGE_ID {
             let new_page_guard = bpm.new_page()?;
             let new_page_id = new_page_guard.read().id;
-            page_guard.write().header_mut().next_page_id = new_page_id;
+            let mut page = page_guard.write();
+            let mut header = page.read_header();
+            header.next_page_id = new_page_id;
+            page.write_header(&header);
             let mut new_page = new_page_guard.write();
             let item_id = new_page.add_tuple(&tuple_data, tx_id, 0).unwrap();
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
@@ -897,7 +911,9 @@ fn execute_insert(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            new_page.header_mut().lsn = lsn;
+            let mut header = new_page.read_header();
+            header.lsn = lsn;
+            new_page.write_header(&header);
             return Ok(1);
         }
         current_page_id = next_page_id;
@@ -995,7 +1011,9 @@ fn execute_update(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
+            let mut header = page.read_header();
+            header.lsn = lsn;
+            page.write_header(&header);
         } else {
             page.get_tuple_header_mut(item_id).unwrap().xmax = 0;
             lm.unlock_all(tx_id);
@@ -1060,7 +1078,9 @@ fn execute_delete(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
+            let mut header = page.read_header();
+            header.lsn = lsn;
+            page.write_header(&header);
         }
     }
     Ok(rows_affected)
@@ -1100,7 +1120,7 @@ pub fn scan_table(
                 }
             }
         }
-        current_page_id = page.header().next_page_id;
+        current_page_id = page.read_header().next_page_id;
     }
     Ok(rows)
 }
@@ -1251,7 +1271,9 @@ fn execute_vacuum(
                 } else {
                     let new_page_guard = bpm.new_page()?;
                     let next_id = new_page_guard.read().id;
-                    page.header_mut().next_page_id = next_id;
+                    let mut header = page.read_header();
+                    header.next_page_id = next_id;
+                    page.write_header(&header);
                     current_new_page_id = next_id;
                 }
             }
@@ -1462,7 +1484,9 @@ fn insert_tuple_into_system_table(
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
-        page.header_mut().lsn = lsn;
+        let mut header = page.read_header();
+        header.lsn = lsn;
+        page.write_header(&header);
 
         update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
         return Ok(());
@@ -1476,9 +1500,10 @@ fn insert_tuple_into_system_table(
             let needed = tuple_data.len()
                 + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
                 + std::mem::size_of::<bedrock::page::ItemIdData>();
-            page.header()
+            let header = page.read_header();
+            header
                 .upper_offset
-                .saturating_sub(page.header().lower_offset)
+                .saturating_sub(header.lower_offset)
                 >= needed as u16
         };
 
@@ -1496,15 +1521,20 @@ fn insert_tuple_into_system_table(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
+            let mut header = page.read_header();
+            header.lsn = lsn;
+            page.write_header(&header);
             return Ok(());
         }
 
-        let next_page_id = page_guard.read().header().next_page_id;
+        let next_page_id = page_guard.read().read_header().next_page_id;
         if next_page_id == INVALID_PAGE_ID {
             let new_page_guard = bpm.new_page()?;
             let new_page_id = new_page_guard.read().id;
-            page_guard.write().header_mut().next_page_id = new_page_id;
+            let mut page = page_guard.write();
+            let mut header = page.read_header();
+            header.next_page_id = new_page_id;
+            page.write_header(&header);
             let mut new_page = new_page_guard.write();
             let item_id = new_page.add_tuple(tuple_data, tx_id, 0).unwrap();
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
@@ -1518,7 +1548,9 @@ fn insert_tuple_into_system_table(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            new_page.header_mut().lsn = lsn;
+            let mut header = new_page.read_header();
+            header.lsn = lsn;
+            new_page.write_header(&header);
             return Ok(());
         }
         current_page_id = next_page_id;
@@ -1580,7 +1612,9 @@ fn execute_delete_internal(
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
-            page.header_mut().lsn = lsn;
+            let mut header = page.read_header();
+            header.lsn = lsn;
+            page.write_header(&header);
         }
     }
     Ok(rows_affected)

@@ -161,7 +161,9 @@ impl TransactionManager {
                         // Physically mark the tuple as deleted by this abort.
                         header.xmax = tx_id;
                     }
-                    page.header_mut().lsn = clr_lsn;
+                    let mut header = page.read_header();
+                    header.lsn = clr_lsn;
+                    page.write_header(&header);
                 }
                 WalRecord::DeleteTuple {
                     page_id, item_id, ..
@@ -174,7 +176,9 @@ impl TransactionManager {
                             header.xmax = 0;
                         }
                     }
-                    page.header_mut().lsn = clr_lsn;
+                    let mut header = page.read_header();
+                    header.lsn = clr_lsn;
+                    page.write_header(&header);
                 }
                 WalRecord::UpdateTuple {
                     page_id,
@@ -188,7 +192,9 @@ impl TransactionManager {
                         // Restore the old version of the tuple.
                         tuple.copy_from_slice(&old_data);
                     }
-                    page.header_mut().lsn = clr_lsn;
+                    let mut header = page.read_header();
+                    header.lsn = clr_lsn;
+                    page.write_header(&header);
                 }
                 // CLRs are not undone. We just follow their `undo_next_lsn` pointer.
                 WalRecord::CompensationLogRecord { undo_next_lsn, .. } => {

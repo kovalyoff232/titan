@@ -413,9 +413,11 @@ impl WalManager {
                 Self::deserialize_record(record_buf)
             {
                 let mut page = pager.read_page(page_id)?;
-                if page.header().lsn < current_pos as u64 {
+                if page.read_header().lsn < current_pos as u64 {
                     page.data.copy_from_slice(&data);
-                    page.header_mut().lsn = current_pos as u64;
+                    let mut header = page.read_header();
+                    header.lsn = current_pos as u64;
+                    page.write_header(&header);
                     pager.write_page(&page)?;
                 }
             } else {
@@ -461,7 +463,7 @@ impl WalManager {
                     // This is a simplified version.
                     let page = pager.read_page(page_id)?;
                     // We only undo if the change was actually applied.
-                    if page.header().lsn >= current_pos as u64 {
+                    if page.read_header().lsn >= current_pos as u64 {
                         // In a real system, we'd get the tuple and restore it.
                         // This is a placeholder for that logic.
                         println!(
