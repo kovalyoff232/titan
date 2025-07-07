@@ -1,6 +1,6 @@
 //! The Write-Ahead Log manager.
 
-use crate::{PageId, pager::Pager};
+use crate::{pager::Pager, PageId};
 use crc32fast::Hasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -354,7 +354,8 @@ impl WalManager {
         while current_pos < buf.len() {
             let header_slice =
                 &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader = unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+            let header: WalRecordHeader =
+                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
 
             if header.tx_id > highest_tx_id {
                 highest_tx_id = header.tx_id;
@@ -382,7 +383,9 @@ impl WalManager {
                     | WalRecord::BTreePage { page_id, .. }
                     | WalRecord::SetNextPageId { page_id, .. } => {
                         // Add page to DPT if not present
-                        dirty_page_table.entry(page_id).or_insert(current_pos as Lsn);
+                        dirty_page_table
+                            .entry(page_id)
+                            .or_insert(current_pos as Lsn);
                     }
                     _ => {}
                 }
@@ -398,7 +401,8 @@ impl WalManager {
         while current_pos < buf.len() {
             let header_slice =
                 &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader = unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+            let header: WalRecordHeader =
+                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
 
             let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
             let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
@@ -427,7 +431,7 @@ impl WalManager {
         // For all transactions that were active at the end of the analysis (loser transactions),
         // undo their changes from last to first.
         let to_undo: HashSet<u32> = active_tx_table.keys().cloned().collect();
-        
+
         // We need to find the maximum LSN among all loser transactions to start the undo scan.
         let mut max_lsn = 0;
         for tx_id in &to_undo {
@@ -442,7 +446,8 @@ impl WalManager {
         while current_pos > 0 {
             let header_slice =
                 &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader = unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+            let header: WalRecordHeader =
+                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
 
             if to_undo.contains(&header.tx_id) {
                 let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
@@ -456,13 +461,16 @@ impl WalManager {
                     // This is a simplified version.
                     match record {
                         WalRecord::UpdateTuple { page_id, .. } => {
-                             let page = pager.read_page(page_id)?;
-                             // We only undo if the change was actually applied.
-                             if page.header().lsn >= current_pos as u64 {
-                                 // In a real system, we'd get the tuple and restore it.
-                                 // This is a placeholder for that logic.
-                                 println!("[RECOVERY-UNDO] Undoing update for tx {} on page {}", header.tx_id, page_id);
-                             }
+                            let page = pager.read_page(page_id)?;
+                            // We only undo if the change was actually applied.
+                            if page.header().lsn >= current_pos as u64 {
+                                // In a real system, we'd get the tuple and restore it.
+                                // This is a placeholder for that logic.
+                                println!(
+                                    "[RECOVERY-UNDO] Undoing update for tx {} on page {}",
+                                    header.tx_id, page_id
+                                );
+                            }
                         }
                         _ => {}
                     }

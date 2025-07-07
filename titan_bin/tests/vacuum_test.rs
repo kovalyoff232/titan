@@ -33,9 +33,9 @@ fn test_vacuum_removes_dead_tuples() {
     // 6. Check that the remaining data is still accessible
     let rows3 = client.simple_query("SELECT * FROM test_vacuum;");
     assert_eq!(rows3.len(), 2, "Should still have 2 rows after vacuum");
-    
+
     let mut ids: Vec<String> = rows3.into_iter().map(|row| row[0].clone()).collect();
     ids.sort();
-    
+
     assert_eq!(ids, vec!["1", "3"]);
 }

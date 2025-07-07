@@ -31,10 +31,7 @@ pub struct SelectStatement {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SelectItem {
     UnnamedExpr(Expression),
-    ExprWithAlias {
-        expr: Expression,
-        alias: String,
-    },
+    ExprWithAlias { expr: Expression, alias: String },
     Wildcard,
     QualifiedWildcard(String),
 }
@@ -171,33 +168,53 @@ impl fmt::Display for BinaryOperator {
 // --- Parser ---
 
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
-    let ident = text::ident().padded().try_map(|ident: String, span| {
-        match ident.to_uppercase().as_str() {
-            "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS" | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET" | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START" | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" =>
-                Err(Simple::custom(span, format!("keyword `{}` cannot be used as an identifier", ident))),
-            _ => Ok(ident),
-        }
-    });
+    let ident =
+        text::ident()
+            .padded()
+            .try_map(|ident: String, span| match ident.to_uppercase().as_str() {
+                "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS"
+                | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
+                | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
+                | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" => {
+                    Err(Simple::custom(
+                        span,
+                        format!("keyword `{}` cannot be used as an identifier", ident),
+                    ))
+                }
+                _ => Ok(ident),
+            });
 
     let number = text::int(10)
         .chain::<char, _, _>(just('.').chain(text::digits(10)).or_not().flatten())
         .collect::<String>()
         .map(LiteralValue::Number);
 
-    let string_literal = just('\'').ignore_then(filter(|c| *c != '\'').repeated()).then_ignore(just('\'')).collect::<String>();
+    let string_literal = just('\'')
+        .ignore_then(filter(|c| *c != '\'').repeated())
+        .then_ignore(just('\''))
+        .collect::<String>();
 
     let string = string_literal.clone().map(LiteralValue::String);
 
-    let boolean = text::keyword("TRUE").to(true).or(text::keyword("FALSE").to(false)).map(LiteralValue::Bool);
+    let boolean = text::keyword("TRUE")
+        .to(true)
+        .or(text::keyword("FALSE").to(false))
+        .map(LiteralValue::Bool);
 
     let date = text::keyword("DATE")
         .padded()
         .ignore_then(string_literal)
         .map(LiteralValue::Date);
 
-    let literal = number.or(string).or(boolean).or(date).map(Expression::Literal).padded();
-    
-    let qualified_column = ident.clone()
+    let literal = number
+        .or(string)
+        .or(boolean)
+        .or(date)
+        .map(Expression::Literal)
+        .padded();
+
+    let qualified_column = ident
+        .clone()
         .then_ignore(just('.'))
         .then(ident.clone())
         .map(|(table, column)| Expression::QualifiedColumn(table, column));
@@ -210,18 +227,25 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(column)
             .or(expr.delimited_by(just('(').padded(), just(')').padded()));
 
-        let term = atom.clone()
-            .then(choice((
-                just('+').to(BinaryOperator::Plus),
-                just('-').to(BinaryOperator::Minus),
-            )).padded().then(atom).repeated())
+        let term = atom
+            .clone()
+            .then(
+                choice((
+                    just('+').to(BinaryOperator::Plus),
+                    just('-').to(BinaryOperator::Minus),
+                ))
+                .padded()
+                .then(atom)
+                .repeated(),
+            )
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
             });
 
-        let op = just("=").to(BinaryOperator::Eq)
+        let op = just("=")
+            .to(BinaryOperator::Eq)
             .or(just("<>").to(BinaryOperator::NotEq))
             .or(just("<=").to(BinaryOperator::LtEq))
             .or(just("<").to(BinaryOperator::Lt))
@@ -237,12 +261,21 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             })
     });
 
-    let qualified_wildcard = ident.clone().then_ignore(just('.')).then_ignore(just('*')).map(SelectItem::QualifiedWildcard);
+    let qualified_wildcard = ident
+        .clone()
+        .then_ignore(just('.'))
+        .then_ignore(just('*'))
+        .map(SelectItem::QualifiedWildcard);
     let wildcard = just('*').padded().to(SelectItem::Wildcard);
 
     let select_item = wildcard.or(qualified_wildcard).or(expr
         .clone()
-        .then(text::keyword("AS").padded().ignore_then(ident.clone()).or_not())
+        .then(
+            text::keyword("AS")
+                .padded()
+                .ignore_then(ident.clone())
+                .or_not(),
+        )
         .map(|(expr, alias)| match alias {
             Some(alias) => SelectItem::ExprWithAlias { expr, alias },
             None => SelectItem::UnnamedExpr(expr),
@@ -250,63 +283,90 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
     let table_reference = recursive(|table_ref| {
         let table = ident.clone().map(|name| TableReference::Table { name });
-        
-        let join = table.clone()
+
+        let join = table
+            .clone()
             .then(
-                text::keyword("JOIN").padded()
-                .ignore_then(table_ref)
-                .then_ignore(text::keyword("ON").padded())
-                .then(expr.clone())
-                .repeated()
+                text::keyword("JOIN")
+                    .padded()
+                    .ignore_then(table_ref)
+                    .then_ignore(text::keyword("ON").padded())
+                    .then(expr.clone())
+                    .repeated(),
             )
             .foldl(|left, (right, on_condition)| TableReference::Join {
                 left: Box::new(left),
                 right: Box::new(right),
                 on_condition,
             });
-        
+
         join
     });
 
-    let select = text::keyword("SELECT").padded()
+    let select = text::keyword("SELECT")
+        .padded()
         .ignore_then(
             select_item
                 .separated_by(just(',').padded())
                 .allow_trailing()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         )
-        .then(text::keyword("FROM").padded().ignore_then(
-            table_reference.separated_by(just(',').padded()).collect()
-        ).or_not())
-        .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
-        .then(text::keyword("ORDER").padded().ignore_then(text::keyword("BY")).padded().ignore_then(expr.clone().separated_by(just(',').padded()).collect()).or_not())
-        .then(text::keyword("FOR").padded().ignore_then(text::keyword("UPDATE")).padded().or_not())
-        .map(|((((select_list, from), where_clause), order_by), for_update)| {
-            Statement::Select(SelectStatement {
-                select_list,
-                from: from.unwrap_or_default(),
-                where_clause,
-                order_by,
-                for_update: for_update.is_some(),
-            })
-        });
-    
-    let data_type = text::ident().try_map(|s: String, span| {
-        match s.to_uppercase().as_str() {
+        .then(
+            text::keyword("FROM")
+                .padded()
+                .ignore_then(table_reference.separated_by(just(',').padded()).collect())
+                .or_not(),
+        )
+        .then(
+            text::keyword("WHERE")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
+        .then(
+            text::keyword("ORDER")
+                .padded()
+                .ignore_then(text::keyword("BY"))
+                .padded()
+                .ignore_then(expr.clone().separated_by(just(',').padded()).collect())
+                .or_not(),
+        )
+        .then(
+            text::keyword("FOR")
+                .padded()
+                .ignore_then(text::keyword("UPDATE"))
+                .padded()
+                .or_not(),
+        )
+        .map(
+            |((((select_list, from), where_clause), order_by), for_update)| {
+                Statement::Select(SelectStatement {
+                    select_list,
+                    from: from.unwrap_or_default(),
+                    where_clause,
+                    order_by,
+                    for_update: for_update.is_some(),
+                })
+            },
+        );
+
+    let data_type = text::ident()
+        .try_map(|s: String, span| match s.to_uppercase().as_str() {
             "INT" => Ok(DataType::Int),
             "TEXT" => Ok(DataType::Text),
             "BOOLEAN" => Ok(DataType::Bool),
             "DATE" => Ok(DataType::Date),
             _ => Err(Simple::custom(span, format!("unknown type: {}", s))),
-        }
-    }).padded();
+        })
+        .padded();
 
-
-    let column_def = ident.clone()
+    let column_def = ident
+        .clone()
         .then(data_type)
         .map(|(name, data_type)| ColumnDef { name, data_type });
 
-    let create_table = text::keyword("CREATE").padded()
+    let create_table = text::keyword("CREATE")
+        .padded()
         .ignore_then(text::keyword("TABLE").padded())
         .ignore_then(ident.clone())
         .then(
@@ -322,8 +382,9 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 columns,
             })
         });
-        
-    let create_index = text::keyword("CREATE").padded()
+
+    let create_index = text::keyword("CREATE")
+        .padded()
         .ignore_then(text::keyword("INDEX").padded())
         .ignore_then(ident.clone())
         .then_ignore(text::keyword("ON").padded())
@@ -337,35 +398,39 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             })
         });
 
-    let insert = text::keyword("INSERT").padded()
+    let insert = text::keyword("INSERT")
+        .padded()
         .ignore_then(text::keyword("INTO").padded())
         .ignore_then(ident.clone())
         .then_ignore(text::keyword("VALUES").padded())
         .then(
-            expr.clone().separated_by(just(',').padded())
+            expr.clone()
+                .separated_by(just(',').padded())
                 .allow_trailing()
                 .collect::<Vec<_>>()
                 .delimited_by(just('(').padded(), just(')').padded()),
         )
-        .map(|(table_name, values)| {
-            Statement::Insert(InsertStatement {
-                table_name,
-                values,
-            })
-        });
+        .map(|(table_name, values)| Statement::Insert(InsertStatement { table_name, values }));
 
-    let update = text::keyword("UPDATE").padded()
+    let update = text::keyword("UPDATE")
+        .padded()
         .ignore_then(ident.clone())
         .then_ignore(text::keyword("SET").padded())
         .then(
-            ident.clone()
+            ident
+                .clone()
                 .then_ignore(just('=').padded())
                 .then(expr.clone())
                 .separated_by(just(',').padded())
                 .at_least(1)
                 .collect::<Vec<(String, Expression)>>(),
         )
-        .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
+        .then(
+            text::keyword("WHERE")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
         .map(|((table_name, assignments), where_clause)| {
             Statement::Update(UpdateStatement {
                 table_name,
@@ -374,29 +439,45 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             })
         });
 
-    let delete = text::keyword("DELETE").padded()
+    let delete = text::keyword("DELETE")
+        .padded()
         .ignore_then(text::keyword("FROM").padded())
         .ignore_then(ident.clone())
-        .then(text::keyword("WHERE").padded().ignore_then(expr.clone()).or_not())
+        .then(
+            text::keyword("WHERE")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
         .map(|(table_name, where_clause)| {
-            Statement::Delete(DeleteStatement { table_name, where_clause })
+            Statement::Delete(DeleteStatement {
+                table_name,
+                where_clause,
+            })
         });
 
-    let dump_page = text::keyword("DUMP").padded()
+    let dump_page = text::keyword("DUMP")
+        .padded()
         .ignore_then(text::keyword("PAGE").padded())
         .ignore_then(text::int(10).map(|s: String| s.parse().unwrap()))
         .map(Statement::DumpPage);
 
     let begin = text::keyword("BEGIN").padded().to(Statement::Begin);
-    let start_transaction = text::keyword("START").padded().then(text::keyword("TRANSACTION")).padded().to(Statement::Begin);
+    let start_transaction = text::keyword("START")
+        .padded()
+        .then(text::keyword("TRANSACTION"))
+        .padded()
+        .to(Statement::Begin);
     let commit = text::keyword("COMMIT").padded().to(Statement::Commit);
     let rollback = text::keyword("ROLLBACK").padded().to(Statement::Rollback);
 
-    let vacuum = text::keyword("VACUUM").padded()
+    let vacuum = text::keyword("VACUUM")
+        .padded()
         .ignore_then(ident.clone())
         .map(Statement::Vacuum);
 
-    let analyze = text::keyword("ANALYZE").padded()
+    let analyze = text::keyword("ANALYZE")
+        .padded()
         .ignore_then(ident.clone())
         .map(Statement::Analyze);
 

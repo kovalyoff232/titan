@@ -78,11 +78,17 @@ impl BufferPoolManager {
         if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
             let frame = self.frames[frame_index].clone();
             self.pin_frame(&frame);
-            return Ok(PageGuard { bpm: self.clone(), page_id, frame });
+            return Ok(PageGuard {
+                bpm: self.clone(),
+                page_id,
+                frame,
+            });
         }
 
         // 2. If not, find a free frame or evict one.
-        let frame_index = self.find_victim_frame().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
+        let frame_index = self
+            .find_victim_frame()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
         // 3. Evict the old page if the frame is dirty.
@@ -100,13 +106,22 @@ impl BufferPoolManager {
         }
 
         // 6. Update the page table.
-        self.page_table.write().unwrap().insert(page_id, frame_index);
-        Ok(PageGuard { bpm: self.clone(), page_id, frame })
+        self.page_table
+            .write()
+            .unwrap()
+            .insert(page_id, frame_index);
+        Ok(PageGuard {
+            bpm: self.clone(),
+            page_id,
+            frame,
+        })
     }
 
     pub fn new_page(self: &Arc<Self>) -> io::Result<PageGuard> {
         // 1. Find a free frame or evict one.
-        let frame_index = self.find_victim_frame().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
+        let frame_index = self
+            .find_victim_frame()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
         // 2. Evict the old page if the frame is dirty.
@@ -124,8 +139,15 @@ impl BufferPoolManager {
         }
 
         // 5. Update the page table.
-        self.page_table.write().unwrap().insert(new_page_id, frame_index);
-        Ok(PageGuard { bpm: self.clone(), page_id: new_page_id, frame })
+        self.page_table
+            .write()
+            .unwrap()
+            .insert(new_page_id, frame_index);
+        Ok(PageGuard {
+            bpm: self.clone(),
+            page_id: new_page_id,
+            frame,
+        })
     }
 
     fn pin_frame(&self, frame: &Arc<Frame>) {
@@ -191,7 +213,7 @@ impl BufferPoolManager {
         loop {
             let frame_index = *clock_hand;
             *clock_hand = (*clock_hand + 1) % self.frames.len();
-            
+
             let frame = &self.frames[frame_index];
             let pin_count = frame.pin_count.lock().unwrap();
 

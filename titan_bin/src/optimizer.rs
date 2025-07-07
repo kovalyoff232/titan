@@ -2,14 +2,14 @@
 //!
 //! This module is responsible for converting a logical plan into an efficient physical plan.
 
+use crate::catalog::{self, get_table_schema};
+use crate::executor;
 use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
 use crate::planner::LogicalPlan;
-use crate::catalog::{self, get_table_schema};
-use std::collections::HashMap;
-use std::sync::Arc;
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
-use crate::executor;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
@@ -67,29 +67,82 @@ impl Statistics {
         tx_id: u32,
         snapshot: &Snapshot,
     ) -> Result<Self, ()> {
-        let (stat_oid, stat_page_id) = catalog::find_table("pg_statistic", bpm, tx_id, snapshot).unwrap().unwrap();
+        let (stat_oid, stat_page_id) = catalog::find_table("pg_statistic", bpm, tx_id, snapshot)
+            .unwrap()
+            .unwrap();
         let stat_schema = catalog::get_table_schema(bpm, stat_oid, tx_id, snapshot).unwrap();
-        let stat_rows = executor::scan_table(bpm, &Arc::new(Default::default()), stat_page_id, &stat_schema, tx_id, snapshot, false).unwrap();
+        let stat_rows = executor::scan_table(
+            bpm,
+            &Arc::new(Default::default()),
+            stat_page_id,
+            &stat_schema,
+            tx_id,
+            snapshot,
+            false,
+        )
+        .unwrap();
 
         let mut n_distinct = 0.0;
         let mut mcv = Vec::new();
         let mut histogram = Vec::new();
 
         for (_, _, row) in stat_rows {
-            let starelid = row.get("starelid").unwrap().to_string().parse::<u32>().unwrap();
-            let staattnum = row.get("staattnum").unwrap().to_string().parse::<usize>().unwrap();
+            let starelid = row
+                .get("starelid")
+                .unwrap()
+                .to_string()
+                .parse::<u32>()
+                .unwrap();
+            let staattnum = row
+                .get("staattnum")
+                .unwrap()
+                .to_string()
+                .parse::<usize>()
+                .unwrap();
 
             if starelid == table_oid && staattnum == col_idx {
-                let stakind = row.get("stakind").unwrap().to_string().parse::<i32>().unwrap();
+                let stakind = row
+                    .get("stakind")
+                    .unwrap()
+                    .to_string()
+                    .parse::<i32>()
+                    .unwrap();
                 match stakind {
-                    1 => n_distinct = row.get("stadistinct").unwrap().to_string().parse::<f64>().unwrap(),
-                    2 => mcv = row.get("stavalues").unwrap().to_string().split(',').map(String::from).collect(),
-                    3 => histogram = row.get("stanumbers").unwrap().to_string().split(',').map(String::from).collect(),
+                    1 => {
+                        n_distinct = row
+                            .get("stadistinct")
+                            .unwrap()
+                            .to_string()
+                            .parse::<f64>()
+                            .unwrap()
+                    }
+                    2 => {
+                        mcv = row
+                            .get("stavalues")
+                            .unwrap()
+                            .to_string()
+                            .split(',')
+                            .map(String::from)
+                            .collect()
+                    }
+                    3 => {
+                        histogram = row
+                            .get("stanumbers")
+                            .unwrap()
+                            .to_string()
+                            .split(',')
+                            .map(String::from)
+                            .collect()
+                    }
                     _ => {}
                 }
             }
         }
-        Ok(Self { n_distinct, mcv, histogram })
+        Ok(Self {
+            n_distinct,
+            mcv,
+            histogram,
+        })
     }
 }
 
@@ -117,7 +170,6 @@ fn estimate_index_scan_cost(stats: &Statistics, total_rows: f64, predicate_val: 
     estimated_rows * 1.2 // I/O cost + CPU cost for index traversal
 }
 
-
 pub fn optimize(
     plan: LogicalPlan,
     bpm: &Arc<BufferPoolManager>,
@@ -126,22 +178,52 @@ pub fn optimize(
     snapshot: &Snapshot,
 ) -> Result<PhysicalPlan, ()> {
     match plan {
-        LogicalPlan::Scan { table_name, filter, total_rows, alias: _ } => {
-            let (table_oid, first_page_id) = catalog::find_table(&table_name, bpm, tx_id, snapshot).unwrap().unwrap();
-            let num_pages = if first_page_id == bedrock::page::INVALID_PAGE_ID { 0 } else { bpm.pager.lock().unwrap().num_pages };
+        LogicalPlan::Scan {
+            table_name,
+            filter,
+            total_rows,
+            alias: _,
+        } => {
+            let (table_oid, first_page_id) = catalog::find_table(&table_name, bpm, tx_id, snapshot)
+                .unwrap()
+                .unwrap();
+            let num_pages = if first_page_id == bedrock::page::INVALID_PAGE_ID {
+                0
+            } else {
+                bpm.pager.lock().unwrap().num_pages
+            };
 
             let seq_scan_cost = estimate_seq_scan_cost(num_pages);
-            let mut best_plan = PhysicalPlan::TableScan { table_name: table_name.clone(), filter: filter.clone() };
+            let mut best_plan = PhysicalPlan::TableScan {
+                table_name: table_name.clone(),
+                filter: filter.clone(),
+            };
             let mut best_cost = seq_scan_cost;
 
-            if let Some(Expression::Binary { left, op: BinaryOperator::Eq, right }) = &filter {
-                if let (Expression::Column(col_name), Expression::Literal(lit_val)) = (&**left, &**right) {
+            if let Some(Expression::Binary {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            }) = &filter
+            {
+                if let (Expression::Column(col_name), Expression::Literal(lit_val)) =
+                    (&**left, &**right)
+                {
                     let schema = get_table_schema(bpm, table_oid, tx_id, snapshot).unwrap();
                     if let Some(col_idx) = schema.iter().position(|c| &c.name == col_name) {
                         let index_name = format!("idx_{}", col_name);
-                        if catalog::find_table(&index_name, bpm, tx_id, snapshot).unwrap().is_some() {
-                            if let Ok(stats) = Statistics::load(table_oid, col_idx, bpm, tx_id, snapshot) {
-                                let index_scan_cost = estimate_index_scan_cost(&stats, total_rows as f64, &lit_val.to_string());
+                        if catalog::find_table(&index_name, bpm, tx_id, snapshot)
+                            .unwrap()
+                            .is_some()
+                        {
+                            if let Ok(stats) =
+                                Statistics::load(table_oid, col_idx, bpm, tx_id, snapshot)
+                            {
+                                let index_scan_cost = estimate_index_scan_cost(
+                                    &stats,
+                                    total_rows as f64,
+                                    &lit_val.to_string(),
+                                );
                                 if index_scan_cost < best_cost {
                                     if let LiteralValue::Number(key_str) = lit_val {
                                         best_plan = PhysicalPlan::IndexScan {
@@ -227,4 +309,3 @@ fn is_sorted_by(plan: &PhysicalPlan, key: &Expression) -> bool {
         _ => false,
     }
 }
-

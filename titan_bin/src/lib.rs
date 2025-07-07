@@ -1,23 +1,23 @@
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use crate::errors::ExecutionError;
+use crate::types::{Column, ExecuteResult, ResultSet};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::lock_manager::LockManager;
 use bedrock::pager::Pager;
 use bedrock::transaction::TransactionManager;
 use bedrock::wal::WalManager;
-use crate::types::{Column, ExecuteResult, ResultSet};
-use crate::errors::ExecutionError;
 use bytes::{BufMut, BytesMut};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-pub mod parser;
-pub mod executor;
-pub mod planner;
-pub mod optimizer;
-pub mod types;
-pub mod errors;
 pub mod catalog;
+pub mod errors;
+pub mod executor;
+pub mod optimizer;
+pub mod parser;
+pub mod planner;
+pub mod types;
 
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
@@ -62,10 +62,10 @@ fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resul
         data.put_i16(i as i16 + 1); // Column index
         data.put_i32(col.type_id as i32); // Type OID
         let type_size = match col.type_id {
-            16 => 1, // bool
-            23 => 4, // int4
+            16 => 1,   // bool
+            23 => 4,   // int4
             1082 => 4, // date
-            _ => -1, // variable-length
+            _ => -1,   // variable-length
         };
         data.put_i16(type_size);
         data.put_i32(-1); // Type modifier
@@ -78,8 +78,13 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
     let mut data = BytesMut::new();
     data.put_i16(row.len() as i16);
     for (i, val) in row.iter().enumerate() {
-        let final_val = if columns[i].type_id == 16 { // Bool
-            if val.to_lowercase() == "t" { "t" } else { "f" }
+        let final_val = if columns[i].type_id == 16 {
+            // Bool
+            if val.to_lowercase() == "t" {
+                "t"
+            } else {
+                "f"
+            }
         } else {
             val.as_str()
         };
@@ -89,8 +94,17 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
     write_message(stream, b'D', &data)
 }
 
-fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<TransactionManager>, lm: Arc<LockManager>, wal: Arc<Mutex<WalManager>>) -> io::Result<()> {
-    println!("[handle_client] New connection from: {}", stream.peer_addr()?);
+fn handle_client(
+    mut stream: TcpStream,
+    bpm: Arc<BufferPoolManager>,
+    tm: Arc<TransactionManager>,
+    lm: Arc<LockManager>,
+    wal: Arc<Mutex<WalManager>>,
+) -> io::Result<()> {
+    println!(
+        "[handle_client] New connection from: {}",
+        stream.peer_addr()?
+    );
     let mut buffer = BytesMut::with_capacity(1024);
 
     // --- Startup Phase ---
@@ -98,20 +112,24 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
     let _n = stream.read(&mut startup_buf)?;
 
     let request_code = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
-    if request_code == 80877103 { // SSLRequest
+    if request_code == 80877103 {
+        // SSLRequest
         println!("[handle_client] SSLRequest received, denying.");
         stream.write_all(&[b'N'])?;
         let n = stream.read(&mut startup_buf)?;
-        if n == 0 { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
     }
-    
+
     let protocol_version = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
     println!("[handle_client] Protocol version: {}", protocol_version);
-    if protocol_version != 196608 { // 3.0
+    if protocol_version != 196608 {
+        // 3.0
         send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
         return Ok(());
     }
-    
+
     println!("[handle_client] Sending AuthenticationOk and ReadyForQuery.");
     write_message(&mut stream, b'R', &0i32.to_be_bytes())?;
     send_ready_for_query(&mut stream)?;
@@ -140,22 +158,27 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
         stream.read_exact(&mut buffer)?;
 
         match msg_type[0] {
-            b'Q' => { // Simple Query
-                let query_str = String::from_utf8_lossy(&buffer[..len-1]).to_string();
+            b'Q' => {
+                // Simple Query
+                let query_str = String::from_utf8_lossy(&buffer[..len - 1]).to_string();
                 println!("[handle_client] Received query: '{}'", query_str);
 
                 let stmts = match parser::sql_parser(&query_str) {
                     Ok(s) => s,
                     Err(e) => {
                         println!("[handle_client] Parsing failed: {:?}", e);
-                        send_error_response(&mut stream, &format!("Parsing failed: {:?}", e), "42601")?;
+                        send_error_response(
+                            &mut stream,
+                            &format!("Parsing failed: {:?}", e),
+                            "42601",
+                        )?;
                         send_ready_for_query(&mut stream)?;
                         continue;
                     }
                 };
 
                 let mut last_result: Option<ExecuteResult> = None;
-                
+
                 for stmt in stmts {
                     if !in_transaction {
                         tx_id = tm.begin();
@@ -163,7 +186,10 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                         println!("[handle_client] Started transaction with tx_id: {}", tx_id);
                     }
 
-                    println!("[handle_client] Executing statement: {:?} in tx_id: {}", stmt, tx_id);
+                    println!(
+                        "[handle_client] Executing statement: {:?} in tx_id: {}",
+                        stmt, tx_id
+                    );
                     let snapshot = tm.create_snapshot(tx_id);
                     let result = executor::execute(&stmt, &bpm, &tm, &lm, &wal, tx_id, &snapshot);
 
@@ -172,7 +198,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                         parser::Statement::Begin => {
                             in_explicit_transaction = true;
                             send_command_complete(&mut stream, "BEGIN")?;
-                            last_result = None; 
+                            last_result = None;
                             continue; // Continue to next statement in the query string
                         }
                         parser::Statement::Commit => {
@@ -182,7 +208,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                             in_transaction = false;
                             in_explicit_transaction = false;
                             send_command_complete(&mut stream, "COMMIT")?;
-                            last_result = None; 
+                            last_result = None;
                             continue;
                         }
                         parser::Statement::Rollback => {
@@ -191,7 +217,7 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                             in_transaction = false;
                             in_explicit_transaction = false;
                             send_command_complete(&mut stream, "ROLLBACK")?;
-                            last_result = None; 
+                            last_result = None;
                             continue;
                         }
                         _ => {}
@@ -203,7 +229,10 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                             last_result = Some(res);
                         }
                         Err(errors::ExecutionError::SerializationFailure) => {
-                            println!("[handle_client] Serialization failure for tx_id: {}.", tx_id);
+                            println!(
+                                "[handle_client] Serialization failure for tx_id: {}.",
+                                tx_id
+                            );
                             send_error_response(&mut stream, "Serialization failure", "40001")?;
                             tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                             lm.unlock_all(tx_id);
@@ -214,7 +243,11 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                         }
                         Err(e) => {
                             println!("[handle_client] Execution failed: {:?}", e);
-                            send_error_response(&mut stream, &format!("Execution failed: {:?}", e), "XX000")?;
+                            send_error_response(
+                                &mut stream,
+                                &format!("Execution failed: {:?}", e),
+                                "XX000",
+                            )?;
                             if in_transaction {
                                 tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
                                 lm.unlock_all(tx_id);
@@ -230,9 +263,15 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                 if let Some(execute_result) = last_result {
                     match execute_result {
                         ExecuteResult::Ddl => send_command_complete(&mut stream, "DDL")?,
-                        ExecuteResult::Insert(count) => send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?,
-                        ExecuteResult::Delete(count) => send_command_complete(&mut stream, &format!("DELETE {}", count))?,
-                        ExecuteResult::Update(count) => send_command_complete(&mut stream, &format!("UPDATE {}", count))?,
+                        ExecuteResult::Insert(count) => {
+                            send_command_complete(&mut stream, &format!("INSERT 0 {}", count))?
+                        }
+                        ExecuteResult::Delete(count) => {
+                            send_command_complete(&mut stream, &format!("DELETE {}", count))?
+                        }
+                        ExecuteResult::Update(count) => {
+                            send_command_complete(&mut stream, &format!("UPDATE {}", count))?
+                        }
                         ExecuteResult::ResultSet(ResultSet { columns, rows }) => {
                             send_row_description(&mut stream, &columns)?;
                             let row_count = rows.len();
@@ -246,7 +285,10 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
 
                 // Commit the transaction if it's an implicit one (not a BEGIN block)
                 if in_transaction && !in_explicit_transaction {
-                    println!("[handle_client] Committing implicit transaction with tx_id: {}", tx_id);
+                    println!(
+                        "[handle_client] Committing implicit transaction with tx_id: {}",
+                        tx_id
+                    );
                     tm.commit(tx_id);
                     lm.unlock_all(tx_id);
                     in_transaction = false;
@@ -254,7 +296,8 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
 
                 send_ready_for_query(&mut stream)?;
             }
-            b'X' => { // Terminate
+            b'X' => {
+                // Terminate
                 println!("[handle_client] Terminate message received. Closing connection.");
                 if in_transaction {
                     tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
@@ -263,19 +306,28 @@ fn handle_client(mut stream: TcpStream, bpm: Arc<BufferPoolManager>, tm: Arc<Tra
                 return Ok(());
             }
             _ => {
-                println!("[handle_client] Received unknown message type: {}", msg_type[0]);
+                println!(
+                    "[handle_client] Received unknown message type: {}",
+                    msg_type[0]
+                );
             }
         }
     }
 }
 
 pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<()> {
-    println!("[run_server] Starting server with db_path: {} and wal_path: {}", db_path, wal_path);
+    println!(
+        "[run_server] Starting server with db_path: {} and wal_path: {}",
+        db_path, wal_path
+    );
     // --- Recovery Phase ---
     let mut pager_for_recovery = Pager::open(&db_path)?;
     let db_is_new = pager_for_recovery.num_pages == 0;
     let highest_tx_id = WalManager::recover(&wal_path, &mut pager_for_recovery)?;
-    println!("[RECOVERY] Completed. Highest TX ID found: {}", highest_tx_id);
+    println!(
+        "[RECOVERY] Completed. Highest TX ID found: {}",
+        highest_tx_id
+    );
 
     // --- Initialization after Recovery ---
     let pager = Pager::open(&db_path)?;
@@ -289,7 +341,8 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
         initialize_db(&bpm, &tm, &lm, &wal).expect("Failed to initialize database");
         // *** THE CRITICAL FIX ***
         println!("[INIT] Flushing all pages to disk after initialization.");
-        bpm.flush_all_pages().expect("Failed to flush pages after init");
+        bpm.flush_all_pages()
+            .expect("Failed to flush pages after init");
         println!("[INIT] Flushing completed.");
     }
 
@@ -304,7 +357,8 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
                 let lm_clone = Arc::clone(&lm);
                 let wal_clone = Arc::clone(&wal);
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, bpm_clone, tm_clone, lm_clone, wal_clone) {
+                    if let Err(e) = handle_client(stream, bpm_clone, tm_clone, lm_clone, wal_clone)
+                    {
                         println!("Error handling client: {}", e);
                     }
                 });
@@ -318,7 +372,12 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
 }
 
 /// Initializes the system catalogs for a new database.
-fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm: &Arc<LockManager>, wal: &Arc<Mutex<WalManager>>) -> Result<(), errors::ExecutionError> {
+fn initialize_db(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    lm: &Arc<LockManager>,
+    wal: &Arc<Mutex<WalManager>>,
+) -> Result<(), errors::ExecutionError> {
     println!("[initialize_db] Starting database initialization.");
     let tx_id = tm.begin();
     let snapshot = tm.create_snapshot(tx_id);
@@ -328,11 +387,25 @@ fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm:
     let create_pg_class = parser::CreateTableStatement {
         table_name: "pg_class".to_string(),
         columns: vec![
-            parser::ColumnDef { name: "oid".to_string(), data_type: parser::DataType::Int },
-            parser::ColumnDef { name: "relname".to_string(), data_type: parser::DataType::Text },
+            parser::ColumnDef {
+                name: "oid".to_string(),
+                data_type: parser::DataType::Int,
+            },
+            parser::ColumnDef {
+                name: "relname".to_string(),
+                data_type: parser::DataType::Text,
+            },
         ],
     };
-    executor::execute(&parser::Statement::CreateTable(create_pg_class), bpm, tm, lm, wal, tx_id, &snapshot)?;
+    executor::execute(
+        &parser::Statement::CreateTable(create_pg_class),
+        bpm,
+        tm,
+        lm,
+        wal,
+        tx_id,
+        &snapshot,
+    )?;
     println!("[initialize_db] pg_class table created.");
 
     // Create pg_attribute
@@ -340,12 +413,29 @@ fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm:
     let create_pg_attribute = parser::CreateTableStatement {
         table_name: "pg_attribute".to_string(),
         columns: vec![
-            parser::ColumnDef { name: "attrelid".to_string(), data_type: parser::DataType::Int },
-            parser::ColumnDef { name: "attname".to_string(), data_type: parser::DataType::Text },
-            parser::ColumnDef { name: "atttypid".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "attrelid".to_string(),
+                data_type: parser::DataType::Int,
+            },
+            parser::ColumnDef {
+                name: "attname".to_string(),
+                data_type: parser::DataType::Text,
+            },
+            parser::ColumnDef {
+                name: "atttypid".to_string(),
+                data_type: parser::DataType::Int,
+            },
         ],
     };
-    executor::execute(&parser::Statement::CreateTable(create_pg_attribute), bpm, tm, lm, wal, tx_id, &snapshot)?;
+    executor::execute(
+        &parser::Statement::CreateTable(create_pg_attribute),
+        bpm,
+        tm,
+        lm,
+        wal,
+        tx_id,
+        &snapshot,
+    )?;
     println!("[initialize_db] pg_attribute table created.");
 
     // Create pg_statistic
@@ -354,24 +444,53 @@ fn initialize_db(bpm: &Arc<BufferPoolManager>, tm: &Arc<TransactionManager>, lm:
         table_name: "pg_statistic".to_string(),
         columns: vec![
             // Table OID
-            parser::ColumnDef { name: "starelid".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "starelid".to_string(),
+                data_type: parser::DataType::Int,
+            },
             // Column number
-            parser::ColumnDef { name: "staattnum".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "staattnum".to_string(),
+                data_type: parser::DataType::Int,
+            },
             // Number of distinct values
-            parser::ColumnDef { name: "stadistinct".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "stadistinct".to_string(),
+                data_type: parser::DataType::Int,
+            },
             // Kind of statistics
-            parser::ColumnDef { name: "stakind".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "stakind".to_string(),
+                data_type: parser::DataType::Int,
+            },
             // Operator used
-            parser::ColumnDef { name: "staop".to_string(), data_type: parser::DataType::Int },
+            parser::ColumnDef {
+                name: "staop".to_string(),
+                data_type: parser::DataType::Int,
+            },
             // Histogram bounds
-            parser::ColumnDef { name: "stanumbers".to_string(), data_type: parser::DataType::Text },
+            parser::ColumnDef {
+                name: "stanumbers".to_string(),
+                data_type: parser::DataType::Text,
+            },
             // Most common values
-            parser::ColumnDef { name: "stavalues".to_string(), data_type: parser::DataType::Text },
+            parser::ColumnDef {
+                name: "stavalues".to_string(),
+                data_type: parser::DataType::Text,
+            },
         ],
     };
-    executor::execute(&parser::Statement::CreateTable(create_pg_statistic), bpm, tm, lm, wal, tx_id, &snapshot)?;
+    executor::execute(
+        &parser::Statement::CreateTable(create_pg_statistic),
+        bpm,
+        tm,
+        lm,
+        wal,
+        tx_id,
+        &snapshot,
+    )?;
     println!("[initialize_db] pg_statistic table created.");
-    
+
     tm.commit(tx_id);
     lm.unlock_all(tx_id);
     println!("[initialize_db] Initialization transaction committed.");

@@ -1,8 +1,8 @@
 //! B-Tree index implementation.
-use crate::{Page, PageId, TupleId};
 use crate::buffer_pool::BufferPoolManager;
 use crate::transaction::TransactionManager;
 use crate::wal::{WalManager, WalRecord};
+use crate::{Page, PageId, TupleId};
 use std::io;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,8 @@ const B_TREE_PAGE_HEADER_SIZE: usize = size_of::<BTreePageHeader>();
 const LEAF_CELL_SIZE: usize = size_of::<LeafCell>();
 const INTERNAL_CELL_SIZE: usize = size_of::<InternalCell>();
 const LEAF_MAX_CELLS: usize = (crate::PAGE_SIZE - B_TREE_PAGE_HEADER_SIZE) / LEAF_CELL_SIZE;
-const INTERNAL_MAX_CELLS: usize = (crate::PAGE_SIZE - B_TREE_PAGE_HEADER_SIZE - size_of::<PageId>()) / INTERNAL_CELL_SIZE;
+const INTERNAL_MAX_CELLS: usize =
+    (crate::PAGE_SIZE - B_TREE_PAGE_HEADER_SIZE - size_of::<PageId>()) / INTERNAL_CELL_SIZE;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u8)]
@@ -95,7 +96,11 @@ impl Page {
 }
 
 /// Searches for a key in the B-Tree.
-pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key) -> io::Result<Option<TupleId>> {
+pub fn btree_search(
+    bpm: &Arc<BufferPoolManager>,
+    root_page_id: PageId,
+    key: Key,
+) -> io::Result<Option<TupleId>> {
     let mut current_page_id = root_page_id;
     loop {
         let current_page_guard = bpm.acquire_page(current_page_id)?;
@@ -111,7 +116,9 @@ pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key
                     match cell_key.cmp(&key) {
                         std::cmp::Ordering::Less => low = mid + 1,
                         std::cmp::Ordering::Greater => high = mid,
-                        std::cmp::Ordering::Equal => return Ok(Some(current_page.leaf_cell(mid).tuple_id)),
+                        std::cmp::Ordering::Equal => {
+                            return Ok(Some(current_page.leaf_cell(mid).tuple_id))
+                        }
                     }
                 }
                 return Ok(None);
@@ -120,7 +127,7 @@ pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key
                 let num_cells = current_page.btree_header().num_cells as usize;
                 let mut low = 0;
                 let mut high = num_cells;
-                
+
                 while low < high {
                     let mid = low + (high - low) / 2;
                     let cell_key = current_page.internal_cell(mid).key;
@@ -130,7 +137,7 @@ pub fn btree_search(bpm: &Arc<BufferPoolManager>, root_page_id: PageId, key: Key
                         low = mid + 1;
                     }
                 }
-                
+
                 let next_page_id = if high > 0 {
                     current_page.internal_cell(high - 1).page_id
                 } else {
@@ -285,7 +292,10 @@ fn internal_insert(page: &mut Page, key: Key, new_page_id: PageId) {
         *page.internal_cell_mut(i + 1) = *page.internal_cell(i);
     }
 
-    *page.internal_cell_mut(insert_idx) = InternalCell { key, page_id: new_page_id };
+    *page.internal_cell_mut(insert_idx) = InternalCell {
+        key,
+        page_id: new_page_id,
+    };
     page.btree_header_mut().num_cells += 1;
 }
 
@@ -307,7 +317,7 @@ fn leaf_split_and_move(old_page: &mut Page, new_page: &mut Page) -> Key {
 
 fn leaf_insert(page: &mut Page, key: Key, tuple_id: TupleId) {
     let num_cells = page.btree_header().num_cells as usize;
-    
+
     let mut low = 0;
     let mut high = num_cells;
     while low < high {
@@ -342,7 +352,9 @@ pub fn btree_delete(
     // If the root node is an internal node with one child, the child becomes the new root.
     let root_page_guard = bpm.acquire_page(root_page_id)?;
     let root_page = root_page_guard.read();
-    if root_page.btree_header().page_type == BTreePageType::Internal && root_page.btree_header().num_cells == 0 {
+    if root_page.btree_header().page_type == BTreePageType::Internal
+        && root_page.btree_header().num_cells == 0
+    {
         let new_root_id = *root_page.right_child();
         // TODO: Deallocate the old root page
         root_page_id = new_root_id;
@@ -387,7 +399,7 @@ fn btree_delete_recursive(
             } else {
                 *page.right_child()
             };
-            
+
             btree_delete_recursive(bpm, tm, wm, tx_id, current_page_id, child_page_id, key)?;
 
             // Re-fetch child page to check for underflow
@@ -421,23 +433,29 @@ fn handle_underflow(
         let left_sibling_id = parent_page.internal_cell(child_idx_in_parent - 1).page_id;
         let left_sibling_guard = bpm.acquire_page(left_sibling_id)?;
         let mut left_sibling = left_sibling_guard.write();
-        
-        let min_cells = if left_sibling.btree_header().page_type == BTreePageType::Leaf { LEAF_MAX_CELLS / 2 } else { INTERNAL_MAX_CELLS / 2 };
+
+        let min_cells = if left_sibling.btree_header().page_type == BTreePageType::Leaf {
+            LEAF_MAX_CELLS / 2
+        } else {
+            INTERNAL_MAX_CELLS / 2
+        };
 
         if (left_sibling.btree_header().num_cells as usize) > min_cells {
             let child_guard = bpm.acquire_page(child_page_id)?;
             let mut child_page = child_guard.write();
-            
+
             let separator_key_idx = child_idx_in_parent - 1;
             let separator_key = parent_page.internal_cell(separator_key_idx).key;
-            
+
             if child_page.btree_header().page_type == BTreePageType::Leaf {
-                let borrowed_cell = *left_sibling.leaf_cell(left_sibling.btree_header().num_cells as usize - 1);
+                let borrowed_cell =
+                    *left_sibling.leaf_cell(left_sibling.btree_header().num_cells as usize - 1);
                 left_sibling.btree_header_mut().num_cells -= 1;
                 leaf_insert(&mut child_page, borrowed_cell.key, borrowed_cell.tuple_id);
                 parent_page.internal_cell_mut(separator_key_idx).key = borrowed_cell.key;
             } else {
-                let borrowed_cell = *left_sibling.internal_cell(left_sibling.btree_header().num_cells as usize - 1);
+                let borrowed_cell =
+                    *left_sibling.internal_cell(left_sibling.btree_header().num_cells as usize - 1);
                 let borrowed_right_child = *left_sibling.right_child();
                 left_sibling.btree_header_mut().num_cells -= 1;
                 *left_sibling.right_child_mut() = borrowed_cell.page_id;
@@ -445,7 +463,7 @@ fn handle_underflow(
                 internal_insert(&mut child_page, separator_key, borrowed_right_child);
                 parent_page.internal_cell_mut(separator_key_idx).key = borrowed_cell.key;
             }
-            
+
             log_btree_page(tm, wm, tx_id, &*left_sibling)?;
             log_btree_page(tm, wm, tx_id, &*child_page)?;
             log_btree_page(tm, wm, tx_id, parent_page)?;
@@ -459,12 +477,16 @@ fn handle_underflow(
         let right_sibling_guard = bpm.acquire_page(right_sibling_id)?;
         let mut right_sibling = right_sibling_guard.write();
 
-        let min_cells = if right_sibling.btree_header().page_type == BTreePageType::Leaf { LEAF_MAX_CELLS / 2 } else { INTERNAL_MAX_CELLS / 2 };
+        let min_cells = if right_sibling.btree_header().page_type == BTreePageType::Leaf {
+            LEAF_MAX_CELLS / 2
+        } else {
+            INTERNAL_MAX_CELLS / 2
+        };
 
         if (right_sibling.btree_header().num_cells as usize) > min_cells {
             let child_guard = bpm.acquire_page(child_page_id)?;
             let mut child_page = child_guard.write();
-            
+
             let separator_key_idx = child_idx_in_parent;
             let separator_key = parent_page.internal_cell(separator_key_idx).key;
 
@@ -472,11 +494,12 @@ fn handle_underflow(
                 let borrowed_cell = *right_sibling.leaf_cell(0);
                 leaf_delete(&mut right_sibling, borrowed_cell.key); // Simple delete, as it's the first element
                 leaf_insert(&mut child_page, borrowed_cell.key, borrowed_cell.tuple_id);
-                parent_page.internal_cell_mut(separator_key_idx).key = right_sibling.leaf_cell(0).key;
+                parent_page.internal_cell_mut(separator_key_idx).key =
+                    right_sibling.leaf_cell(0).key;
             } else {
                 let borrowed_cell = *right_sibling.internal_cell(0);
                 let borrowed_right_child = *right_sibling.right_child();
-                
+
                 // Shift cells left in right_sibling
                 for i in 0..right_sibling.btree_header().num_cells as usize - 1 {
                     *right_sibling.internal_cell_mut(i) = *right_sibling.internal_cell(i + 1);
@@ -499,11 +522,29 @@ fn handle_underflow(
     if child_idx_in_parent > 0 {
         // Merge with left sibling
         let left_sibling_id = parent_page.internal_cell(child_idx_in_parent - 1).page_id;
-        merge_pages(bpm, tm, wm, tx_id, parent_page, left_sibling_id, child_page_id, child_idx_in_parent - 1)?;
+        merge_pages(
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            parent_page,
+            left_sibling_id,
+            child_page_id,
+            child_idx_in_parent - 1,
+        )?;
     } else {
         // Merge with right sibling
         let right_sibling_id = parent_page.internal_cell(child_idx_in_parent).page_id;
-        merge_pages(bpm, tm, wm, tx_id, parent_page, child_page_id, right_sibling_id, child_idx_in_parent)?;
+        merge_pages(
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            parent_page,
+            child_page_id,
+            right_sibling_id,
+            child_idx_in_parent,
+        )?;
     }
 
     Ok(())
@@ -536,7 +577,10 @@ fn merge_pages(
     } else {
         // Merge internal pages
         let start_idx = left_page.btree_header().num_cells as usize;
-        *left_page.internal_cell_mut(start_idx) = InternalCell { key: separator_key, page_id: *right_page.right_child() };
+        *left_page.internal_cell_mut(start_idx) = InternalCell {
+            key: separator_key,
+            page_id: *right_page.right_child(),
+        };
         for i in 0..right_page.btree_header().num_cells as usize {
             *left_page.internal_cell_mut(start_idx + 1 + i) = *right_page.internal_cell(i);
         }

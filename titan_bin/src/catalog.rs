@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use crate::errors::ExecutionError;
+use crate::types::Column;
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::WalManager;
 use bedrock::PageId;
-use crate::errors::ExecutionError;
-use crate::types::Column;
+use std::sync::{Arc, Mutex};
 
 pub const PG_CLASS_TABLE_OID: PageId = 0;
 pub const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
@@ -83,8 +83,7 @@ pub fn get_table_schema(
                     let attnum = u16::from_be_bytes(tuple_data[4..6].try_into().unwrap());
                     let type_id = u32::from_be_bytes(tuple_data[6..10].try_into().unwrap());
                     let name_len = tuple_data[10] as usize;
-                    let name =
-                        String::from_utf8_lossy(&tuple_data[11..11 + name_len]).to_string();
+                    let name = String::from_utf8_lossy(&tuple_data[11..11 + name_len]).to_string();
                     schema_cols.push((attnum, Column { name, type_id }));
                 }
             }
@@ -131,9 +130,12 @@ pub fn update_pg_class_page_id(
     // Add the new entry with the correct page_id.
     if let Some(mut tuple_data) = old_tuple_data {
         tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
-        let new_item_id = pg_class_page.add_tuple(&tuple_data, tx_id, 0)
-            .ok_or_else(|| ExecutionError::GenericError("Failed to insert into pg_class".to_string()))?;
-        
+        let new_item_id = pg_class_page
+            .add_tuple(&tuple_data, tx_id, 0)
+            .ok_or_else(|| {
+                ExecutionError::GenericError("Failed to insert into pg_class".to_string())
+            })?;
+
         if let Some(old_id) = old_item_id {
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
             let lsn = wm.lock().unwrap().log(

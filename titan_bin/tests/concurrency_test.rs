@@ -61,10 +61,7 @@ fn test_concurrent_updates_conflict() {
         println!("[TX2] Пытаемся обновить баланс...");
         let result = client2.simple_query("UPDATE accounts SET balance = 120 WHERE id = 1");
 
-        assert!(
-            result.is_err(),
-            "Ожидалась ошибка конфликта сериализации"
-        );
+        assert!(result.is_err(), "Ожидалась ошибка конфликта сериализации");
         println!("[TX2] Ожидаемо получили ошибку при обновлении. Откат.");
     });
 
@@ -105,7 +102,9 @@ fn test_deadlock_detection() {
         println!("[TX1] Transaction started.");
 
         // TX1 locks resource 1
-        client1.simple_query("UPDATE deadlock_test SET id = 10 WHERE id = 1;").unwrap();
+        client1
+            .simple_query("UPDATE deadlock_test SET id = 10 WHERE id = 1;")
+            .unwrap();
         println!("[TX1] Locked resource 1.");
 
         // Give TX2 time to lock resource 2
@@ -114,7 +113,7 @@ fn test_deadlock_detection() {
         // TX1 tries to lock resource 2 (which TX2 holds)
         println!("[TX1] Attempting to lock resource 2...");
         let result = client1.simple_query("UPDATE deadlock_test SET id = 20 WHERE id = 2;");
-        
+
         // One of the transactions must fail. We check if this one failed.
         if result.is_err() {
             println!("[TX1] Failed as expected due to deadlock.");
@@ -130,14 +129,16 @@ fn test_deadlock_detection() {
     let handle2 = thread::spawn(move || {
         println!("[TX2] Thread started.");
         // Give TX1 time to lock resource 1
-        thread::sleep(Duration::from_millis(100)); 
+        thread::sleep(Duration::from_millis(100));
 
         let mut client2 = Client::connect(&addr_clone2, NoTls).unwrap();
         client2.simple_query("BEGIN;").unwrap();
         println!("[TX2] Transaction started.");
 
         // TX2 locks resource 2
-        client2.simple_query("UPDATE deadlock_test SET id = 20 WHERE id = 2;").unwrap();
+        client2
+            .simple_query("UPDATE deadlock_test SET id = 20 WHERE id = 2;")
+            .unwrap();
         println!("[TX2] Locked resource 2.");
 
         // Give TX1 time to wait for resource 2
@@ -164,8 +165,14 @@ fn test_deadlock_detection() {
     println!("[MAIN] Both threads finished.");
     // Assert that at least one of the transactions failed.
     // It's non-deterministic which one will be chosen as the victim.
-    assert!(res1.is_err() || res2.is_err(), "One of the transactions should have failed due to deadlock");
-    assert!(!(res1.is_ok() && res2.is_ok()), "Both transactions cannot succeed");
+    assert!(
+        res1.is_err() || res2.is_err(),
+        "One of the transactions should have failed due to deadlock"
+    );
+    assert!(
+        !(res1.is_ok() && res2.is_ok()),
+        "Both transactions cannot succeed"
+    );
 
     println!("[MAIN] Verifying final state.");
     // Check the final state of the table. It should either be the state from TX1 or TX2 committing.
@@ -178,5 +185,8 @@ fn test_deadlock_detection() {
     let nothing_committed = final_state == vec!["1", "2"];
 
     println!("[MAIN] Final state: {:?}", final_state);
-    assert!(tx1_committed || tx2_committed || nothing_committed, "Final state is not one of the expected outcomes.");
+    assert!(
+        tx1_committed || tx2_committed || nothing_committed,
+        "Final state is not one of the expected outcomes."
+    );
 }

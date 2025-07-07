@@ -1,5 +1,5 @@
 //! The layout of a page on disk.
-use crate::{PageId, PAGE_SIZE, transaction::Snapshot};
+use crate::{transaction::Snapshot, PageId, PAGE_SIZE};
 
 pub type TransactionId = u32;
 pub type CommandId = u32;
@@ -91,14 +91,24 @@ impl Page {
 
     /// Adds a new tuple to the page.
     /// Returns the item id of the new tuple, or None if there is not enough space.
-    pub fn add_tuple(&mut self, tuple: &[u8], xmin: TransactionId, xmax: TransactionId) -> Option<u16> {
+    pub fn add_tuple(
+        &mut self,
+        tuple: &[u8],
+        xmin: TransactionId,
+        xmax: TransactionId,
+    ) -> Option<u16> {
         let tuple_header_len = std::mem::size_of::<HeapTupleHeaderData>();
         let tuple_len = tuple.len() + tuple_header_len;
         let item_id_len = std::mem::size_of::<ItemIdData>();
         let needed_space = tuple_len + item_id_len;
 
         let header = self.header();
-        println!("[Page::add_tuple] PageId: {}, Needed space: {}, Free space: {}", self.id, needed_space, header.upper_offset.saturating_sub(header.lower_offset));
+        println!(
+            "[Page::add_tuple] PageId: {}, Needed space: {}, Free space: {}",
+            self.id,
+            needed_space,
+            header.upper_offset.saturating_sub(header.lower_offset)
+        );
         if header.upper_offset.saturating_sub(header.lower_offset) < needed_space as u16 {
             println!("[Page::add_tuple] Not enough space on page {}", self.id);
             return None;
@@ -107,7 +117,8 @@ impl Page {
         let item_id_offset = header.lower_offset;
         let tuple_offset = header.upper_offset - tuple_len as u16;
 
-        let item_id_index = (item_id_offset - std::mem::size_of::<PageHeaderData>() as u16) / item_id_len as u16;
+        let item_id_index =
+            (item_id_offset - std::mem::size_of::<PageHeaderData>() as u16) / item_id_len as u16;
 
         let item_id = self.item_id_mut(item_id_offset);
         item_id.offset = tuple_offset;
@@ -126,8 +137,11 @@ impl Page {
         let header = self.header_mut();
         header.lower_offset += item_id_len as u16;
         header.upper_offset = tuple_offset;
-        
-        println!("[Page::add_tuple] Added tuple to page {}, item_id_index: {}, xmin: {}, xmax: {}", self.id, item_id_index, xmin, xmax);
+
+        println!(
+            "[Page::add_tuple] Added tuple to page {}, item_id_index: {}, xmin: {}, xmax: {}",
+            self.id, item_id_index, xmin, xmax
+        );
 
         Some(item_id_index)
     }
@@ -177,7 +191,9 @@ impl Page {
         }
         let item_id_data = *self.item_id(item_id_offset);
 
-        if item_id_data.offset < self.header().lower_offset || item_id_data.offset + item_id_data.length > PAGE_SIZE as u16 {
+        if item_id_data.offset < self.header().lower_offset
+            || item_id_data.offset + item_id_data.length > PAGE_SIZE as u16
+        {
             return None;
         }
         if item_id_data.length == 0 {
@@ -187,7 +203,12 @@ impl Page {
     }
 
     /// Returns true if the tuple is visible to the given snapshot.
-    pub fn is_visible(&self, snapshot: &Snapshot, current_tx_id: TransactionId, item_id: u16) -> bool {
+    pub fn is_visible(
+        &self,
+        snapshot: &Snapshot,
+        current_tx_id: TransactionId,
+        item_id: u16,
+    ) -> bool {
         let header = self.tuple_header(self.get_item_id_data(item_id).unwrap().offset);
 
         if header.xmin == current_tx_id {
@@ -232,24 +253,18 @@ impl Page {
     }
 
     fn tuple_header_mut(&mut self, offset: u16) -> &mut HeapTupleHeaderData {
-        unsafe { &mut *(self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData) }
+        unsafe {
+            &mut *(self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData)
+        }
     }
 
     pub fn tuple(&self, offset: u16, len: usize) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.data.as_ptr().offset(offset as isize),
-                len,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr().offset(offset as isize), len) }
     }
 
     fn tuple_mut(&mut self, offset: u16, len: usize) -> &mut [u8] {
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.data.as_mut_ptr().offset(offset as isize),
-                len,
-            )
+            std::slice::from_raw_parts_mut(self.data.as_mut_ptr().offset(offset as isize), len)
         }
     }
 }

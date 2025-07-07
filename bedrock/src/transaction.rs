@@ -46,7 +46,10 @@ pub struct TransactionManager {
 
 impl TransactionManager {
     pub fn new(initial_tx_id: TransactionId) -> Self {
-        println!("[TM::new] Initializing with next_transaction_id = {}", initial_tx_id);
+        println!(
+            "[TM::new] Initializing with next_transaction_id = {}",
+            initial_tx_id
+        );
         let state = TransactionManagerState {
             next_transaction_id: AtomicU32::new(initial_tx_id),
             active_transactions: Mutex::new(HashSet::new()),
@@ -67,18 +70,33 @@ impl TransactionManager {
 
     /// Begins a new transaction and returns its ID.
     pub fn begin(&self) -> TransactionId {
-        let tx_id = self.state.next_transaction_id.fetch_add(1, Ordering::SeqCst);
+        let tx_id = self
+            .state
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
         self.state.active_transactions.lock().unwrap().insert(tx_id);
         self.state.last_lsns.lock().unwrap().insert(tx_id, 0); // Initialize LSN to 0
-        println!("[TM::begin] Started tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
+        println!(
+            "[TM::begin] Started tx_id: {}. Active transactions: {:?}",
+            tx_id,
+            self.state.active_transactions.lock().unwrap()
+        );
         tx_id
     }
 
     /// Commits a transaction.
     pub fn commit(&self, tx_id: TransactionId) {
-        self.state.active_transactions.lock().unwrap().remove(&tx_id);
+        self.state
+            .active_transactions
+            .lock()
+            .unwrap()
+            .remove(&tx_id);
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
-        println!("[TM::commit] Committed tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
+        println!(
+            "[TM::commit] Committed tx_id: {}. Active transactions: {:?}",
+            tx_id,
+            self.state.active_transactions.lock().unwrap()
+        );
     }
 
     pub fn get_last_lsn(&self, tx_id: TransactionId) -> Option<Lsn> {
@@ -90,7 +108,12 @@ impl TransactionManager {
     }
 
     /// Aborts a transaction, rolling back its changes using ARIES-style UNDO.
-    pub fn abort(&self, tx_id: TransactionId, wal: &mut WalManager, bpm: &Arc<BufferPoolManager>) -> std::io::Result<()> {
+    pub fn abort(
+        &self,
+        tx_id: TransactionId,
+        wal: &mut WalManager,
+        bpm: &Arc<BufferPoolManager>,
+    ) -> std::io::Result<()> {
         println!("[TM::abort] Aborting tx_id: {}", tx_id);
 
         let mut current_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
@@ -122,23 +145,27 @@ impl TransactionManager {
                 item_id: 0, // Placeholder
                 undo_next_lsn: prev_lsn,
             };
-            
+
             let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
             let clr_lsn = wal.log(tx_id, last_lsn, &clr)?;
             self.set_last_lsn(tx_id, clr_lsn);
 
             // Now, perform the physical UNDO operation.
             match rec {
-                WalRecord::InsertTuple { page_id, item_id, .. } => {
+                WalRecord::InsertTuple {
+                    page_id, item_id, ..
+                } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
                     if let Some(header) = page.get_tuple_header_mut(item_id) {
                         // Physically mark the tuple as deleted by this abort.
-                        header.xmax = tx_id; 
+                        header.xmax = tx_id;
                     }
                     page.header_mut().lsn = clr_lsn;
                 }
-                WalRecord::DeleteTuple { page_id, item_id, .. } => {
+                WalRecord::DeleteTuple {
+                    page_id, item_id, ..
+                } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
                     if let Some(header) = page.get_tuple_header_mut(item_id) {
@@ -149,7 +176,12 @@ impl TransactionManager {
                     }
                     page.header_mut().lsn = clr_lsn;
                 }
-                WalRecord::UpdateTuple { page_id, item_id, old_data, .. } => {
+                WalRecord::UpdateTuple {
+                    page_id,
+                    item_id,
+                    old_data,
+                    ..
+                } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
                     if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
@@ -165,7 +197,7 @@ impl TransactionManager {
                 }
                 _ => {}
             }
-            
+
             // Move to the previous record in this transaction's chain.
             current_lsn = prev_lsn;
         }
@@ -174,20 +206,32 @@ impl TransactionManager {
         let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
         wal.log(tx_id, last_lsn, &WalRecord::Abort { tx_id })?;
 
-        self.state.active_transactions.lock().unwrap().remove(&tx_id);
+        self.state
+            .active_transactions
+            .lock()
+            .unwrap()
+            .remove(&tx_id);
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
 
-        println!("[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}", tx_id, self.state.active_transactions.lock().unwrap());
+        println!(
+            "[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}",
+            tx_id,
+            self.state.active_transactions.lock().unwrap()
+        );
         Ok(())
     }
 
     /// Creates a new snapshot of the current database state.
     pub fn create_snapshot(&self, _current_tx_id: TransactionId) -> Snapshot {
         let active_txns = self.state.active_transactions.lock().unwrap();
-        
+
         // xmin is the lowest transaction ID that is currently active.
         // Any transaction with an ID less than xmin is guaranteed to be either committed or aborted.
-        let xmin = active_txns.iter().min().cloned().unwrap_or_else(|| self.state.next_transaction_id.load(Ordering::SeqCst));
+        let xmin = active_txns
+            .iter()
+            .min()
+            .cloned()
+            .unwrap_or_else(|| self.state.next_transaction_id.load(Ordering::SeqCst));
 
         // xmax is the next transaction ID to be allocated. Any transaction with this ID or
         // higher has not yet started and is therefore not visible.
@@ -198,7 +242,10 @@ impl TransactionManager {
             xmax,
             active_transactions: Arc::new(active_txns.clone()),
         };
-        println!("[TM::create_snapshot] Created for tx {}: {:?}", _current_tx_id, snapshot);
+        println!(
+            "[TM::create_snapshot] Created for tx {}: {:?}",
+            _current_tx_id, snapshot
+        );
         snapshot
     }
 }
@@ -258,7 +305,3 @@ mod tests {
         assert!(snapshot.is_visible(19));
     }
 }
-
-
-
-

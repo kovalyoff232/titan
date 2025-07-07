@@ -95,8 +95,10 @@ impl LockManager {
         let mut guard = wait_queue.queue.lock().unwrap();
 
         // If we already hold the lock in a compatible or stronger mode, we are good.
-        if (mode == LockMode::Shared && (guard.sharing.contains(&tx_id) || guard.exclusive == Some(tx_id)))
-            || (mode == LockMode::Exclusive && guard.exclusive == Some(tx_id)) {
+        if (mode == LockMode::Shared
+            && (guard.sharing.contains(&tx_id) || guard.exclusive == Some(tx_id)))
+            || (mode == LockMode::Exclusive && guard.exclusive == Some(tx_id))
+        {
             return Ok(());
         }
 
@@ -117,12 +119,16 @@ impl LockManager {
                 guard.queue.retain(|req| req.tx_id != tx_id);
                 return Err(e);
             }
-            
+
             guard = wait_queue.cvar.wait(guard).unwrap();
         }
     }
 
-    fn update_waits_for_graph(&self, queue: &LockQueue, waiting_tx_id: TransactionId) -> Result<(), LockError> {
+    fn update_waits_for_graph(
+        &self,
+        queue: &LockQueue,
+        waiting_tx_id: TransactionId,
+    ) -> Result<(), LockError> {
         let mut waits_for_map = self.waits_for.lock().unwrap();
         waits_for_map.remove(&waiting_tx_id); // Clear old dependencies for this tx
 
@@ -134,7 +140,7 @@ impl LockManager {
                 waits_for_map.insert(waiting_tx_id, holders);
             }
         }
-        
+
         // Check for cycles
         let mut visited = HashSet::new();
         let mut recursion_stack = HashSet::new();

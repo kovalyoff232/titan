@@ -17,7 +17,7 @@ fn test_optimizer_chooses_hash_join_for_equi_join() {
     // This query should use HashJoin because of the equality condition.
     // We don't have a way to EXPLAIN the plan yet, so we just check for correctness.
     let result = client.simple_query("SELECT t1.data FROM t1 JOIN t2 ON t1.id = t2.t1_id;");
-    
+
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], "a");
 }
@@ -39,7 +39,7 @@ fn test_optimizer_chooses_nested_loop_join_for_non_equi_join() {
 
     // This query should use NestedLoopJoin.
     let result = client.simple_query("SELECT t3.id, t4.id FROM t3 JOIN t4 ON t3.val < t4.val;");
-    
+
     let mut sorted_result: Vec<String> = result.into_iter().map(|row| row.join(", ")).collect();
     sorted_result.sort();
 
@@ -70,8 +70,9 @@ fn test_optimizer_chooses_merge_join() {
     client.simple_query("ANALYZE t7;");
     client.simple_query("COMMIT;");
 
-    let result = client.simple_query("SELECT t6.data, t7.id FROM t6 JOIN t7 ON t6.id = t7.t6_id ORDER BY id;");
-    
+    let result = client
+        .simple_query("SELECT t6.data, t7.id FROM t6 JOIN t7 ON t6.id = t7.t6_id ORDER BY id;");
+
     assert_eq!(result.len(), 10);
     assert_eq!(result[0][0], "text0");
     assert_eq!(result[0][1], "100");
@@ -97,7 +98,7 @@ fn test_optimizer_chooses_index_scan() {
     client.simple_query("COMMIT;");
 
     let result = client.simple_query("SELECT data FROM t5 WHERE id = 500;");
-    
+
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], "text500");
 }

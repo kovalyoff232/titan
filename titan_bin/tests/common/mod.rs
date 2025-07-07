@@ -88,4 +88,3 @@ pub fn setup_server_and_client(test_name: &str) -> TestClient {
         _dir: dir,
     }
 }
-

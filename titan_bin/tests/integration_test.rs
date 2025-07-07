@@ -65,7 +65,7 @@ fn test_join_tables() {
     client.simple_query("COMMIT;");
 
     let mut result = client.simple_query("SELECT users.user_name, orders.item FROM users JOIN orders ON users.user_id = orders.user_id;");
-    
+
     assert_eq!(result.len(), 4, "JOIN should produce 4 rows");
 
     result.sort();
@@ -130,7 +130,8 @@ fn test_date_type() {
     assert_eq!(all_rows[2], vec!["3", "2024-01-15"]);
 
     // Test filtering by date
-    let filtered_rows = client.simple_query("SELECT id FROM events WHERE event_date = DATE '2024-01-15';");
+    let filtered_rows =
+        client.simple_query("SELECT id FROM events WHERE event_date = DATE '2024-01-15';");
     assert_eq!(filtered_rows.len(), 2);
     assert!(filtered_rows.contains(&vec!["1".to_string()]));
     assert!(filtered_rows.contains(&vec!["3".to_string()]));

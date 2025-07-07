@@ -2,12 +2,12 @@
 //!
 //! This module is responsible for converting the AST from the parser into a logical plan.
 
-use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use crate::catalog;
-use std::sync::Arc;
+use crate::executor;
+use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
-use crate::executor;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -42,9 +42,20 @@ pub fn create_logical_plan(
     // For now, we only support a single table or a single JOIN clause.
     let from_plan = match &stmt.from[0] {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot).unwrap().unwrap();
+            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot)
+                .unwrap()
+                .unwrap();
             let schema = catalog::get_table_schema(bpm, table_oid, tx_id, snapshot).unwrap();
-            let all_rows = executor::scan_table(bpm, &Arc::new(Default::default()), first_page_id, &schema, tx_id, snapshot, false).unwrap();
+            let all_rows = executor::scan_table(
+                bpm,
+                &Arc::new(Default::default()),
+                first_page_id,
+                &schema,
+                tx_id,
+                snapshot,
+                false,
+            )
+            .unwrap();
             LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
@@ -92,9 +103,20 @@ fn build_plan_from_table_ref(
 ) -> Result<LogicalPlan, ()> {
     match table_ref {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot).unwrap().unwrap();
+            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot)
+                .unwrap()
+                .unwrap();
             let schema = catalog::get_table_schema(bpm, table_oid, tx_id, snapshot).unwrap();
-            let all_rows = executor::scan_table(bpm, &Arc::new(Default::default()), first_page_id, &schema, tx_id, snapshot, false).unwrap();
+            let all_rows = executor::scan_table(
+                bpm,
+                &Arc::new(Default::default()),
+                first_page_id,
+                &schema,
+                tx_id,
+                snapshot,
+                false,
+            )
+            .unwrap();
             Ok(LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
