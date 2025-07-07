@@ -2,7 +2,7 @@
 
 name: Rust CI
 
-# Запускать воркфлоу при пуше в ветку main или при создании пул-реквеста на main
+
 on:
   push:
     branches: [ "main" ]
@@ -14,18 +14,18 @@ env:
 
 jobs:
   build_and_test:
-    # Запускать на последней версии Ubuntu
-    runs-on: ubuntu-latest
+
+    runs-on: windows-latest
 
     steps:
-    # 1. Клонируем репозиторий на раннер
+
     - uses: actions/checkout@v4
 
-    # 2. Устанавливаем стабильную версию Rust
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
-    # 3. Кэшируем зависимости, чтобы ускорить последующие сборки
+
     - name: Cache dependencies
       uses: actions/cache@v4
       with:
@@ -37,10 +37,9 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    # 4. Собираем проект (чтобы убедиться, что все компилируется)
+
     - name: Build
       run: cargo build --verbose
 
-    # 5. Запускаем тесты (cargo test автоматически найдет и запустит тесты из папки tests)
     - name: Run tests
       run: cargo test --verbose
