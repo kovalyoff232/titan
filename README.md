@@ -43,7 +43,7 @@ Clone the repository and build the project using Cargo:
 
 ```sh
 git clone <repository-url>
-cd titandb
+cd titan
 cargo build --release
 ```
 
