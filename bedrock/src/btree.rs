@@ -266,11 +266,9 @@ fn internal_split_and_move(old_page: &mut Page, new_page: &mut Page) -> Key {
     let mid_point = INTERNAL_MAX_CELLS / 2;
     let promoted_key = old_page.internal_cell(mid_point).key;
 
-    let mut new_cell_idx = 0;
     // Move cells after midpoint to the new page
-    for i in (mid_point + 1)..=INTERNAL_MAX_CELLS {
+    for (new_cell_idx, i) in ((mid_point + 1)..=INTERNAL_MAX_CELLS).enumerate() {
         *new_page.internal_cell_mut(new_cell_idx) = *old_page.internal_cell(i);
-        new_cell_idx += 1;
     }
     *new_page.right_child_mut() = *old_page.right_child();
     *old_page.right_child_mut() = old_page.internal_cell(mid_point).page_id;
@@ -302,11 +300,9 @@ fn internal_insert(page: &mut Page, key: Key, new_page_id: PageId) {
 fn leaf_split_and_move(old_page: &mut Page, new_page: &mut Page) -> Key {
     new_page.as_btree_leaf_page();
     let mid_point = LEAF_MAX_CELLS / 2;
-    let mut new_cell_idx = 0;
 
-    for i in mid_point..=LEAF_MAX_CELLS {
+    for (new_cell_idx, i) in (mid_point..=LEAF_MAX_CELLS).enumerate() {
         *new_page.leaf_cell_mut(new_cell_idx) = *old_page.leaf_cell(i);
-        new_cell_idx += 1;
     }
 
     old_page.btree_header_mut().num_cells = mid_point as u16;
@@ -464,8 +460,8 @@ fn handle_underflow(
                 parent_page.internal_cell_mut(separator_key_idx).key = borrowed_cell.key;
             }
 
-            log_btree_page(tm, wm, tx_id, &*left_sibling)?;
-            log_btree_page(tm, wm, tx_id, &*child_page)?;
+            log_btree_page(tm, wm, tx_id, &left_sibling)?;
+            log_btree_page(tm, wm, tx_id, &child_page)?;
             log_btree_page(tm, wm, tx_id, parent_page)?;
             return Ok(());
         }
@@ -511,8 +507,8 @@ fn handle_underflow(
                 parent_page.internal_cell_mut(separator_key_idx).key = borrowed_cell.key;
             }
 
-            log_btree_page(tm, wm, tx_id, &*right_sibling)?;
-            log_btree_page(tm, wm, tx_id, &*child_page)?;
+            log_btree_page(tm, wm, tx_id, &right_sibling)?;
+            log_btree_page(tm, wm, tx_id, &child_page)?;
             log_btree_page(tm, wm, tx_id, parent_page)?;
             return Ok(());
         }
@@ -522,50 +518,52 @@ fn handle_underflow(
     if child_idx_in_parent > 0 {
         // Merge with left sibling
         let left_sibling_id = parent_page.internal_cell(child_idx_in_parent - 1).page_id;
-        merge_pages(
+        let mut ctx = MergeContext {
             bpm,
             tm,
             wm,
             tx_id,
             parent_page,
-            left_sibling_id,
-            child_page_id,
-            child_idx_in_parent - 1,
-        )?;
+            separator_idx: child_idx_in_parent - 1,
+        };
+        merge_pages(&mut ctx, left_sibling_id, child_page_id)?;
     } else {
         // Merge with right sibling
         let right_sibling_id = parent_page.internal_cell(child_idx_in_parent).page_id;
-        merge_pages(
+        let mut ctx = MergeContext {
             bpm,
             tm,
             wm,
             tx_id,
             parent_page,
-            child_page_id,
-            right_sibling_id,
-            child_idx_in_parent,
-        )?;
+            separator_idx: child_idx_in_parent,
+        };
+        merge_pages(&mut ctx, child_page_id, right_sibling_id)?;
     }
 
     Ok(())
 }
 
-fn merge_pages(
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    wm: &Arc<Mutex<WalManager>>,
+struct MergeContext<'a> {
+    bpm: &'a Arc<BufferPoolManager>,
+    tm: &'a Arc<TransactionManager>,
+    wm: &'a Arc<Mutex<WalManager>>,
     tx_id: u32,
-    parent_page: &mut Page,
+    parent_page: &'a mut Page,
+    separator_idx: usize,
+}
+
+fn merge_pages(
+    ctx: &mut MergeContext,
     left_page_id: PageId,
     right_page_id: PageId,
-    separator_idx: usize,
 ) -> io::Result<()> {
-    let left_guard = bpm.acquire_page(left_page_id)?;
+    let left_guard = ctx.bpm.acquire_page(left_page_id)?;
     let mut left_page = left_guard.write();
-    let right_guard = bpm.acquire_page(right_page_id)?;
+    let right_guard = ctx.bpm.acquire_page(right_page_id)?;
     let right_page = right_guard.read();
 
-    let separator_key = parent_page.internal_cell(separator_idx).key;
+    let separator_key = ctx.parent_page.internal_cell(ctx.separator_idx).key;
 
     if left_page.btree_header().page_type == BTreePageType::Leaf {
         // Merge leaf pages
@@ -588,13 +586,13 @@ fn merge_pages(
     }
 
     // Remove separator from parent and shift remaining keys
-    for i in separator_idx..parent_page.btree_header().num_cells as usize - 1 {
-        *parent_page.internal_cell_mut(i) = *parent_page.internal_cell(i + 1);
+    for i in ctx.separator_idx..ctx.parent_page.btree_header().num_cells as usize - 1 {
+        *ctx.parent_page.internal_cell_mut(i) = *ctx.parent_page.internal_cell(i + 1);
     }
-    parent_page.btree_header_mut().num_cells -= 1;
+    ctx.parent_page.btree_header_mut().num_cells -= 1;
 
-    log_btree_page(tm, wm, tx_id, &*left_page)?;
-    log_btree_page(tm, wm, tx_id, parent_page)?;
+    log_btree_page(ctx.tm, ctx.wm, ctx.tx_id, &left_page)?;
+    log_btree_page(ctx.tm, ctx.wm, ctx.tx_id, ctx.parent_page)?;
     // TODO: Deallocate the right page
     Ok(())
 }

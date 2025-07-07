@@ -98,7 +98,6 @@ impl WalManager {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
             .create(true)
             .append(true)
             .open(path)?;
@@ -335,6 +334,7 @@ impl WalManager {
         let mut wal_file = OpenOptions::new()
             .read(true)
             .create(true)
+            .truncate(true)
             .write(true)
             .open(wal_path)?;
         let mut buf = Vec::new();
@@ -409,20 +409,18 @@ impl WalManager {
             let record_end = record_start + record_len;
             let record_buf = &buf[record_start..record_end];
 
-            if let Some(record) = Self::deserialize_record(record_buf) {
-                match record {
-                    WalRecord::BTreePage { page_id, data, .. } => {
-                        let mut page = pager.read_page(page_id)?;
-                        if page.header().lsn < current_pos as u64 {
-                            page.data.copy_from_slice(&data);
-                            page.header_mut().lsn = current_pos as u64;
-                            pager.write_page(&page)?;
-                        }
-                    }
-                    // For other record types, a more detailed redo logic would be needed.
-                    // For now, we assume BTreePage is the most critical for structural integrity.
-                    _ => {}
+            if let Some(WalRecord::BTreePage { page_id, data, .. }) =
+                Self::deserialize_record(record_buf)
+            {
+                let mut page = pager.read_page(page_id)?;
+                if page.header().lsn < current_pos as u64 {
+                    page.data.copy_from_slice(&data);
+                    page.header_mut().lsn = current_pos as u64;
+                    pager.write_page(&page)?;
                 }
+            } else {
+                // For other record types, a more detailed redo logic would be needed.
+                // For now, we assume BTreePage is the most critical for structural integrity.
             }
             current_pos += header.total_len as usize;
         }
@@ -455,24 +453,21 @@ impl WalManager {
                 let record_end = record_start + record_len;
                 let record_buf = &buf[record_start..record_end];
 
-                if let Some(record) = Self::deserialize_record(record_buf) {
+                if let Some(WalRecord::UpdateTuple { page_id, .. }) =
+                    Self::deserialize_record(record_buf)
+                {
                     // Here we would generate a CompensationLogRecord (CLR) and write it to the WAL.
                     // Then we would apply the actual UNDO operation.
                     // This is a simplified version.
-                    match record {
-                        WalRecord::UpdateTuple { page_id, .. } => {
-                            let page = pager.read_page(page_id)?;
-                            // We only undo if the change was actually applied.
-                            if page.header().lsn >= current_pos as u64 {
-                                // In a real system, we'd get the tuple and restore it.
-                                // This is a placeholder for that logic.
-                                println!(
-                                    "[RECOVERY-UNDO] Undoing update for tx {} on page {}",
-                                    header.tx_id, page_id
-                                );
-                            }
-                        }
-                        _ => {}
+                    let page = pager.read_page(page_id)?;
+                    // We only undo if the change was actually applied.
+                    if page.header().lsn >= current_pos as u64 {
+                        // In a real system, we'd get the tuple and restore it.
+                        // This is a placeholder for that logic.
+                        println!(
+                            "[RECOVERY-UNDO] Undoing update for tx {} on page {}",
+                            header.tx_id, page_id
+                        );
                     }
                 }
             }

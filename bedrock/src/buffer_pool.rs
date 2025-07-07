@@ -88,7 +88,7 @@ impl BufferPoolManager {
         // 2. If not, find a free frame or evict one.
         let frame_index = self
             .find_victim_frame()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
+            .ok_or_else(|| io::Error::other("all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
         // 3. Evict the old page if the frame is dirty.
@@ -121,7 +121,7 @@ impl BufferPoolManager {
         // 1. Find a free frame or evict one.
         let frame_index = self
             .find_victim_frame()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "all pages are pinned"))?;
+            .ok_or_else(|| io::Error::other("all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
         // 2. Evict the old page if the frame is dirty.

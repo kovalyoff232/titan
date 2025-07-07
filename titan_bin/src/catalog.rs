@@ -1,7 +1,7 @@
 use crate::errors::ExecutionError;
 use crate::types::Column;
 use bedrock::buffer_pool::BufferPoolManager;
-use bedrock::page::INVALID_PAGE_ID;
+
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::WalManager;
 use bedrock::PageId;

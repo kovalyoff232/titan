@@ -155,6 +155,7 @@ impl LockManager {
         Ok(())
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn has_cycle_util(
         &self,
         tx_id: TransactionId,
@@ -252,7 +253,7 @@ impl LockManager {
             queue.queue.retain(|req| req.tx_id != tx_id);
 
             if changed {
-                to_notify.push(resource.clone());
+                to_notify.push(*resource);
             }
         }
 

@@ -1,4 +1,4 @@
-use crate::errors::ExecutionError;
+
 use crate::types::{Column, ExecuteResult, ResultSet};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::lock_manager::LockManager;
@@ -42,7 +42,7 @@ fn send_error_response(stream: &mut TcpStream, message: &str, code: &str) -> io:
 }
 
 fn send_ready_for_query(stream: &mut TcpStream) -> io::Result<()> {
-    write_message(stream, b'Z', &[b'I']) // 'I' for Idle
+    write_message(stream, b'Z', b"I") // 'I' for Idle
 }
 
 fn send_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
@@ -115,7 +115,7 @@ fn handle_client(
     if request_code == 80877103 {
         // SSLRequest
         println!("[handle_client] SSLRequest received, denying.");
-        stream.write_all(&[b'N'])?;
+        stream.write_all(b"N")?;
         let n = stream.read(&mut startup_buf)?;
         if n == 0 {
             return Ok(());
@@ -276,7 +276,7 @@ fn handle_client(
                             send_row_description(&mut stream, &columns)?;
                             let row_count = rows.len();
                             for row in &rows {
-                                send_data_row(&mut stream, &columns, &row)?;
+                                send_data_row(&mut stream, &columns, row)?;
                             }
                             send_command_complete(&mut stream, &format!("SELECT {}", row_count))?;
                         }
@@ -321,20 +321,20 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
         db_path, wal_path
     );
     // --- Recovery Phase ---
-    let mut pager_for_recovery = Pager::open(&db_path)?;
+    let mut pager_for_recovery = Pager::open(db_path)?;
     let db_is_new = pager_for_recovery.num_pages == 0;
-    let highest_tx_id = WalManager::recover(&wal_path, &mut pager_for_recovery)?;
+    let highest_tx_id = WalManager::recover(wal_path, &mut pager_for_recovery)?;
     println!(
         "[RECOVERY] Completed. Highest TX ID found: {}",
         highest_tx_id
     );
 
     // --- Initialization after Recovery ---
-    let pager = Pager::open(&db_path)?;
+    let pager = Pager::open(db_path)?;
     let bpm = Arc::new(BufferPoolManager::new(pager));
     let tm = Arc::new(TransactionManager::new(highest_tx_id + 1));
     let lm = Arc::new(LockManager::new());
-    let wal = Arc::new(Mutex::new(WalManager::open(&wal_path)?));
+    let wal = Arc::new(Mutex::new(WalManager::open(wal_path)?));
 
     if db_is_new {
         println!("[INIT] New database detected, initializing system tables.");

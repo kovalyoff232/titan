@@ -22,6 +22,7 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path_ref)?;
 
         let file_size = file.metadata()?.len();
