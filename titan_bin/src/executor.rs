@@ -23,7 +23,7 @@ use chrono::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-const PG_STATISTIC_TABLE_OID: PageId = 2;
+
 
 // --- Helper Functions ---
 
@@ -234,10 +234,10 @@ fn execute_physical_plan(
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
             let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
 
-            let index_name = format!("idx_id"); // Simplified
+            let index_name = "idx_id".to_string(); // Simplified
             let (_index_oid, index_root_page_id) =
                 find_table(&index_name, bpm, tx_id, snapshot)?
-                    .ok_or_else(|| ExecutionError::TableNotFound(index_name))?;
+                    .ok_or(ExecutionError::TableNotFound(index_name))?;
 
             let mut rows = Vec::new();
             if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, *key)? {
@@ -265,7 +265,7 @@ fn execute_physical_plan(
             let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
             let mut filtered_rows = Vec::new();
             for row_vec in &input_result.rows {
-                let row_map = row_vec_to_map(&row_vec, &input_result.columns, None);
+                let row_map = row_vec_to_map(row_vec, &input_result.columns, None);
                 if evaluate_expr_for_row(predicate, &row_map)? {
                     filtered_rows.push(row_vec.clone());
                 }
@@ -325,9 +325,9 @@ fn execute_physical_plan(
             left_key,
             right_key,
         } => {
-            let mut left_result =
+            let left_result =
                 execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let mut right_result =
+            let right_result =
                 execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
 
             let mut joined_rows = Vec::new();
@@ -337,12 +337,12 @@ fn execute_physical_plan(
             let left_key_idx = left_result
                 .columns
                 .iter()
-                .position(|c| &c.name == left_key.to_string().split('.').last().unwrap())
+                .position(|c| c.name == left_key.to_string().split('.').next_back().unwrap())
                 .unwrap();
             let right_key_idx = right_result
                 .columns
                 .iter()
-                .position(|c| &c.name == right_key.to_string().split('.').last().unwrap())
+                .position(|c| c.name == right_key.to_string().split('.').next_back().unwrap())
                 .unwrap();
 
             let mut i = 0;
@@ -352,7 +352,7 @@ fn execute_physical_plan(
                     std::cmp::Ordering::Less => i += 1,
                     std::cmp::Ordering::Greater => j += 1,
                     std::cmp::Ordering::Equal => {
-                        let mut j_start = j;
+                        let j_start = j;
                         while j < right_result.rows.len()
                             && left_result.rows[i][left_key_idx]
                                 == right_result.rows[j][right_key_idx]
@@ -1262,8 +1262,9 @@ fn execute_vacuum(
     Ok(())
 }
 
-use rand::seq::SliceRandom;
 use rand::thread_rng;
+
+
 
 fn execute_analyze(
     table_name: &str,

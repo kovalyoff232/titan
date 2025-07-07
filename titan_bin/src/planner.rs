@@ -6,7 +6,7 @@ use crate::catalog;
 use crate::executor;
 use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use bedrock::buffer_pool::BufferPoolManager;
-use bedrock::transaction::{Snapshot, TransactionManager};
+use bedrock::transaction::{Snapshot};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]

@@ -8,7 +8,6 @@ use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
 use crate::planner::LogicalPlan;
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -198,7 +197,7 @@ pub fn optimize(
                 table_name: table_name.clone(),
                 filter: filter.clone(),
             };
-            let mut best_cost = seq_scan_cost;
+            let best_cost = seq_scan_cost;
 
             if let Some(Expression::Binary {
                 left,
@@ -231,7 +230,6 @@ pub fn optimize(
                                             index_name,
                                             key: key_str.parse().unwrap(),
                                         };
-                                        best_cost = index_scan_cost;
                                     }
                                 }
                             }
