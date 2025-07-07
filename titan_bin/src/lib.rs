@@ -1,4 +1,12 @@
 
+//! The main library for the TitanDB binary.
+//!
+//! This library contains the core logic for the TitanDB server, including:
+//! - Handling TCP connections from clients.
+//! - Parsing and executing SQL queries.
+//! - Managing transactions, concurrency control, and recovery.
+//! - Initializing the database with system catalogs.
+
 use crate::types::{Column, ExecuteResult, ResultSet};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::lock_manager::LockManager;
@@ -19,6 +27,7 @@ pub mod parser;
 pub mod planner;
 pub mod types;
 
+/// Writes a message to the given stream with the specified message type and data.
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
     stream.write_all(&[msg_type])?;
@@ -27,6 +36,7 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Resul
     Ok(())
 }
 
+/// Sends an error response to the client.
 fn send_error_response(stream: &mut TcpStream, message: &str, code: &str) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_u8(b'S'); // Severity
@@ -41,10 +51,12 @@ fn send_error_response(stream: &mut TcpStream, message: &str, code: &str) -> io:
     write_message(stream, b'E', &data)
 }
 
+/// Sends a "Ready for Query" message to the client.
 fn send_ready_for_query(stream: &mut TcpStream) -> io::Result<()> {
     write_message(stream, b'Z', b"I") // 'I' for Idle
 }
 
+/// Sends a "Command Complete" message to the client.
 fn send_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_slice(tag.as_bytes());
@@ -52,6 +64,7 @@ fn send_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
     write_message(stream, b'C', &data)
 }
 
+/// Sends a "Row Description" message to the client, describing the columns of a result set.
 fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_i16(columns.len() as i16);
@@ -74,6 +87,7 @@ fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resul
     write_message(stream, b'T', &data)
 }
 
+/// Sends a "Data Row" message to the client, containing the data for a single row.
 fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_i16(row.len() as i16);
@@ -94,6 +108,10 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
     write_message(stream, b'D', &data)
 }
 
+/// Handles a single client connection.
+///
+/// This function reads queries from the client, executes them, and sends back the results.
+/// It also manages transactions for the client's session.
 fn handle_client(
     mut stream: TcpStream,
     bpm: Arc<BufferPoolManager>,

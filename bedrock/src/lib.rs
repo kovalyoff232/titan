@@ -1,13 +1,20 @@
+//! # Bedrock Storage Engine
 //! The Storage Engine for the Titan Database.
-//!
 //! This crate is responsible for managing the on-disk and in-memory representation of data.
 
+/// The B-Tree implementation.
 pub mod btree;
+/// The buffer pool manager.
 pub mod buffer_pool;
+/// The lock manager for concurrency control.
 pub mod lock_manager;
+/// The page layout and data structures.
 pub mod page;
+/// The pager for reading and writing pages to disk.
 pub mod pager;
+/// The transaction manager.
 pub mod transaction;
+/// The Write-Ahead Log for recovery.
 pub mod wal;
 
 /// The size of a single page in bytes.

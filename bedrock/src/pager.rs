@@ -1,3 +1,4 @@
+//! The Pager is responsible for reading and writing pages to the database file.
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;

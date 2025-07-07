@@ -5,28 +5,41 @@ use crate::TupleId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// The mode of a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockMode {
+    /// A shared lock.
     Shared,
+    /// An exclusive lock.
     Exclusive,
 }
 
+/// A resource that can be locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockableResource {
+    /// A table.
     Table(u32),
+    /// A tuple.
     Tuple(TupleId),
 }
 
+/// A lock request.
 #[derive(Debug)]
 struct LockRequest {
+    /// The ID of the transaction that requested the lock.
     tx_id: TransactionId,
+    /// The mode of the lock.
     mode: LockMode,
 }
 
+/// A queue of lock requests for a resource.
 #[derive(Debug, Default)]
 struct LockQueue {
+    /// The queue of lock requests.
     queue: VecDeque<LockRequest>,
+    /// The set of transactions that hold a shared lock.
     sharing: HashSet<TransactionId>,
+    /// The transaction that holds an exclusive lock.
     exclusive: Option<TransactionId>,
 }
 
@@ -59,28 +72,38 @@ impl LockQueue {
     }
 }
 
+/// A queue of waiting transactions.
 #[derive(Debug, Default)]
 struct WaitQueue {
+    /// The queue of lock requests.
     queue: Mutex<LockQueue>,
+    /// The condition variable to notify waiting transactions.
     cvar: Condvar,
 }
 
+/// The lock manager.
 #[derive(Debug, Default)]
 pub struct LockManager {
+    /// A map from a resource to its lock queue.
     table: Mutex<HashMap<LockableResource, Arc<WaitQueue>>>,
+    /// A map from a transaction to the transactions it is waiting for.
     waits_for: Mutex<HashMap<TransactionId, Vec<TransactionId>>>,
 }
 
+/// An error that can occur when acquiring a lock.
 #[derive(Debug)]
 pub enum LockError {
+    /// A deadlock was detected.
     Deadlock,
 }
 
 impl LockManager {
+    /// Creates a new lock manager.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Acquires a lock on a resource.
     pub fn lock(
         &self,
         tx_id: TransactionId,
@@ -124,6 +147,7 @@ impl LockManager {
         }
     }
 
+    /// Updates the waits-for graph and checks for deadlocks.
     fn update_waits_for_graph(
         &self,
         queue: &LockQueue,
@@ -155,6 +179,7 @@ impl LockManager {
         Ok(())
     }
 
+    /// Checks for cycles in the waits-for graph.
     #[allow(clippy::only_used_in_recursion)]
     fn has_cycle_util(
         &self,
@@ -185,6 +210,7 @@ impl LockManager {
         false
     }
 
+    /// Tries to acquire a lock.
     fn try_acquire(&self, queue: &mut LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
         if self.is_locked_for(queue, tx_id, mode) {
             return false;
@@ -212,6 +238,7 @@ impl LockManager {
         true
     }
 
+    /// Checks if a resource is locked for a transaction.
     fn is_locked_for(&self, queue: &LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
         match mode {
             LockMode::Shared => {
@@ -233,6 +260,7 @@ impl LockManager {
         false
     }
 
+    /// Releases all locks held by a transaction.
     pub fn unlock_all(&self, tx_id: TransactionId) {
         let table = self.table.lock().unwrap();
         let mut to_notify = Vec::new();

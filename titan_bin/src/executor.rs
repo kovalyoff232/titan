@@ -1,4 +1,8 @@
 //! The query executor.
+//!
+//! This module is responsible for taking a physical query plan and executing it
+//! against the database. It handles all the details of data retrieval, modification,
+//! and expression evaluation.
 
 use crate::catalog::{
     find_table, get_table_schema, update_pg_class_page_id, PG_ATTRIBUTE_TABLE_OID,

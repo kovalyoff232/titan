@@ -8,15 +8,20 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A Log Sequence Number.
 pub type Lsn = u64;
 
 /// Header for every WAL record.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct WalRecordHeader {
+    /// The total length of the record, including the header.
     pub total_len: u32,
+    /// The ID of the transaction that this record belongs to.
     pub tx_id: u32,
+    /// The LSN of the previous record for this transaction.
     pub prev_lsn: Lsn,
+    /// The CRC checksum of the record.
     pub crc: u32,
 }
 
@@ -72,6 +77,7 @@ pub enum WalRecord {
 }
 
 impl WalRecord {
+    /// Returns the transaction ID of the record.
     pub fn tx_id(&self) -> u32 {
         match self {
             WalRecord::Commit { tx_id } => *tx_id,
@@ -141,6 +147,7 @@ impl WalManager {
         Ok(lsn)
     }
 
+    /// Serializes a WAL record into a byte buffer.
     fn serialize_record(&self, record: &WalRecord, buf: &mut Vec<u8>) {
         match record {
             WalRecord::Commit { tx_id } => {
@@ -221,6 +228,7 @@ impl WalManager {
         }
     }
 
+    /// Deserializes a WAL record from a byte buffer.
     pub fn deserialize_record(buf: &[u8]) -> Option<WalRecord> {
         if buf.is_empty() {
             return None;
@@ -307,6 +315,7 @@ impl WalManager {
         }
     }
 
+    /// Reads a WAL record from the given LSN.
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
         if lsn == 0 {
             return Ok((None, 0));

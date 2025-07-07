@@ -11,8 +11,11 @@ use std::sync::{Arc, Mutex};
 /// It contains the set of active transactions.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// The minimum transaction ID that is currently active.
     pub xmin: TransactionId,
+    /// The next transaction ID to be allocated.
     pub xmax: TransactionId,
+    /// The set of active transaction IDs.
     pub active_transactions: Arc<HashSet<TransactionId>>,
 }
 
@@ -32,9 +35,13 @@ impl Snapshot {
 /// The state of the transaction manager.
 #[derive(Debug, Default)]
 struct TransactionManagerState {
+    /// The next transaction ID to be allocated.
     next_transaction_id: AtomicU32,
+    /// The set of active transaction IDs.
     active_transactions: Mutex<HashSet<TransactionId>>,
+    /// The last LSN for each active transaction.
     last_lsns: Mutex<HashMap<TransactionId, Lsn>>,
+    /// The next object ID to be allocated.
     next_oid: AtomicU32,
 }
 
@@ -45,6 +52,7 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
+    /// Creates a new transaction manager.
     pub fn new(initial_tx_id: TransactionId) -> Self {
         println!(
             "[TM::new] Initializing with next_transaction_id = {}",
@@ -99,10 +107,12 @@ impl TransactionManager {
         );
     }
 
+    /// Gets the last LSN for a transaction.
     pub fn get_last_lsn(&self, tx_id: TransactionId) -> Option<Lsn> {
         self.state.last_lsns.lock().unwrap().get(&tx_id).cloned()
     }
 
+    /// Sets the last LSN for a transaction.
     pub fn set_last_lsn(&self, tx_id: TransactionId, lsn: Lsn) {
         self.state.last_lsns.lock().unwrap().insert(tx_id, lsn);
     }

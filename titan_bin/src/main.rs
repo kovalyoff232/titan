@@ -1,3 +1,7 @@
+//! The main entry point for the TitanDB server.
+//!
+//! This file parses command-line arguments and starts the server.
+
 use titan_bin::run_server;
 
 fn main() -> std::io::Result<()> {

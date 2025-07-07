@@ -1,3 +1,9 @@
+//! Manages the system catalogs, which store metadata about the database.
+//!
+//! The system catalogs are special tables that store information about tables, columns,
+//! and other database objects. This module provides functions for accessing and
+//! manipulating the system catalogs.
+
 use crate::errors::ExecutionError;
 use crate::types::Column;
 use bedrock::buffer_pool::BufferPoolManager;
@@ -7,9 +13,15 @@ use bedrock::wal::WalManager;
 use bedrock::PageId;
 use std::sync::{Arc, Mutex};
 
+/// The object ID of the `pg_class` table, which stores information about tables.
 pub const PG_CLASS_TABLE_OID: PageId = 0;
+/// The object ID of the `pg_attribute` table, which stores information about columns.
 pub const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
 
+/// Finds a table by name in the `pg_class` catalog.
+///
+/// This function searches the `pg_class` table for a table with the given name.
+/// It returns the table's object ID and the page ID of its first page.
 pub fn find_table(
     name: &str,
     bpm: &Arc<BufferPoolManager>,

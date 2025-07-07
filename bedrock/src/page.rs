@@ -1,9 +1,12 @@
 //! The layout of a page on disk.
 use crate::{transaction::Snapshot, PageId, PAGE_SIZE};
 
+/// A unique identifier for a transaction.
 pub type TransactionId = u32;
+/// A unique identifier for a command within a transaction.
 pub type CommandId = u32;
 
+/// A constant for an invalid page ID.
 pub const INVALID_PAGE_ID: PageId = 0;
 
 /// The header of a page on disk.
@@ -55,7 +58,9 @@ pub struct HeapTupleHeaderData {
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Page {
+    /// The ID of the page.
     pub id: PageId,
+    /// The raw data of the page.
     pub data: [u8; PAGE_SIZE],
 }
 
@@ -82,11 +87,12 @@ impl Page {
         self.write_header(&header);
     }
 
-    /// Returns a mutable reference to the page header.
+    /// Reads the page header.
     pub fn read_header(&self) -> PageHeaderData {
         unsafe { std::ptr::read_unaligned(self.data.as_ptr() as *const PageHeaderData) }
     }
 
+    /// Writes the page header.
     pub fn write_header(&mut self, header: &PageHeaderData) {
         unsafe {
             std::ptr::write_unaligned(self.data.as_mut_ptr() as *mut PageHeaderData, *header);
