@@ -957,8 +957,9 @@ fn execute_update(
         let mut page = page_guard.write();
         if !page.is_visible(snapshot, tx_id, item_id)
             || page
-                .get_tuple_header_mut(item_id)
-                .map_or(true, |h| h.xmax != 0)
+                .get_item_id_data(item_id)
+                .map(|d| page.read_tuple_header(d.offset).xmax != 0)
+                .unwrap_or(true)
         {
             lm.unlock_all(tx_id);
             return Err(ExecutionError::SerializationFailure);
@@ -995,7 +996,10 @@ fn execute_update(
         }
 
         let old_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
-        page.get_tuple_header_mut(item_id).unwrap().xmax = tx_id;
+        let item_id_data = page.get_item_id_data(item_id).unwrap();
+        let mut header = page.read_tuple_header(item_id_data.offset);
+        header.xmax = tx_id;
+        page.write_tuple_header(item_id_data.offset, &header);
 
         if let Some(new_item_id) = page.add_tuple(&new_data, tx_id, 0) {
             rows_affected += 1;
@@ -1015,7 +1019,9 @@ fn execute_update(
             header.lsn = lsn;
             page.write_header(&header);
         } else {
-            page.get_tuple_header_mut(item_id).unwrap().xmax = 0;
+            let mut header = page.read_tuple_header(item_id_data.offset);
+            header.xmax = 0;
+            page.write_tuple_header(item_id_data.offset, &header);
             lm.unlock_all(tx_id);
             return Err(ExecutionError::SerializationFailure);
         }
@@ -1061,11 +1067,13 @@ fn execute_delete(
         if !page.is_visible(snapshot, tx_id, item_id) {
             continue;
         }
-        if let Some(header) = page.get_tuple_header_mut(item_id) {
+        if let Some(item_id_data) = page.get_item_id_data(item_id) {
+            let mut header = page.read_tuple_header(item_id_data.offset);
             if header.xmax != 0 {
                 return Err(ExecutionError::SerializationFailure);
             }
             header.xmax = tx_id;
+            page.write_tuple_header(item_id_data.offset, &header);
             rows_affected += 1;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
             let lsn = wm.lock().unwrap().log(
@@ -1595,11 +1603,13 @@ fn execute_delete_internal(
         if !page.is_visible(snapshot, tx_id, item_id) {
             continue;
         }
-        if let Some(header) = page.get_tuple_header_mut(item_id) {
+        if let Some(item_id_data) = page.get_item_id_data(item_id) {
+            let mut header = page.read_tuple_header(item_id_data.offset);
             if header.xmax != 0 {
                 return Err(ExecutionError::SerializationFailure);
             }
             header.xmax = tx_id;
+            page.write_tuple_header(item_id_data.offset, &header);
             rows_affected += 1;
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
             let lsn = wm.lock().unwrap().log(

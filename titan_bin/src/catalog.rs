@@ -29,7 +29,7 @@ pub fn find_table(
             if let (Some(tuple_data), Some(item_id_data)) =
                 (page.get_tuple(i), page.get_item_id_data(i))
             {
-                let header = page.tuple_header(item_id_data.offset);
+                let header = page.read_tuple_header(item_id_data.offset);
                 let name_len = tuple_data[8] as usize;
                 if tuple_data.len() >= 9 + name_len {
                     let table_name = String::from_utf8_lossy(&tuple_data[9..9 + name_len]);
@@ -117,8 +117,10 @@ pub fn update_pg_class_page_id(
             };
             if oid == table_oid {
                 let tuple_data_vec = pg_class_page.get_tuple(i).unwrap().to_vec();
-                if let Some(header) = pg_class_page.get_tuple_header_mut(i) {
+                if let Some(item_id_data) = pg_class_page.get_item_id_data(i) {
+                    let mut header = pg_class_page.read_tuple_header(item_id_data.offset);
                     header.xmax = tx_id;
+                    pg_class_page.write_tuple_header(item_id_data.offset, &header);
                     old_item_id = Some(i);
                     old_tuple_data = Some(tuple_data_vec);
                 }

@@ -157,9 +157,11 @@ impl TransactionManager {
                 } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
-                    if let Some(header) = page.get_tuple_header_mut(item_id) {
+                    if let Some(item_id_data) = page.get_item_id_data(item_id) {
+                        let mut header = page.read_tuple_header(item_id_data.offset);
                         // Physically mark the tuple as deleted by this abort.
                         header.xmax = tx_id;
+                        page.write_tuple_header(item_id_data.offset, &header);
                     }
                     let mut header = page.read_header();
                     header.lsn = clr_lsn;
@@ -170,11 +172,13 @@ impl TransactionManager {
                 } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
-                    if let Some(header) = page.get_tuple_header_mut(item_id) {
+                    if let Some(item_id_data) = page.get_item_id_data(item_id) {
+                        let mut header = page.read_tuple_header(item_id_data.offset);
                         // Undo the deletion by clearing the xmax.
                         if header.xmax == tx_id {
                             header.xmax = 0;
                         }
+                        page.write_tuple_header(item_id_data.offset, &header);
                     }
                     let mut header = page.read_header();
                     header.lsn = clr_lsn;

@@ -38,6 +38,7 @@ pub struct ItemIdData {
 /// The header of a heap tuple.
 /// This structure is laid out in memory exactly as it is on disk.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct HeapTupleHeaderData {
     /// ID of the transaction that created this tuple.
     pub xmin: TransactionId,
@@ -125,15 +126,17 @@ impl Page {
         let item_id_index =
             (item_id_offset - std::mem::size_of::<PageHeaderData>() as u16) / item_id_len as u16;
 
-        let item_id = self.item_id_mut(item_id_offset);
+        let mut item_id = self.read_item_id(item_id_offset);
         item_id.offset = tuple_offset;
         item_id.length = tuple_len as u16;
+        self.write_item_id(item_id_offset, &item_id);
 
-        let tuple_header = self.tuple_header_mut(tuple_offset);
+        let mut tuple_header = self.read_tuple_header(tuple_offset);
         tuple_header.xmin = xmin;
         tuple_header.xmax = xmax;
         tuple_header.cmin_cmax = 0; // Make sure all fields are initialized
         tuple_header.infomask = 0;
+        self.write_tuple_header(tuple_offset, &tuple_header);
 
         let tuple_data_offset = tuple_offset + tuple_header_len as u16;
         let tuple_data = self.tuple_mut(tuple_data_offset, tuple.len());
@@ -181,9 +184,9 @@ impl Page {
     }
 
     /// Returns a mutable reference to the tuple header for the given item id.
-    pub fn get_tuple_header_mut(&mut self, item_id: u16) -> Option<&mut HeapTupleHeaderData> {
+    pub fn get_tuple_header_mut(&mut self, item_id: u16) -> Option<HeapTupleHeaderData> {
         let item_id_data = self.get_item_id_data(item_id)?;
-        Some(self.tuple_header_mut(item_id_data.offset))
+        Some(self.read_tuple_header(item_id_data.offset))
     }
 
     /// Helper to safely get ItemIdData
@@ -195,7 +198,7 @@ impl Page {
         if item_id_offset + item_id_size > self.read_header().lower_offset {
             return None;
         }
-        let item_id_data = *self.item_id(item_id_offset);
+        let item_id_data = self.read_item_id(item_id_offset);
 
         if item_id_data.offset < self.read_header().lower_offset
             || item_id_data.offset + item_id_data.length > PAGE_SIZE as u16
@@ -215,7 +218,7 @@ impl Page {
         current_tx_id: TransactionId,
         item_id: u16,
     ) -> bool {
-        let header = self.tuple_header(self.get_item_id_data(item_id).unwrap().offset);
+        let header = self.read_tuple_header(self.get_item_id_data(item_id).unwrap().offset);
 
         if header.xmin == current_tx_id {
             return header.xmax == 0;
@@ -246,21 +249,23 @@ impl Page {
         (lower - header_size) / item_id_size
     }
 
-    fn item_id(&self, offset: u16) -> &ItemIdData {
-        unsafe { &*(self.data.as_ptr().offset(offset as isize) as *const ItemIdData) }
+    fn read_item_id(&self, offset: u16) -> ItemIdData {
+        unsafe { std::ptr::read_unaligned(self.data.as_ptr().offset(offset as isize) as *const ItemIdData) }
     }
 
-    fn item_id_mut(&mut self, offset: u16) -> &mut ItemIdData {
-        unsafe { &mut *(self.data.as_mut_ptr().offset(offset as isize) as *mut ItemIdData) }
-    }
-
-    pub fn tuple_header(&self, offset: u16) -> &HeapTupleHeaderData {
-        unsafe { &*(self.data.as_ptr().offset(offset as isize) as *const HeapTupleHeaderData) }
-    }
-
-    fn tuple_header_mut(&mut self, offset: u16) -> &mut HeapTupleHeaderData {
+    fn write_item_id(&mut self, offset: u16, item_id: &ItemIdData) {
         unsafe {
-            &mut *(self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData)
+            std::ptr::write_unaligned(self.data.as_mut_ptr().offset(offset as isize) as *mut ItemIdData, *item_id);
+        }
+    }
+
+    pub fn read_tuple_header(&self, offset: u16) -> HeapTupleHeaderData {
+        unsafe { std::ptr::read_unaligned(self.data.as_ptr().offset(offset as isize) as *const HeapTupleHeaderData) }
+    }
+
+    pub fn write_tuple_header(&mut self, offset: u16, header: &HeapTupleHeaderData) {
+        unsafe {
+            std::ptr::write_unaligned(self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData, *header);
         }
     }
 
