@@ -29,3 +29,4 @@ pub type TupleId = (PageId, u16); // (page_id, item_id)
 
 // The Page struct is now defined in the page module.
 pub use page::Page;
+pub use buffer_pool::PageGuard;

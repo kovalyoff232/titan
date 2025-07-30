@@ -28,13 +28,13 @@ pub struct BufferPoolManager {
 }
 
 /// An RAII guard for a page.
-pub struct PageGuard {
-    bpm: Arc<BufferPoolManager>,
+pub struct PageGuard<'a> {
+    bpm: &'a Arc<BufferPoolManager>,
     page_id: PageId,
     frame: Arc<Frame>,
 }
 
-impl PageGuard {
+impl<'a> PageGuard<'a> {
     pub fn read(&self) -> std::sync::RwLockReadGuard<Page> {
         self.frame.page.read().unwrap()
     }
@@ -45,7 +45,7 @@ impl PageGuard {
     }
 }
 
-impl Drop for PageGuard {
+impl<'a> Drop for PageGuard<'a> {
     fn drop(&mut self) {
         self.bpm.unpin_page(self.page_id);
     }
@@ -79,7 +79,7 @@ impl BufferPoolManager {
             let frame = self.frames[frame_index].clone();
             self.pin_frame(&frame);
             return Ok(PageGuard {
-                bpm: self.clone(),
+                bpm: self,
                 page_id,
                 frame,
             });
@@ -111,7 +111,7 @@ impl BufferPoolManager {
             .unwrap()
             .insert(page_id, frame_index);
         Ok(PageGuard {
-            bpm: self.clone(),
+            bpm: self,
             page_id,
             frame,
         })
@@ -144,7 +144,7 @@ impl BufferPoolManager {
             .unwrap()
             .insert(new_page_id, frame_index);
         Ok(PageGuard {
-            bpm: self.clone(),
+            bpm: self,
             page_id: new_page_id,
             frame,
         })

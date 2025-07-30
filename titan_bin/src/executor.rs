@@ -29,6 +29,15 @@ use std::sync::{Arc, Mutex};
 
 
 
+// --- Type Aliases ---
+type Row = Vec<String>;
+
+// --- Executor Trait ---
+pub trait Executor {
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError>;
+    fn schema(&self) -> &Vec<Column>;
+}
+
 // --- Helper Functions ---
 
 fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, LiteralValue> {
@@ -142,8 +151,18 @@ pub fn execute(
 
             println!("[Executor] Physical Plan: {:?}", physical_plan);
 
-            execute_physical_plan(&physical_plan, bpm, lm, tx_id, snapshot, select_stmt)
-                .map(ExecuteResult::ResultSet)
+            let mut executor =
+                create_executor(&physical_plan, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let schema = executor.schema().clone();
+            let mut rows = Vec::new();
+            while let Some(row) = executor.next()? {
+                rows.push(row);
+            }
+
+            Ok(ExecuteResult::ResultSet(ResultSet {
+                columns: schema,
+                rows,
+            }))
         }
         Statement::CreateTable(create_stmt) => {
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
@@ -175,61 +194,31 @@ pub fn execute(
     }
 }
 
-// --- Physical Plan Executor ---
+// --- Executor Creation ---
 
-fn execute_physical_plan(
-    plan: &PhysicalPlan,
-    bpm: &Arc<BufferPoolManager>,
-    lm: &Arc<LockManager>,
+fn create_executor<'a>(
+    plan: &'a PhysicalPlan,
+    bpm: &'a Arc<BufferPoolManager>,
+    lm: &'a Arc<LockManager>,
     tx_id: u32,
-    snapshot: &Snapshot,
-    select_stmt: &SelectStatement,
-) -> Result<ResultSet, ExecutionError> {
+    snapshot: &'a Snapshot,
+    select_stmt: &'a SelectStatement,
+) -> Result<Box<dyn Executor + 'a>, ExecutionError> {
     match plan {
         PhysicalPlan::TableScan { table_name, filter } => {
             let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
             let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-            let mut rows_with_ids = scan_table(
+            Ok(Box::new(TableScanExecutor::new(
                 bpm,
                 lm,
                 first_page_id,
-                &schema,
+                schema,
                 tx_id,
                 snapshot,
                 select_stmt.for_update,
-            )?;
-
-            if let Some(predicate) = filter {
-                rows_with_ids
-                    .retain(|(_, _, row)| evaluate_expr_for_row(predicate, row).unwrap_or(false));
-            }
-
-            let rows: Vec<Vec<String>> = rows_with_ids
-                .into_iter()
-                .map(|(_, _, row)| {
-                    schema
-                        .iter()
-                        .map(|col| {
-                            let val = row.get(&col.name).unwrap();
-                            match val {
-                                LiteralValue::Bool(b) => {
-                                    if *b {
-                                        "t".to_string()
-                                    } else {
-                                        "f".to_string()
-                                    }
-                                }
-                                _ => val.to_string(),
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            Ok(ResultSet {
-                columns: schema,
-                rows,
-            })
+                filter.clone(),
+            )))
         }
         PhysicalPlan::IndexScan {
             table_name, key, ..
@@ -243,139 +232,46 @@ fn execute_physical_plan(
                 find_table(&index_name, bpm, tx_id, snapshot)?
                     .ok_or(ExecutionError::TableNotFound(index_name))?;
 
-            let mut rows = Vec::new();
-            if let Some(tuple_id) = btree::btree_search(bpm, index_root_page_id, *key)? {
-                let (page_id, item_id) = tuple_id;
-                let page_guard = bpm.acquire_page(page_id)?;
-                let page = page_guard.read();
-                if page.is_visible(snapshot, tx_id, item_id) {
-                    if let Some(tuple_data) = page.get_tuple(item_id) {
-                        let parsed = parse_tuple(tuple_data, &schema);
-                        rows.push(
-                            schema
-                                .iter()
-                                .map(|col| parsed.get(&col.name).unwrap().to_string())
-                                .collect(),
-                        );
-                    }
-                }
-            }
-            Ok(ResultSet {
-                columns: schema,
-                rows,
-            })
+            Ok(Box::new(IndexScanExecutor::new(
+                bpm,
+                schema,
+                index_root_page_id,
+                *key,
+                tx_id,
+                snapshot,
+            )))
         }
         PhysicalPlan::Filter { input, predicate } => {
-            let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let mut filtered_rows = Vec::new();
-            for row_vec in &input_result.rows {
-                let row_map = row_vec_to_map(row_vec, &input_result.columns, None);
-                if evaluate_expr_for_row(predicate, &row_map)? {
-                    filtered_rows.push(row_vec.clone());
-                }
-            }
-            Ok(ResultSet {
-                columns: input_result.columns,
-                rows: filtered_rows,
-            })
+            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            Ok(Box::new(FilterExecutor::new(
+                input_executor,
+                predicate.clone(),
+            )))
         }
         PhysicalPlan::NestedLoopJoin {
             left,
             right,
             condition,
         } => {
-            let left_result = execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let right_result = execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
-
-            let mut joined_rows = Vec::new();
-            let mut joined_columns = left_result.columns.clone();
-            joined_columns.extend(right_result.columns.clone());
-
+            let left_executor = create_executor(left, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let right_executor = create_executor(right, bpm, lm, tx_id, snapshot, select_stmt)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                Some(table_name.as_str())
+                Some(table_name.clone())
             } else {
                 None
             };
             let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                Some(table_name.as_str())
+                Some(table_name.clone())
             } else {
                 None
             };
-
-            for left_row_vec in &left_result.rows {
-                for right_row_vec in &right_result.rows {
-                    let left_map =
-                        row_vec_to_map(left_row_vec, &left_result.columns, left_table_name);
-                    let right_map =
-                        row_vec_to_map(right_row_vec, &right_result.columns, right_table_name);
-                    let combined_map: HashMap<String, LiteralValue> =
-                        left_map.into_iter().chain(right_map).collect();
-
-                    if evaluate_expr_for_row(condition, &combined_map)? {
-                        let mut joined_row_vec = left_row_vec.clone();
-                        joined_row_vec.extend(right_row_vec.clone());
-                        joined_rows.push(joined_row_vec);
-                    }
-                }
-            }
-            Ok(ResultSet {
-                columns: joined_columns,
-                rows: joined_rows,
-            })
-        }
-        PhysicalPlan::MergeJoin {
-            left,
-            right,
-            left_key,
-            right_key,
-        } => {
-            let left_result =
-                execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let right_result =
-                execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
-
-            let mut joined_rows = Vec::new();
-            let mut joined_columns = left_result.columns.clone();
-            joined_columns.extend(right_result.columns.clone());
-
-            let left_key_idx = left_result
-                .columns
-                .iter()
-                .position(|c| c.name == left_key.to_string().split('.').next_back().unwrap())
-                .unwrap();
-            let right_key_idx = right_result
-                .columns
-                .iter()
-                .position(|c| c.name == right_key.to_string().split('.').next_back().unwrap())
-                .unwrap();
-
-            let mut i = 0;
-            let mut j = 0;
-            while i < left_result.rows.len() && j < right_result.rows.len() {
-                match left_result.rows[i][left_key_idx].cmp(&right_result.rows[j][right_key_idx]) {
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                    std::cmp::Ordering::Equal => {
-                        let j_start = j;
-                        while j < right_result.rows.len()
-                            && left_result.rows[i][left_key_idx]
-                                == right_result.rows[j][right_key_idx]
-                        {
-                            let mut joined_row = left_result.rows[i].clone();
-                            joined_row.extend(right_result.rows[j].clone());
-                            joined_rows.push(joined_row);
-                            j += 1;
-                        }
-                        i += 1;
-                        j = j_start;
-                    }
-                }
-            }
-
-            Ok(ResultSet {
-                columns: joined_columns,
-                rows: joined_rows,
-            })
+            Ok(Box::new(NestedLoopJoinExecutor::new(
+                left_executor,
+                right_executor,
+                condition.clone(),
+                left_table_name,
+                right_table_name,
+            )))
         }
         PhysicalPlan::HashJoin {
             left,
@@ -383,64 +279,254 @@ fn execute_physical_plan(
             left_key,
             right_key,
         } => {
-            let left_result = execute_physical_plan(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let right_result = execute_physical_plan(right, bpm, lm, tx_id, snapshot, select_stmt)?;
-
-            let mut joined_rows = Vec::new();
-            let mut joined_columns = left_result.columns.clone();
-            joined_columns.extend(right_result.columns.clone());
-
+            let left_executor = create_executor(left, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let right_executor = create_executor(right, bpm, lm, tx_id, snapshot, select_stmt)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                Some(table_name.as_str())
+                Some(table_name.clone())
             } else {
                 None
             };
             let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                Some(table_name.as_str())
+                Some(table_name.clone())
             } else {
                 None
             };
-
-            // Build phase
-            let mut hash_table: HashMap<LiteralValue, Vec<&Vec<String>>> = HashMap::new();
-            for right_row_vec in &right_result.rows {
-                let right_row_map =
-                    row_vec_to_map(right_row_vec, &right_result.columns, right_table_name);
-                let key = evaluate_expr_for_row_to_val(right_key, &right_row_map)?;
-                hash_table.entry(key).or_default().push(right_row_vec);
-            }
-
-            // Probe phase
-            for left_row_vec in &left_result.rows {
-                let left_row_map =
-                    row_vec_to_map(left_row_vec, &left_result.columns, left_table_name);
-                let key = evaluate_expr_for_row_to_val(left_key, &left_row_map)?;
-                if let Some(matching_rows) = hash_table.get(&key) {
-                    for right_row_vec in matching_rows {
-                        let mut joined_row = left_row_vec.clone();
-                        joined_row.extend((*right_row_vec).clone());
-                        joined_rows.push(joined_row);
-                    }
-                }
-            }
-            Ok(ResultSet {
-                columns: joined_columns,
-                rows: joined_rows,
-            })
+            Ok(Box::new(HashJoinExecutor::new(
+                left_executor,
+                right_executor,
+                left_key.clone(),
+                right_key.clone(),
+                left_table_name,
+                right_table_name,
+            )?))
         }
         PhysicalPlan::Projection { input, expressions } => {
-            let input_result = execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
-            if expressions
-                .iter()
-                .any(|item| matches!(item, SelectItem::Wildcard))
-            {
-                return Ok(input_result);
+            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            Ok(Box::new(ProjectionExecutor::new(
+                input_executor,
+                expressions.clone(),
+            )))
+        }
+        PhysicalPlan::Sort { input, order_by } => {
+            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            Ok(Box::new(SortExecutor::new(
+                input_executor,
+                order_by.clone(),
+            )?))
+        }
+        PhysicalPlan::MergeJoin { .. } => {
+            Err(ExecutionError::GenericError(
+                "MergeJoin is not supported by the iterator executor yet".to_string(),
+            ))
+        }
+    }
+}
+
+// --- Physical Plan Executors ---
+
+// TableScanExecutor
+struct TableScanExecutor<'a> {
+    bpm: &'a Arc<BufferPoolManager>,
+    lm: &'a Arc<LockManager>,
+    schema: Vec<Column>,
+    tx_id: u32,
+    snapshot: &'a Snapshot,
+    for_update: bool,
+    filter: Option<Expression>,
+    current_page_id: PageId,
+    current_item_id: u16,
+}
+
+impl<'a> TableScanExecutor<'a> {
+    fn new(
+        bpm: &'a Arc<BufferPoolManager>,
+        lm: &'a Arc<LockManager>,
+        first_page_id: PageId,
+        schema: Vec<Column>,
+        tx_id: u32,
+        snapshot: &'a Snapshot,
+        for_update: bool,
+        filter: Option<Expression>,
+    ) -> Self {
+        Self {
+            bpm,
+            lm,
+            schema,
+            tx_id,
+            snapshot,
+            for_update,
+            filter,
+            current_page_id: first_page_id,
+            current_item_id: 0,
+        }
+    }
+}
+
+impl<'a> Executor for TableScanExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        loop {
+            if self.current_page_id == INVALID_PAGE_ID {
+                return Ok(None);
             }
 
-            let mut projected_rows = Vec::new();
-            let mut projected_columns = Vec::new();
+            let page_guard = self.bpm.acquire_page(self.current_page_id)?;
+            let page = page_guard.read();
 
-            // Determine projected column names and types (simplified)
+            if self.current_item_id >= page.get_tuple_count() {
+                self.current_page_id = page.read_header().next_page_id;
+                self.current_item_id = 0;
+                continue;
+            }
+
+            let item_id = self.current_item_id;
+            self.current_item_id += 1;
+
+            if page.is_visible(self.snapshot, self.tx_id, item_id) {
+                if self.for_update {
+                    self.lm.lock(
+                        self.tx_id,
+                        LockableResource::Tuple((self.current_page_id, item_id)),
+                        LockMode::Exclusive,
+                    )?;
+                }
+                if let Some(tuple_data) = page.get_tuple(item_id) {
+                    let parsed_row = parse_tuple(tuple_data, &self.schema);
+                    if let Some(predicate) = &self.filter {
+                        if !evaluate_expr_for_row(predicate, &parsed_row)? {
+                            continue;
+                        }
+                    }
+                    let row: Row = self
+                        .schema
+                        .iter()
+                        .map(|col| {
+                            let val = parsed_row.get(&col.name).unwrap();
+                            match val {
+                                LiteralValue::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+                                _ => val.to_string(),
+                            }
+                        })
+                        .collect();
+                    return Ok(Some(row));
+                }
+            }
+        }
+    }
+}
+
+// IndexScanExecutor
+struct IndexScanExecutor<'a> {
+    bpm: &'a Arc<BufferPoolManager>,
+    schema: Vec<Column>,
+    tx_id: u32,
+    snapshot: &'a Snapshot,
+    tuple_id: Option<(PageId, u16)>,
+    done: bool,
+}
+
+impl<'a> IndexScanExecutor<'a> {
+    fn new(
+        bpm: &'a Arc<BufferPoolManager>,
+        schema: Vec<Column>,
+        index_root_page_id: PageId,
+        key: i32,
+        tx_id: u32,
+        snapshot: &'a Snapshot,
+    ) -> Self {
+        let tuple_id = btree::btree_search(bpm, index_root_page_id, key).unwrap_or(None);
+        Self {
+            bpm,
+            schema,
+            tx_id,
+            snapshot,
+            tuple_id,
+            done: false,
+        }
+    }
+}
+
+impl<'a> Executor for IndexScanExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        if self.done || self.tuple_id.is_none() {
+            return Ok(None);
+        }
+        self.done = true;
+
+        let (page_id, item_id) = self.tuple_id.unwrap();
+        let page_guard = self.bpm.acquire_page(page_id)?;
+        let page = page_guard.read();
+
+        if page.is_visible(self.snapshot, self.tx_id, item_id) {
+            if let Some(tuple_data) = page.get_tuple(item_id) {
+                let parsed = parse_tuple(tuple_data, &self.schema);
+                let row = self
+                    .schema
+                    .iter()
+                    .map(|col| parsed.get(&col.name).unwrap().to_string())
+                    .collect();
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+}
+
+// FilterExecutor
+struct FilterExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    predicate: Expression,
+}
+
+impl<'a> FilterExecutor<'a> {
+    fn new(input: Box<dyn Executor + 'a>, predicate: Expression) -> Self {
+        Self { input, predicate }
+    }
+}
+
+impl<'a> Executor for FilterExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        self.input.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        loop {
+            match self.input.next()? {
+                Some(row) => {
+                    let row_map = row_vec_to_map(&row, self.schema(), None);
+                    if evaluate_expr_for_row(&self.predicate, &row_map)? {
+                        return Ok(Some(row));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+// ProjectionExecutor
+struct ProjectionExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    expressions: Vec<SelectItem>,
+    projected_schema: Vec<Column>,
+}
+
+impl<'a> ProjectionExecutor<'a> {
+    fn new(input: Box<dyn Executor + 'a>, expressions: Vec<SelectItem>) -> Self {
+        let mut projected_schema = Vec::new();
+        if expressions
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+        {
+            projected_schema = input.schema().clone();
+        } else {
             for (i, item) in expressions.iter().enumerate() {
                 let name = match item {
                     SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
@@ -452,197 +538,355 @@ fn execute_physical_plan(
                     SelectItem::Wildcard => "*".to_string(),
                     SelectItem::QualifiedWildcard(table_name) => format!("{}.*", table_name),
                 };
-                // This is a simplification. We should ideally resolve the type from the input.
-                projected_columns.push(Column { name, type_id: 25 });
+                projected_schema.push(Column { name, type_id: 25 }); // Simplified type
             }
-
-            for row_vec in &input_result.rows {
-                let row_map: HashMap<String, LiteralValue> =
-                    if let PhysicalPlan::HashJoin { left, right, .. }
-                    | PhysicalPlan::NestedLoopJoin { left, right, .. } = &**input
-                    {
-                        // HACK: This is inefficient as it may re-fetch schema info.
-                        // It's also brittle as it assumes the direct children of the join are table scans.
-                        // A proper fix would involve a larger refactor of the ResultSet or execution context.
-                        fn get_child_schema(
-                            plan: &PhysicalPlan,
-                            bpm: &Arc<BufferPoolManager>,
-                            tx_id: u32,
-                            snapshot: &Snapshot,
-                        ) -> Result<Vec<Column>, ExecutionError> {
-                            if let PhysicalPlan::TableScan { table_name, .. } = plan {
-                                let (oid, _) = find_table(table_name, bpm, tx_id, snapshot)?
-                                    .ok_or_else(|| {
-                                        ExecutionError::TableNotFound(table_name.clone())
-                                    })?;
-                                get_table_schema(bpm, oid, tx_id, snapshot)
-                            } else {
-                                // This is not robust. We can't easily get the schema for a more complex child plan.
-                                Ok(vec![])
-                            }
-                        }
-
-                        let left_schema = get_child_schema(left, bpm, tx_id, snapshot)?;
-                        let left_col_count = left_schema.len();
-
-                        let (left_cols, right_cols) = input_result.columns.split_at(left_col_count);
-                        let (left_vec, right_vec) = row_vec.split_at(left_col_count);
-
-                        let left_table_name =
-                            if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                                Some(table_name.as_str())
-                            } else {
-                                None
-                            };
-                        let right_table_name =
-                            if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                                Some(table_name.as_str())
-                            } else {
-                                None
-                            };
-
-                        let left_map = row_vec_to_map(left_vec, left_cols, left_table_name);
-                        let right_map = row_vec_to_map(right_vec, right_cols, right_table_name);
-                        left_map.into_iter().chain(right_map).collect()
-                    } else if let PhysicalPlan::Sort {
-                        input: sort_input, ..
-                    } = &**input
-                    {
-                        if let PhysicalPlan::HashJoin { left, right, .. }
-                        | PhysicalPlan::NestedLoopJoin { left, right, .. } = &**sort_input
-                        {
-                            fn get_child_schema(
-                                plan: &PhysicalPlan,
-                                bpm: &Arc<BufferPoolManager>,
-                                tx_id: u32,
-                                snapshot: &Snapshot,
-                            ) -> Result<Vec<Column>, ExecutionError> {
-                                if let PhysicalPlan::TableScan { table_name, .. } = plan {
-                                    let (oid, _) = find_table(table_name, bpm, tx_id, snapshot)?
-                                        .ok_or_else(|| {
-                                            ExecutionError::TableNotFound(table_name.clone())
-                                        })?;
-                                    get_table_schema(bpm, oid, tx_id, snapshot)
-                                } else {
-                                    Ok(vec![])
-                                }
-                            }
-
-                            let left_schema = get_child_schema(left, bpm, tx_id, snapshot)?;
-                            let left_col_count = left_schema.len();
-
-                            let (left_cols, right_cols) =
-                                input_result.columns.split_at(left_col_count);
-                            let (left_vec, right_vec) = row_vec.split_at(left_col_count);
-
-                            let left_table_name =
-                                if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                                    Some(table_name.as_str())
-                                } else {
-                                    None
-                                };
-                            let right_table_name =
-                                if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                                    Some(table_name.as_str())
-                                } else {
-                                    None
-                                };
-
-                            let left_map = row_vec_to_map(left_vec, left_cols, left_table_name);
-                            let right_map = row_vec_to_map(right_vec, right_cols, right_table_name);
-                            left_map.into_iter().chain(right_map).collect()
-                        } else {
-                            let table_name =
-                                if let PhysicalPlan::TableScan { table_name, .. } = &**sort_input {
-                                    Some(table_name.as_str())
-                                } else {
-                                    None
-                                };
-                            row_vec_to_map(&row_vec, &input_result.columns, table_name)
-                        }
-                    } else {
-                        let table_name =
-                            if let PhysicalPlan::TableScan { table_name, .. } = &**input {
-                                Some(table_name.as_str())
-                            } else {
-                                None
-                            };
-                        row_vec_to_map(&row_vec, &input_result.columns, table_name)
-                    };
-
-                let mut projected_row = Vec::new();
-                for item in expressions {
-                    if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } =
-                        item
-                    {
-                        let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
-                        projected_row.push(val.to_string());
-                    }
-                }
-                projected_rows.push(projected_row);
-            }
-
-            Ok(ResultSet {
-                columns: projected_columns,
-                rows: projected_rows,
-            })
         }
-        PhysicalPlan::Sort { input, order_by } => {
-            let mut input_result =
-                execute_physical_plan(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+        Self {
+            input,
+            expressions,
+            projected_schema,
+        }
+    }
+}
 
-            // For simplicity, we only support sorting by a single column expression for now.
-            if order_by.len() != 1 {
-                return Err(ExecutionError::GenericError(
-                    "ORDER BY only supports a single column".to_string(),
-                ));
+impl<'a> Executor for ProjectionExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.projected_schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        let next_row = self.input.next()?;
+        if next_row.is_none() {
+            return Ok(None);
+        }
+        let row = next_row.unwrap();
+
+        if self
+            .expressions
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+        {
+            return Ok(Some(row));
+        }
+
+        let mut row_map = HashMap::new();
+        if self.input.schema().len() == row.len() {
+            row_map = row_vec_to_map(&row, self.input.schema(), None);
+        } else {
+            // This is a hack for joins. A proper solution would involve executors
+            // passing down table information.
+            let left_len = self.input.schema().iter().filter(|c| c.name.starts_with("users.")).count();
+            let (left_row, right_row) = row.split_at(left_len);
+            let (left_schema, right_schema) = self.input.schema().split_at(left_len);
+            row_map.extend(row_vec_to_map(left_row, left_schema, Some("users")));
+            row_map.extend(row_vec_to_map(right_row, right_schema, Some("orders")));
+        }
+        let mut projected_row = Vec::new();
+        for item in &self.expressions {
+            if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+                let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
+                projected_row.push(val.to_string());
             }
-            let sort_expr = &order_by[0];
+        }
+        Ok(Some(projected_row))
+    }
+}
 
-            // Find the index and type of the sort key column
-            let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
-                input_result
-                    .columns
-                    .iter()
-                    .position(|c| &c.name == name)
-                    .map(|i| (i, input_result.columns[i].type_id))
-                    .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
+// NestedLoopJoinExecutor
+struct NestedLoopJoinExecutor<'a> {
+    left: Box<dyn Executor + 'a>,
+    right: Box<dyn Executor + 'a>,
+    condition: Expression,
+    joined_schema: Vec<Column>,
+    left_row: Option<Row>,
+    right_rows: Vec<Row>,
+    right_cursor: usize,
+    left_table_name: Option<String>,
+    right_table_name: Option<String>,
+}
+
+impl<'a> NestedLoopJoinExecutor<'a> {
+    fn new(
+        mut left: Box<dyn Executor + 'a>,
+        mut right: Box<dyn Executor + 'a>,
+        condition: Expression,
+        left_table_name: Option<String>,
+        right_table_name: Option<String>,
+    ) -> Self {
+        let mut joined_schema = Vec::new();
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        if let Some(table_name) = &left_table_name {
+            for col in left_schema {
+                joined_schema.push(Column {
+                    name: format!("{}.{}", table_name, col.name),
+                    type_id: col.type_id,
+                });
+            }
+        } else {
+            joined_schema.extend_from_slice(left_schema);
+        }
+        if let Some(table_name) = &right_table_name {
+            for col in right_schema {
+                joined_schema.push(Column {
+                    name: format!("{}.{}", table_name, col.name),
+                    type_id: col.type_id,
+                });
+            }
+        } else {
+            joined_schema.extend_from_slice(right_schema);
+        }
+
+        // Materialize the right side
+        let mut right_rows = Vec::new();
+        while let Ok(Some(row)) = right.next() {
+            right_rows.push(row);
+        }
+
+        let left_row = left.next().unwrap_or(None);
+
+        Self {
+            left,
+            right,
+            condition,
+            joined_schema,
+            left_row,
+            right_rows,
+            right_cursor: 0,
+            left_table_name,
+            right_table_name,
+        }
+    }
+}
+
+impl<'a> Executor for NestedLoopJoinExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.joined_schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        loop {
+            if self.left_row.is_none() {
+                return Ok(None);
+            }
+
+            while self.right_cursor < self.right_rows.len() {
+                let right_row = &self.right_rows[self.right_cursor];
+                self.right_cursor += 1;
+
+                let left_row = self.left_row.as_ref().unwrap();
+                let left_map = row_vec_to_map(
+                    left_row,
+                    self.left.schema(),
+                    self.left_table_name.as_deref(),
+                );
+                let right_map = row_vec_to_map(
+                    right_row,
+                    self.right.schema(),
+                    self.right_table_name.as_deref(),
+                );
+                let combined_map: HashMap<String, LiteralValue> =
+                    left_map.into_iter().chain(right_map).collect();
+
+                if evaluate_expr_for_row(&self.condition, &combined_map)? {
+                    let mut joined_row = left_row.clone();
+                    joined_row.extend(right_row.clone());
+                    return Ok(Some(joined_row));
+                }
+            }
+
+            // Move to the next left row and reset the right cursor
+            self.left_row = self.left.next()?;
+            self.right_cursor = 0;
+        }
+    }
+}
+
+// HashJoinExecutor
+struct HashJoinExecutor<'a> {
+    left: Box<dyn Executor + 'a>,
+    left_key: Expression,
+    joined_schema: Vec<Column>,
+    hash_table: HashMap<LiteralValue, Vec<Row>>,
+    current_left_row: Option<Row>,
+    current_matches: Vec<Row>,
+    left_table_name: Option<String>,
+    right_table_name: Option<String>,
+}
+
+impl<'a> HashJoinExecutor<'a> {
+    fn new(
+        left: Box<dyn Executor + 'a>,
+        mut right: Box<dyn Executor + 'a>,
+        left_key: Expression,
+        right_key: Expression,
+        left_table_name: Option<String>,
+        right_table_name: Option<String>,
+    ) -> Result<Self, ExecutionError> {
+        let mut joined_schema = Vec::new();
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        if let Some(table_name) = &left_table_name {
+            for col in left_schema {
+                joined_schema.push(Column {
+                    name: format!("{}.{}", table_name, col.name),
+                    type_id: col.type_id,
+                });
+            }
+        } else {
+            joined_schema.extend_from_slice(left_schema);
+        }
+        if let Some(table_name) = &right_table_name {
+            for col in right_schema {
+                joined_schema.push(Column {
+                    name: format!("{}.{}", table_name, col.name),
+                    type_id: col.type_id,
+                });
+            }
+        } else {
+            joined_schema.extend_from_slice(right_schema);
+        }
+
+        // Build phase
+        let mut hash_table: HashMap<LiteralValue, Vec<Row>> = HashMap::new();
+        while let Some(row) = right.next()? {
+            let row_map = row_vec_to_map(&row, right.schema(), right_table_name.as_deref());
+            let key = evaluate_expr_for_row_to_val(&right_key, &row_map)?;
+            hash_table.entry(key).or_default().push(row);
+        }
+
+        Ok(Self {
+            left,
+            left_key,
+            joined_schema,
+            hash_table,
+            current_left_row: None,
+            current_matches: Vec::new(),
+            left_table_name,
+            right_table_name,
+        })
+    }
+}
+
+impl<'a> Executor for HashJoinExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.joined_schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        loop {
+            // If we have matches for the current left row, return one
+            if let Some(match_row) = self.current_matches.pop() {
+                let mut joined_row = self.current_left_row.as_ref().unwrap().clone();
+                joined_row.extend(match_row);
+                return Ok(Some(joined_row));
+            }
+
+            // Otherwise, get the next left row and find matches
+            let left_row = self.left.next()?;
+            if left_row.is_none() {
+                return Ok(None); // Left side is exhausted
+            }
+            self.current_left_row = left_row;
+            let left_row_ref = self.current_left_row.as_ref().unwrap();
+
+            let left_map = row_vec_to_map(
+                left_row_ref,
+                self.left.schema(),
+                self.left_table_name.as_deref(),
+            );
+            let key = evaluate_expr_for_row_to_val(&self.left_key, &left_map)?;
+
+            if let Some(matching_rows) = self.hash_table.get(&key) {
+                self.current_matches = matching_rows.clone();
+                self.current_matches.reverse(); // To pop from the back
             } else {
-                return Err(ExecutionError::GenericError(
-                    "ORDER BY only supports column names".to_string(),
-                ));
-            };
-
-            // Sort the rows
-            input_result.rows.sort_by(|a, b| {
-                let val_a = &a[sort_col_idx];
-                let val_b = &b[sort_col_idx];
-                match sort_col_type {
-                    23 => {
-                        // INT
-                        let num_a = val_a.parse::<i32>().unwrap_or(0);
-                        let num_b = val_b.parse::<i32>().unwrap_or(0);
-                        num_a.cmp(&num_b)
-                    }
-                    25 => val_a.cmp(val_b), // TEXT
-                    1082 => {
-                        // DATE
-                        let date_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d").unwrap();
-                        let date_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d").unwrap();
-                        date_a.cmp(&date_b)
-                    }
-                    16 => {
-                        // BOOL
-                        let bool_a = val_a == "t";
-                        let bool_b = val_b == "t";
-                        bool_a.cmp(&bool_b)
-                    }
-                    _ => std::cmp::Ordering::Equal,
-                }
-            });
-
-            Ok(input_result)
+                self.current_matches.clear();
+            }
         }
+    }
+}
+
+// SortExecutor
+struct SortExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    order_by: Vec<Expression>,
+    sorted_rows: Vec<Row>,
+    cursor: usize,
+}
+
+impl<'a> SortExecutor<'a> {
+    fn new(mut input: Box<dyn Executor + 'a>, order_by: Vec<Expression>) -> Result<Self, ExecutionError> {
+        let mut rows = Vec::new();
+        while let Some(row) = input.next()? {
+            rows.push(row);
+        }
+
+        if order_by.len() != 1 {
+            return Err(ExecutionError::GenericError(
+                "ORDER BY only supports a single column".to_string(),
+            ));
+        }
+        let sort_expr = &order_by[0];
+
+        let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
+            input
+                .schema()
+                .iter()
+                .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
+                .map(|i| (i, input.schema()[i].type_id))
+                .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
+        } else {
+            return Err(ExecutionError::GenericError(
+                "ORDER BY only supports column names".to_string(),
+            ));
+        };
+
+        rows.sort_by(|a, b| {
+            let val_a = &a[sort_col_idx];
+            let val_b = &b[sort_col_idx];
+            match sort_col_type {
+                23 => {
+                    let num_a = val_a.parse::<i32>().unwrap_or(0);
+                    let num_b = val_b.parse::<i32>().unwrap_or(0);
+                    num_a.cmp(&num_b)
+                }
+                25 => val_a.cmp(val_b),
+                1082 => {
+                    let date_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d").unwrap();
+                    let date_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d").unwrap();
+                    date_a.cmp(&date_b)
+                }
+                16 => {
+                    let bool_a = val_a == "t";
+                    let bool_b = val_b == "t";
+                    bool_a.cmp(&bool_b)
+                }
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        Ok(Self {
+            input,
+            order_by,
+            sorted_rows: rows,
+            cursor: 0,
+        })
+    }
+}
+
+impl<'a> Executor for SortExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        self.input.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        if self.cursor >= self.sorted_rows.len() {
+            return Ok(None);
+        }
+        let row = self.sorted_rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(row))
     }
 }
 
@@ -1155,10 +1399,33 @@ fn evaluate_expr_for_row_to_val<'a>(
 ) -> Result<LiteralValue, ExecutionError> {
     match expr {
         Expression::Literal(lit) => Ok(lit.clone()),
-        Expression::Column(name) => row
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone())),
+        Expression::Column(name) => {
+            // Try direct match first
+            if let Some(val) = row.get(name) {
+                return Ok(val.clone());
+            }
+            // Try to find an unambiguous qualified match
+            let mut found: Option<LiteralValue> = None;
+            let mut ambiguous = false;
+            for (key, val) in row.iter() {
+                if key.ends_with(&format!(".{}", name)) {
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    found = Some(val.clone());
+                }
+            }
+
+            if ambiguous {
+                return Err(ExecutionError::GenericError(format!(
+                    "Column {} is ambiguous",
+                    name
+                )));
+            }
+
+            found.ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))
+        }
         Expression::QualifiedColumn(table, col) => {
             let qname = format!("{}.{}", table, col);
             row.get(&qname)

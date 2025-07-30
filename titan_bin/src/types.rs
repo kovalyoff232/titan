@@ -12,6 +12,7 @@ pub struct ResultSet {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<String>>,
 }
+pub type Row = Vec<String>;
 
 #[derive(Clone, Debug)]
 pub struct Column {

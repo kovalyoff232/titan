@@ -6,7 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 /// A Log Sequence Number.
 pub type Lsn = u64;
@@ -70,8 +73,7 @@ pub enum WalRecord {
         tx_id: u32,
         page_id: PageId,
         item_id: u16,
-        // The LSN of the next record to undo for this transaction.
-        // This allows us to chain the undo operations together.
+
         undo_next_lsn: Lsn,
     },
 }
@@ -95,8 +97,10 @@ impl WalRecord {
 
 /// The WAL manager.
 pub struct WalManager {
-    file: File,
+    file: Arc<Mutex<File>>,
     next_lsn: AtomicU64,
+    sync_thread_handle: Option<thread::JoinHandle<()>>,
+    stop_sync_thread: Arc<AtomicBool>,
 }
 
 impl WalManager {
@@ -110,8 +114,26 @@ impl WalManager {
 
         let file_len = file.metadata()?.len();
         let next_lsn = AtomicU64::new(file_len);
+        let file_arc = Arc::new(Mutex::new(file));
+        let stop_sync_thread = Arc::new(AtomicBool::new(false));
 
-        Ok(Self { file, next_lsn })
+        let file_clone = file_arc.clone();
+        let stop_clone = stop_sync_thread.clone();
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+                if let Ok(mut file) = file_clone.lock() {
+                    let _ = file.sync_all();
+                }
+            }
+        });
+
+        Ok(Self {
+            file: file_arc,
+            next_lsn,
+            sync_thread_handle: Some(handle),
+            stop_sync_thread,
+        })
     }
 
     /// Logs a record to the WAL and returns the LSN of the record.
@@ -138,11 +160,11 @@ impl WalManager {
             crc,
         };
 
-        self.file.write_all(unsafe {
+        let mut file = self.file.lock().unwrap();
+        file.write_all(unsafe {
             std::slice::from_raw_parts(&header as *const _ as *const u8, header_len as usize)
         })?;
-        self.file.write_all(&record_bytes)?;
-        self.file.sync_all()?;
+        file.write_all(&record_bytes)?;
 
         Ok(lsn)
     }
@@ -320,17 +342,17 @@ impl WalManager {
         if lsn == 0 {
             return Ok((None, 0));
         }
-        self.file.seek(SeekFrom::Start(lsn))?;
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(lsn))?;
         let mut header_buf = [0u8; std::mem::size_of::<WalRecordHeader>()];
-        if self.file.read_exact(&mut header_buf).is_err() {
-            // This can happen if we are at the end of the file or the file is corrupted.
+        if file.read_exact(&mut header_buf).is_err() {
             return Ok((None, 0));
         }
         let header: WalRecordHeader = unsafe { std::mem::transmute(header_buf) };
 
         let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
         let mut record_buf = vec![0; record_len];
-        self.file.read_exact(&mut record_buf)?;
+        file.read_exact(&mut record_buf)?;
 
         // TODO: CRC check
 
@@ -357,8 +379,7 @@ impl WalManager {
         let mut active_tx_table: HashMap<u32, Lsn> = HashMap::new();
         let mut dirty_page_table: HashMap<PageId, Lsn> = HashMap::new();
 
-        // --- 1. Analysis Phase ---
-        // Scan WAL from beginning to end.
+
         let mut current_pos = 0;
         while current_pos < buf.len() {
             let header_slice =
@@ -376,14 +397,14 @@ impl WalManager {
             let record_buf = &buf[record_start..record_end];
 
             if let Some(record) = Self::deserialize_record(record_buf) {
-                // Add transaction to ATT if not present
+              
                 if record.tx_id() != 0 && !active_tx_table.contains_key(&record.tx_id()) {
                     active_tx_table.insert(record.tx_id(), current_pos as Lsn);
                 }
 
                 match record {
                     WalRecord::Commit { tx_id } | WalRecord::Abort { tx_id } => {
-                        // Remove from ATT on commit/abort
+                        
                         active_tx_table.remove(&tx_id);
                     }
                     WalRecord::InsertTuple { page_id, .. }
@@ -391,7 +412,7 @@ impl WalManager {
                     | WalRecord::UpdateTuple { page_id, .. }
                     | WalRecord::BTreePage { page_id, .. }
                     | WalRecord::SetNextPageId { page_id, .. } => {
-                        // Add page to DPT if not present
+                        
                         dirty_page_table
                             .entry(page_id)
                             .or_insert(current_pos as Lsn);
@@ -402,8 +423,7 @@ impl WalManager {
             current_pos += header.total_len as usize;
         }
 
-        // --- 2. Redo Phase ---
-        // Re-apply all changes for dirty pages since the earliest modification.
+       
         let redo_start_lsn = dirty_page_table.values().min().cloned().unwrap_or(0);
         current_pos = redo_start_lsn as usize;
 
@@ -430,18 +450,15 @@ impl WalManager {
                     pager.write_page(&page)?;
                 }
             } else {
-                // For other record types, a more detailed redo logic would be needed.
-                // For now, we assume BTreePage is the most critical for structural integrity.
+               
             }
             current_pos += header.total_len as usize;
         }
 
-        // --- 3. Undo Phase ---
-        // For all transactions that were active at the end of the analysis (loser transactions),
-        // undo their changes from last to first.
+      
         let to_undo: HashSet<u32> = active_tx_table.keys().cloned().collect();
 
-        // We need to find the maximum LSN among all loser transactions to start the undo scan.
+     
         let mut max_lsn = 0;
         for tx_id in &to_undo {
             if let Some(lsn) = active_tx_table.get(tx_id) {
@@ -467,14 +484,11 @@ impl WalManager {
                 if let Some(WalRecord::UpdateTuple { page_id, .. }) =
                     Self::deserialize_record(record_buf)
                 {
-                    // Here we would generate a CompensationLogRecord (CLR) and write it to the WAL.
-                    // Then we would apply the actual UNDO operation.
-                    // This is a simplified version.
+                   
                     let page = pager.read_page(page_id)?;
-                    // We only undo if the change was actually applied.
+                   
                     if page.read_header().lsn >= current_pos as u64 {
-                        // In a real system, we'd get the tuple and restore it.
-                        // This is a placeholder for that logic.
+                       
                         println!(
                             "[RECOVERY-UNDO] Undoing update for tx {} on page {}",
                             header.tx_id, page_id
@@ -486,5 +500,18 @@ impl WalManager {
         }
 
         Ok(highest_tx_id)
+    }
+}
+
+impl Drop for WalManager {
+    fn drop(&mut self) {
+        self.stop_sync_thread.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.sync_thread_handle.take() {
+            handle.join().unwrap();
+        }
+        // Final sync on drop
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.sync_all();
+        }
     }
 }
