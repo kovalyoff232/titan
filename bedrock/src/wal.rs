@@ -2,6 +2,7 @@
 
 use crate::{pager::Pager, PageId};
 use crc32fast::Hasher;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -29,7 +30,7 @@ pub struct WalRecordHeader {
 }
 
 /// A single record in the WAL.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WalRecord {
     /// Indicates the commit of a transaction.
     Commit { tx_id: u32 },
@@ -138,8 +139,7 @@ impl WalManager {
 
     /// Logs a record to the WAL and returns the LSN of the record.
     pub fn log(&mut self, tx_id: u32, prev_lsn: Lsn, record: &WalRecord) -> io::Result<Lsn> {
-        let mut record_bytes = Vec::new();
-        self.serialize_record(record, &mut record_bytes);
+        let record_bytes = bincode::serialize(record).unwrap();
 
         let header_len = std::mem::size_of::<WalRecordHeader>() as u32;
         let total_len = header_len + record_bytes.len() as u32;
@@ -169,172 +169,9 @@ impl WalManager {
         Ok(lsn)
     }
 
-    /// Serializes a WAL record into a byte buffer.
-    fn serialize_record(&self, record: &WalRecord, buf: &mut Vec<u8>) {
-        match record {
-            WalRecord::Commit { tx_id } => {
-                buf.push(1);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-            }
-            WalRecord::Abort { tx_id } => {
-                buf.push(2);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-            }
-            WalRecord::InsertTuple {
-                tx_id,
-                page_id,
-                item_id,
-            } => {
-                buf.push(3);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&item_id.to_be_bytes());
-            }
-            WalRecord::DeleteTuple {
-                tx_id,
-                page_id,
-                item_id,
-            } => {
-                buf.push(4);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&item_id.to_be_bytes());
-            }
-            WalRecord::UpdateTuple {
-                tx_id,
-                page_id,
-                item_id,
-                old_data,
-            } => {
-                buf.push(5);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&item_id.to_be_bytes());
-                buf.extend_from_slice(&(old_data.len() as u32).to_be_bytes());
-                buf.extend_from_slice(old_data);
-            }
-            WalRecord::BTreePage {
-                tx_id,
-                page_id,
-                data,
-            } => {
-                buf.push(6);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                buf.extend_from_slice(data);
-            }
-            WalRecord::Checkpoint => buf.push(7),
-            WalRecord::SetNextPageId {
-                tx_id,
-                page_id,
-                next_page_id,
-            } => {
-                buf.push(8);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&next_page_id.to_be_bytes());
-            }
-            WalRecord::CompensationLogRecord {
-                tx_id,
-                page_id,
-                item_id,
-                undo_next_lsn,
-            } => {
-                buf.push(9);
-                buf.extend_from_slice(&tx_id.to_be_bytes());
-                buf.extend_from_slice(&page_id.to_be_bytes());
-                buf.extend_from_slice(&item_id.to_be_bytes());
-                buf.extend_from_slice(&undo_next_lsn.to_be_bytes());
-            }
-        }
-    }
-
     /// Deserializes a WAL record from a byte buffer.
     pub fn deserialize_record(buf: &[u8]) -> Option<WalRecord> {
-        if buf.is_empty() {
-            return None;
-        }
-        let record_type = buf[0];
-        let data = &buf[1..];
-        match record_type {
-            1 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                Some(WalRecord::Commit { tx_id })
-            }
-            2 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                Some(WalRecord::Abort { tx_id })
-            }
-            3 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
-                Some(WalRecord::InsertTuple {
-                    tx_id,
-                    page_id,
-                    item_id,
-                })
-            }
-            4 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
-                Some(WalRecord::DeleteTuple {
-                    tx_id,
-                    page_id,
-                    item_id,
-                })
-            }
-            5 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
-                let len = u32::from_be_bytes(data[10..14].try_into().ok()?) as usize;
-                let old_data = data[14..14 + len].to_vec();
-                Some(WalRecord::UpdateTuple {
-                    tx_id,
-                    page_id,
-                    item_id,
-                    old_data,
-                })
-            }
-            6 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let len = u32::from_be_bytes(data[8..12].try_into().ok()?) as usize;
-                let page_data = data[12..12 + len].to_vec();
-                Some(WalRecord::BTreePage {
-                    tx_id,
-                    page_id,
-                    data: page_data,
-                })
-            }
-            7 => Some(WalRecord::Checkpoint),
-            8 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let next_page_id = u32::from_be_bytes(data[8..12].try_into().ok()?);
-                Some(WalRecord::SetNextPageId {
-                    tx_id,
-                    page_id,
-                    next_page_id,
-                })
-            }
-            9 => {
-                let tx_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
-                let page_id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-                let item_id = u16::from_be_bytes(data[8..10].try_into().ok()?);
-                let undo_next_lsn = u64::from_be_bytes(data[10..18].try_into().ok()?);
-                Some(WalRecord::CompensationLogRecord {
-                    tx_id,
-                    page_id,
-                    item_id,
-                    undo_next_lsn,
-                })
-            }
-            _ => None,
-        }
+        bincode::deserialize(buf).ok()
     }
 
     /// Reads a WAL record from the given LSN.
