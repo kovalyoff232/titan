@@ -1167,113 +1167,57 @@ fn execute_insert(
 
     lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
 
-    let mut tuple_data = Vec::new();
-    for value in &stmt.values {
-        match value {
-            Expression::Literal(LiteralValue::Number(n)) => {
-                tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes())
-            }
-            Expression::Literal(LiteralValue::String(s)) => {
-                tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                tuple_data.extend_from_slice(s.as_bytes());
-            }
-            Expression::Literal(LiteralValue::Bool(b)) => tuple_data.push(if *b { 1 } else { 0 }),
-            Expression::Literal(LiteralValue::Date(s)) => {
-                let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                let days = date.signed_duration_since(epoch).num_days() as i32;
-                tuple_data.extend_from_slice(&days.to_be_bytes());
-            }
-            _ => {}
-        }
-    }
+    let tuple_data = serialize_expressions(&stmt.values)?;
 
-    if first_page_id == INVALID_PAGE_ID {
-        let new_page_guard = bpm.new_page()?;
-        first_page_id = new_page_guard.read().id;
-        let mut page = new_page_guard.write();
-        let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
-        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: first_page_id,
-                item_id,
-            },
-        )?;
-        tm.set_last_lsn(tx_id, lsn);
-        let mut header = page.read_header();
-        header.lsn = lsn;
-        page.write_header(&header);
-        update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
-        return Ok(1);
-    }
+    let page_id = find_or_create_page_for_insert(
+        bpm,
+        tm,
+        wm,
+        tx_id,
+        snapshot,
+        table_oid,
+        &mut first_page_id,
+        tuple_data.len(),
+    )?;
 
-    let mut current_page_id = first_page_id;
-    loop {
-        let page_guard = bpm.acquire_page(current_page_id)?;
-        let has_space = {
-            let page = page_guard.read();
-            let needed = tuple_data.len()
-                + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
-                + std::mem::size_of::<bedrock::page::ItemIdData>();
-            let header = page.read_header();
-            header
-                .upper_offset
-                .saturating_sub(header.lower_offset)
-                >= needed as u16
-        };
+    insert_tuple_and_update_indexes(
+        bpm,
+        tm,
+        wm,
+        tx_id,
+        snapshot,
+        system_catalog,
+        table_oid,
+        &mut first_page_id,
+        &tuple_data,
+    )?;
 
-        if has_space {
-            let mut page = page_guard.write();
-            let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: current_page_id,
-                    item_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            let mut header = page.read_header();
-            header.lsn = lsn;
-            page.write_header(&header);
-            return Ok(1);
-        }
+    Ok(1)
+}
 
-        let next_page_id = page_guard.read().read_header().next_page_id;
-        if next_page_id == INVALID_PAGE_ID {
-            let new_page_guard = bpm.new_page()?;
-            let new_page_id = new_page_guard.read().id;
-            let mut page = page_guard.write();
-            let mut header = page.read_header();
-            header.next_page_id = new_page_id;
-            page.write_header(&header);
-            let mut new_page = new_page_guard.write();
-            let item_id = new_page.add_tuple(&tuple_data, tx_id, 0).unwrap();
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: new_page_id,
-                    item_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            let mut header = new_page.read_header();
-            header.lsn = lsn;
-            new_page.write_header(&header);
-            return Ok(1);
-        }
-        current_page_id = next_page_id;
-    }
+fn insert_tuple_and_update_indexes(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    table_oid: u32,
+    first_page_id: &mut PageId,
+    tuple_data: &[u8],
+) -> Result<(), ExecutionError> {
+    let page_id = find_or_create_page_for_insert(
+        bpm,
+        tm,
+        wm,
+        tx_id,
+        snapshot,
+        table_oid,
+        first_page_id,
+        tuple_data.len(),
+    )?;
+
+    insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)
 }
 
 fn execute_update(
@@ -1344,27 +1288,7 @@ fn execute_update(
             );
         }
 
-        let mut new_data = Vec::new();
-        for col in &schema {
-            if let Some(val) = new_parsed.get(&col.name) {
-                match val {
-                    LiteralValue::Number(n) => {
-                        new_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes())
-                    }
-                    LiteralValue::String(s) => {
-                        new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                        new_data.extend_from_slice(s.as_bytes());
-                    }
-                    LiteralValue::Bool(b) => new_data.push(if *b { 1 } else { 0 }),
-                    LiteralValue::Date(s) => {
-                        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-                        let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                        let days = date.signed_duration_since(epoch).num_days() as i32;
-                        new_data.extend_from_slice(&days.to_be_bytes());
-                    }
-                }
-            }
-        }
+        let new_data = serialize_literal_map(&new_parsed, &schema)?;
 
         let old_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
         let item_id_data = page.get_item_id_data(item_id).unwrap();
@@ -1615,27 +1539,7 @@ fn execute_vacuum(
         let mut current_new_page_id = new_first_page_id;
 
         for tuple in live_tuples {
-            let mut tuple_data = Vec::new();
-            for col in &schema {
-                if let Some(val) = tuple.get(&col.name) {
-                    match val {
-                        LiteralValue::Number(n) => {
-                            tuple_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes())
-                        }
-                        LiteralValue::String(s) => {
-                            tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                            tuple_data.extend_from_slice(s.as_bytes());
-                        }
-                        LiteralValue::Bool(b) => tuple_data.push(if *b { 1 } else { 0 }),
-                        LiteralValue::Date(s) => {
-                            let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-                            let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                            let days = date.signed_duration_since(epoch).num_days() as i32;
-                            tuple_data.extend_from_slice(&days.to_be_bytes());
-                        }
-                    }
-                }
-            }
+            let tuple_data = serialize_literal_map(&tuple, &schema)?;
 
             let mut inserted = false;
             while !inserted {
@@ -1661,9 +1565,22 @@ fn execute_vacuum(
 
 use rand::thread_rng;
 
-
-
 fn execute_analyze(
+    table_name: &str,
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    lm: &Arc<LockManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
+) -> Result<(), ExecutionError> {
+    analyze_table_and_update_stats(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
+}
+
+/// Analyzes a table, computes statistics, and updates the system catalog.
+/// This function is a helper for `execute_analyze`.
+fn analyze_table_and_update_stats(
     table_name: &str,
     bpm: &Arc<BufferPoolManager>,
     tm: &Arc<TransactionManager>,
@@ -1906,94 +1823,18 @@ fn insert_tuple_into_system_table(
         .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
 
-    if first_page_id == INVALID_PAGE_ID {
-        let new_page_guard = bpm.new_page()?;
-        first_page_id = new_page_guard.read().id;
-        let mut page = new_page_guard.write();
-        let item_id = page.add_tuple(tuple_data, tx_id, 0).unwrap();
+    let page_id = find_or_create_page_for_insert(
+        bpm,
+        tm,
+        wm,
+        tx_id,
+        snapshot,
+        table_oid,
+        &mut first_page_id,
+        tuple_data.len(),
+    )?;
 
-        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
-            tx_id,
-            prev_lsn,
-            &WalRecord::InsertTuple {
-                tx_id,
-                page_id: first_page_id,
-                item_id,
-            },
-        )?;
-        tm.set_last_lsn(tx_id, lsn);
-        let mut header = page.read_header();
-        header.lsn = lsn;
-        page.write_header(&header);
-
-        update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, first_page_id)?;
-        return Ok(());
-    }
-
-    let mut current_page_id = first_page_id;
-    loop {
-        let page_guard = bpm.acquire_page(current_page_id)?;
-        let has_space = {
-            let page = page_guard.read();
-            let needed = tuple_data.len()
-                + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
-                + std::mem::size_of::<bedrock::page::ItemIdData>();
-            let header = page.read_header();
-            header
-                .upper_offset
-                .saturating_sub(header.lower_offset)
-                >= needed as u16
-        };
-
-        if has_space {
-            let mut page = page_guard.write();
-            let item_id = page.add_tuple(tuple_data, tx_id, 0).unwrap();
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: current_page_id,
-                    item_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            let mut header = page.read_header();
-            header.lsn = lsn;
-            page.write_header(&header);
-            return Ok(());
-        }
-
-        let next_page_id = page_guard.read().read_header().next_page_id;
-        if next_page_id == INVALID_PAGE_ID {
-            let new_page_guard = bpm.new_page()?;
-            let new_page_id = new_page_guard.read().id;
-            let mut page = page_guard.write();
-            let mut header = page.read_header();
-            header.next_page_id = new_page_id;
-            page.write_header(&header);
-            let mut new_page = new_page_guard.write();
-            let item_id = new_page.add_tuple(tuple_data, tx_id, 0).unwrap();
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::InsertTuple {
-                    tx_id,
-                    page_id: new_page_id,
-                    item_id,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            let mut header = new_page.read_header();
-            header.lsn = lsn;
-            new_page.write_header(&header);
-            return Ok(());
-        }
-        current_page_id = next_page_id;
-    }
+    insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)
 }
 
 struct DeleteExecutor<'a> {
@@ -2324,4 +2165,145 @@ impl<'a> Executor for UpdateExecutor<'a> {
             }
         }
     }
+}
+
+// --- DML Helper Functions ---
+
+fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionError> {
+    let mut tuple_data = Vec::new();
+    for value in values {
+        match value {
+            Expression::Literal(LiteralValue::Number(n)) => {
+                tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes())
+            }
+            Expression::Literal(LiteralValue::String(s)) => {
+                tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                tuple_data.extend_from_slice(s.as_bytes());
+            }
+            Expression::Literal(LiteralValue::Bool(b)) => tuple_data.push(if *b { 1 } else { 0 }),
+            Expression::Literal(LiteralValue::Date(s)) => {
+                let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
+                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                let days = date.signed_duration_since(epoch).num_days() as i32;
+                tuple_data.extend_from_slice(&days.to_be_bytes());
+            }
+            _ => {
+                return Err(ExecutionError::GenericError(
+                    "Unsupported expression type for insert".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(tuple_data)
+}
+
+fn serialize_literal_map(
+    map: &HashMap<String, LiteralValue>,
+    schema: &[Column],
+) -> Result<Vec<u8>, ExecutionError> {
+    let mut new_data = Vec::new();
+    for col in schema {
+        if let Some(val) = map.get(&col.name) {
+            match val {
+                LiteralValue::Number(n) => {
+                    new_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes())
+                }
+                LiteralValue::String(s) => {
+                    new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                    new_data.extend_from_slice(s.as_bytes());
+                }
+                LiteralValue::Bool(b) => new_data.push(if *b { 1 } else { 0 }),
+                LiteralValue::Date(s) => {
+                    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
+                    let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+                    let days = date.signed_duration_since(epoch).num_days() as i32;
+                    new_data.extend_from_slice(&days.to_be_bytes());
+                }
+            }
+        }
+    }
+    Ok(new_data)
+}
+
+fn find_or_create_page_for_insert(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    table_oid: u32,
+    first_page_id: &mut PageId,
+    tuple_len: usize,
+) -> Result<PageId, ExecutionError> {
+    if *first_page_id == INVALID_PAGE_ID {
+        let new_page_guard = bpm.new_page()?;
+        *first_page_id = new_page_guard.read().id;
+        update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, *first_page_id)?;
+        return Ok(*first_page_id);
+    }
+
+    let mut current_page_id = *first_page_id;
+    loop {
+        let page_guard = bpm.acquire_page(current_page_id)?;
+        let has_space = {
+            let page = page_guard.read();
+            let needed = tuple_len
+                + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
+                + std::mem::size_of::<bedrock::page::ItemIdData>();
+            let header = page.read_header();
+            header
+                .upper_offset
+                .saturating_sub(header.lower_offset)
+                >= needed as u16
+        };
+
+        if has_space {
+            return Ok(current_page_id);
+        }
+
+        let next_page_id = page_guard.read().read_header().next_page_id;
+        if next_page_id == INVALID_PAGE_ID {
+            let new_page_guard = bpm.new_page()?;
+            let new_page_id = new_page_guard.read().id;
+            let mut page = page_guard.write();
+            let mut header = page.read_header();
+            header.next_page_id = new_page_id;
+            page.write_header(&header);
+            return Ok(new_page_id);
+        }
+        current_page_id = next_page_id;
+    }
+}
+
+fn insert_tuple_and_log(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    page_id: PageId,
+    tuple_data: &[u8],
+) -> Result<(), ExecutionError> {
+    let page_guard = bpm.acquire_page(page_id)?;
+    let mut page = page_guard.write();
+    let item_id = page
+        .add_tuple(tuple_data, tx_id, 0)
+        .ok_or_else(|| ExecutionError::GenericError("Failed to add tuple".to_string()))?;
+
+    let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+    let lsn = wm.lock().unwrap().log(
+        tx_id,
+        prev_lsn,
+        &WalRecord::InsertTuple {
+            tx_id,
+            page_id,
+            item_id,
+        },
+    )?;
+    tm.set_last_lsn(tx_id, lsn);
+    let mut header = page.read_header();
+    header.lsn = lsn;
+    page.write_header(&header);
+    Ok(())
 }
