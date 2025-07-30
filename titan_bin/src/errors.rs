@@ -9,6 +9,7 @@ pub enum ExecutionError {
     Deadlock,
     SerializationFailure,
     PlanningError(String),
+    ParsingError(String),
 }
 
 impl From<std::io::Error> for ExecutionError {

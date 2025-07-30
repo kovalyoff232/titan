@@ -141,10 +141,7 @@ pub fn execute(
     match stmt {
         Statement::Select(select_stmt) => {
             let logical_plan =
-                planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot, system_catalog)
-                    .map_err(|_| {
-                        ExecutionError::PlanningError("Failed to create logical plan".to_string())
-                    })?;
+                planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot, system_catalog)?;
             let physical_plan =
                 optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)
                     .map_err(|_| {

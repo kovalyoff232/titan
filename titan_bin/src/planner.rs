@@ -2,6 +2,7 @@
 //!
 //! This module is responsible for converting the AST from the parser into a logical plan.
 
+use crate::errors::ExecutionError;
 use crate::executor;
 use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use bedrock::buffer_pool::BufferPoolManager;
@@ -39,21 +40,19 @@ pub fn create_logical_plan(
     tx_id: u32,
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
-) -> Result<LogicalPlan, ()> {
+) -> Result<LogicalPlan, ExecutionError> {
     // For now, we only support a single table or a single JOIN clause.
     let from_plan = match &stmt.from[0] {
         TableReference::Table { name } => {
             let (table_oid, first_page_id) = system_catalog
                 .lock()
-                .unwrap()
-                .find_table(name, bpm, tx_id, snapshot)
-                .unwrap()
-                .unwrap();
+                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
+                .find_table(name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(name.clone()))?;
             let schema = system_catalog
                 .lock()
-                .unwrap()
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)
-                .unwrap();
+                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
             let all_rows = executor::scan_table(
                 bpm,
                 &Arc::new(Default::default()),
@@ -62,8 +61,7 @@ pub fn create_logical_plan(
                 tx_id,
                 snapshot,
                 false,
-            )
-            .unwrap();
+            )?;
             LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
@@ -109,20 +107,18 @@ fn build_plan_from_table_ref(
     tx_id: u32,
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
-) -> Result<LogicalPlan, ()> {
+) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
         TableReference::Table { name } => {
             let (table_oid, first_page_id) = system_catalog
                 .lock()
-                .unwrap()
-                .find_table(name, bpm, tx_id, snapshot)
-                .unwrap()
-                .unwrap();
+                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
+                .find_table(name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(name.clone()))?;
             let schema = system_catalog
                 .lock()
-                .unwrap()
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)
-                .unwrap();
+                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
             let all_rows = executor::scan_table(
                 bpm,
                 &Arc::new(Default::default()),
@@ -131,8 +127,7 @@ fn build_plan_from_table_ref(
                 tx_id,
                 snapshot,
                 false,
-            )
-            .unwrap();
+            )?;
             Ok(LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
@@ -140,6 +135,8 @@ fn build_plan_from_table_ref(
                 total_rows: all_rows.len(),
             })
         }
-        _ => Err(()), // Nested joins not supported yet
+        _ => Err(ExecutionError::PlanningError(
+            "Nested joins not supported yet".to_string(),
+        )),
     }
 }

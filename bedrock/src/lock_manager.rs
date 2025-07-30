@@ -2,6 +2,7 @@
 
 use crate::page::TransactionId;
 use crate::TupleId;
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -85,7 +86,7 @@ struct WaitQueue {
 #[derive(Debug, Default)]
 pub struct LockManager {
     /// A map from a resource to its lock queue.
-    table: Mutex<HashMap<LockableResource, Arc<WaitQueue>>>,
+    table: DashMap<LockableResource, Arc<WaitQueue>>,
     /// A map from a transaction to the transactions it is waiting for.
     waits_for: Mutex<HashMap<TransactionId, Vec<TransactionId>>>,
 }
@@ -110,10 +111,7 @@ impl LockManager {
         resource: LockableResource,
         mode: LockMode,
     ) -> Result<(), LockError> {
-        let wait_queue = {
-            let mut table = self.table.lock().unwrap();
-            table.entry(resource).or_default().clone()
-        };
+        let wait_queue = self.table.entry(resource).or_default().clone();
 
         let mut guard = wait_queue.queue.lock().unwrap();
 
@@ -262,13 +260,11 @@ impl LockManager {
 
     /// Releases all locks held by a transaction.
     pub fn unlock_all(&self, tx_id: TransactionId) {
-        let table = self.table.lock().unwrap();
-        let mut to_notify = Vec::new();
-
         // Also remove the transaction from the waits-for graph
         self.waits_for.lock().unwrap().remove(&tx_id);
 
-        for (resource, wait_queue) in table.iter() {
+        for entry in self.table.iter() {
+            let wait_queue = entry.value();
             let mut queue = wait_queue.queue.lock().unwrap();
             let mut changed = false;
             if queue.exclusive == Some(tx_id) {
@@ -281,16 +277,6 @@ impl LockManager {
             queue.queue.retain(|req| req.tx_id != tx_id);
 
             if changed {
-                to_notify.push(*resource);
-            }
-        }
-
-        // We must release the table lock before notifying
-        drop(table);
-
-        for resource in to_notify {
-            let table = self.table.lock().unwrap();
-            if let Some(wait_queue) = table.get(&resource) {
                 wait_queue.cvar.notify_all();
             }
         }
