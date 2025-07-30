@@ -118,6 +118,7 @@ fn handle_client(
     tm: Arc<TransactionManager>,
     lm: Arc<LockManager>,
     wal: Arc<Mutex<WalManager>>,
+    system_catalog: Arc<Mutex<catalog::SystemCatalog>>,
 ) -> io::Result<()> {
     println!(
         "[handle_client] New connection from: {}",
@@ -209,7 +210,16 @@ fn handle_client(
                         stmt, tx_id
                     );
                     let snapshot = tm.create_snapshot(tx_id);
-                    let result = executor::execute(&stmt, &bpm, &tm, &lm, &wal, tx_id, &snapshot);
+                    let result = executor::execute(
+                        &stmt,
+                        &bpm,
+                        &tm,
+                        &lm,
+                        &wal,
+                        &system_catalog,
+                        tx_id,
+                        &snapshot,
+                    );
 
                     // Handle transaction control statements explicitly
                     match &stmt {
@@ -353,10 +363,12 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
     let tm = Arc::new(TransactionManager::new(highest_tx_id + 1));
     let lm = Arc::new(LockManager::new());
     let wal = Arc::new(Mutex::new(WalManager::open(wal_path)?));
+    let system_catalog = Arc::new(Mutex::new(catalog::SystemCatalog::new()));
 
     if db_is_new {
         println!("[INIT] New database detected, initializing system tables.");
-        initialize_db(&bpm, &tm, &lm, &wal).expect("Failed to initialize database");
+        initialize_db(&bpm, &tm, &lm, &wal, &system_catalog)
+            .expect("Failed to initialize database");
         // *** THE CRITICAL FIX ***
         println!("[INIT] Flushing all pages to disk after initialization.");
         bpm.flush_all_pages()
@@ -374,9 +386,16 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
                 let tm_clone = Arc::clone(&tm);
                 let lm_clone = Arc::clone(&lm);
                 let wal_clone = Arc::clone(&wal);
+                let system_catalog_clone = Arc::clone(&system_catalog);
                 thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, bpm_clone, tm_clone, lm_clone, wal_clone)
-                    {
+                    if let Err(e) = handle_client(
+                        stream,
+                        bpm_clone,
+                        tm_clone,
+                        lm_clone,
+                        wal_clone,
+                        system_catalog_clone,
+                    ) {
                         println!("Error handling client: {}", e);
                     }
                 });
@@ -395,6 +414,7 @@ fn initialize_db(
     tm: &Arc<TransactionManager>,
     lm: &Arc<LockManager>,
     wal: &Arc<Mutex<WalManager>>,
+    system_catalog: &Arc<Mutex<catalog::SystemCatalog>>,
 ) -> Result<(), errors::ExecutionError> {
     println!("[initialize_db] Starting database initialization.");
     let tx_id = tm.begin();
@@ -421,6 +441,7 @@ fn initialize_db(
         tm,
         lm,
         wal,
+        system_catalog,
         tx_id,
         &snapshot,
     )?;
@@ -451,6 +472,7 @@ fn initialize_db(
         tm,
         lm,
         wal,
+        system_catalog,
         tx_id,
         &snapshot,
     )?;
@@ -504,6 +526,7 @@ fn initialize_db(
         tm,
         lm,
         wal,
+        system_catalog,
         tx_id,
         &snapshot,
     )?;

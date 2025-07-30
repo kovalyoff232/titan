@@ -2,12 +2,12 @@
 //!
 //! This module is responsible for converting the AST from the parser into a logical plan.
 
-use crate::catalog;
 use crate::executor;
 use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot};
-use std::sync::Arc;
+use crate::catalog::SystemCatalog;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -38,14 +38,22 @@ pub fn create_logical_plan(
     bpm: &Arc<BufferPoolManager>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ()> {
     // For now, we only support a single table or a single JOIN clause.
     let from_plan = match &stmt.from[0] {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot)
+            let (table_oid, first_page_id) = system_catalog
+                .lock()
+                .unwrap()
+                .find_table(name, bpm, tx_id, snapshot)
                 .unwrap()
                 .unwrap();
-            let schema = catalog::get_table_schema(bpm, table_oid, tx_id, snapshot).unwrap();
+            let schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)
+                .unwrap();
             let all_rows = executor::scan_table(
                 bpm,
                 &Arc::new(Default::default()),
@@ -68,8 +76,8 @@ pub fn create_logical_plan(
             right,
             on_condition,
         } => {
-            let left_plan = build_plan_from_table_ref(left, bpm, tx_id, snapshot)?;
-            let right_plan = build_plan_from_table_ref(right, bpm, tx_id, snapshot)?;
+            let left_plan = build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
+            let right_plan = build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
             LogicalPlan::Join {
                 left: Box::new(left_plan),
                 right: Box::new(right_plan),
@@ -100,13 +108,21 @@ fn build_plan_from_table_ref(
     bpm: &Arc<BufferPoolManager>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ()> {
     match table_ref {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = catalog::find_table(name, bpm, tx_id, snapshot)
+            let (table_oid, first_page_id) = system_catalog
+                .lock()
+                .unwrap()
+                .find_table(name, bpm, tx_id, snapshot)
                 .unwrap()
                 .unwrap();
-            let schema = catalog::get_table_schema(bpm, table_oid, tx_id, snapshot).unwrap();
+            let schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)
+                .unwrap();
             let all_rows = executor::scan_table(
                 bpm,
                 &Arc::new(Default::default()),

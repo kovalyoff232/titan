@@ -5,8 +5,7 @@
 //! and expression evaluation.
 
 use crate::catalog::{
-    find_table, get_table_schema, update_pg_class_page_id, PG_ATTRIBUTE_TABLE_OID,
-    PG_CLASS_TABLE_OID,
+    update_pg_class_page_id, PG_ATTRIBUTE_TABLE_OID, PG_CLASS_TABLE_OID, SystemCatalog,
 };
 use crate::errors::ExecutionError;
 use crate::optimizer::{self, PhysicalPlan};
@@ -135,24 +134,34 @@ pub fn execute(
     tm: &Arc<TransactionManager>,
     lm: &Arc<LockManager>,
     wm: &Arc<Mutex<WalManager>>,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
     tx_id: u32,
     snapshot: &Snapshot,
 ) -> Result<ExecuteResult, ExecutionError> {
     match stmt {
         Statement::Select(select_stmt) => {
-            let logical_plan = planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot)
-                .map_err(|_| {
-                    ExecutionError::PlanningError("Failed to create logical plan".to_string())
-                })?;
-            let physical_plan = optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot)
-                .map_err(|_| {
-                    ExecutionError::PlanningError("Failed to create physical plan".to_string())
-                })?;
+            let logical_plan =
+                planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot, system_catalog)
+                    .map_err(|_| {
+                        ExecutionError::PlanningError("Failed to create logical plan".to_string())
+                    })?;
+            let physical_plan =
+                optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)
+                    .map_err(|_| {
+                        ExecutionError::PlanningError("Failed to create physical plan".to_string())
+                    })?;
 
             println!("[Executor] Physical Plan: {:?}", physical_plan);
 
-            let mut executor =
-                create_executor(&physical_plan, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let mut executor = create_executor(
+                &physical_plan,
+                bpm,
+                lm,
+                tx_id,
+                snapshot,
+                select_stmt,
+                system_catalog,
+            )?;
             let schema = executor.schema().clone();
             let mut rows = Vec::new();
             while let Some(row) = executor.next()? {
@@ -168,24 +177,76 @@ pub fn execute(
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
         }
         Statement::CreateIndex(create_stmt) => {
-            execute_create_index(create_stmt, bpm, tm, lm, wm, tx_id, snapshot)
-                .map(|_| ExecuteResult::Ddl)
+            execute_create_index(
+                create_stmt,
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            )
+            .map(|_| ExecuteResult::Ddl)
         }
-        Statement::Insert(insert_stmt) => {
-            execute_insert(insert_stmt, bpm, tm, lm, wm, tx_id, snapshot).map(ExecuteResult::Insert)
-        }
-        Statement::Update(update_stmt) => {
-            execute_update(update_stmt, bpm, tm, lm, wm, tx_id, snapshot).map(ExecuteResult::Update)
-        }
-        Statement::Delete(delete_stmt) => {
-            execute_delete(delete_stmt, bpm, tm, lm, wm, tx_id, snapshot).map(ExecuteResult::Delete)
-        }
+        Statement::Insert(insert_stmt) => execute_insert(
+            insert_stmt,
+            bpm,
+            tm,
+            lm,
+            wm,
+            tx_id,
+            snapshot,
+            system_catalog,
+        )
+        .map(ExecuteResult::Insert),
+        Statement::Update(update_stmt) => execute_update(
+            update_stmt,
+            bpm,
+            tm,
+            lm,
+            wm,
+            tx_id,
+            snapshot,
+            system_catalog,
+        )
+        .map(ExecuteResult::Update),
+        Statement::Delete(delete_stmt) => execute_delete(
+            delete_stmt,
+            bpm,
+            tm,
+            lm,
+            wm,
+            tx_id,
+            snapshot,
+            system_catalog,
+        )
+        .map(ExecuteResult::Delete),
         Statement::Vacuum(table_name) => {
-            execute_vacuum(table_name, bpm, tm, lm, wm, tx_id, snapshot).map(|_| ExecuteResult::Ddl)
+            execute_vacuum(
+                table_name,
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            )
+            .map(|_| ExecuteResult::Ddl)
         }
         Statement::Analyze(table_name) => {
-            execute_analyze(table_name, bpm, tm, lm, wm, tx_id, snapshot)
-                .map(|_| ExecuteResult::Ddl)
+            execute_analyze(
+                table_name,
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            )
+            .map(|_| ExecuteResult::Ddl)
         }
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Err(ExecutionError::GenericError(
@@ -203,13 +264,20 @@ fn create_executor<'a>(
     tx_id: u32,
     snapshot: &'a Snapshot,
     select_stmt: &'a SelectStatement,
+    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
 ) -> Result<Box<dyn Executor + 'a>, ExecutionError> {
     match plan {
         PhysicalPlan::TableScan { table_name, filter } => {
-            let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+            let (table_oid, first_page_id) = system_catalog
+                .lock()
+                .unwrap()
+                .find_table(table_name, bpm, tx_id, snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
-            let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-            Ok(Box::new(TableScanExecutor::new(
+            let schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            let scan_executor = Box::new(TableScanExecutor::new(
                 bpm,
                 lm,
                 first_page_id,
@@ -217,20 +285,37 @@ fn create_executor<'a>(
                 tx_id,
                 snapshot,
                 select_stmt.for_update,
-                filter.clone(),
-            )))
+                None, // Filter is handled by FilterExecutor
+            ));
+
+            if let Some(predicate) = filter {
+                Ok(Box::new(FilterExecutor::new(
+                    scan_executor,
+                    predicate.clone(),
+                )))
+            } else {
+                Ok(scan_executor)
+            }
         }
         PhysicalPlan::IndexScan {
             table_name, key, ..
         } => {
-            let (table_oid, _first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+            let (table_oid, _first_page_id) = system_catalog
+                .lock()
+                .unwrap()
+                .find_table(table_name, bpm, tx_id, snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
-            let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            let schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
 
             let index_name = "idx_id".to_string(); // Simplified
-            let (_index_oid, index_root_page_id) =
-                find_table(&index_name, bpm, tx_id, snapshot)?
-                    .ok_or(ExecutionError::TableNotFound(index_name))?;
+            let (_index_oid, index_root_page_id) = system_catalog
+                .lock()
+                .unwrap()
+                .find_table(&index_name, bpm, tx_id, snapshot)?
+                .ok_or(ExecutionError::TableNotFound(index_name))?;
 
             Ok(Box::new(IndexScanExecutor::new(
                 bpm,
@@ -242,7 +327,8 @@ fn create_executor<'a>(
             )))
         }
         PhysicalPlan::Filter { input, predicate } => {
-            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
             Ok(Box::new(FilterExecutor::new(
                 input_executor,
                 predicate.clone(),
@@ -253,8 +339,10 @@ fn create_executor<'a>(
             right,
             condition,
         } => {
-            let left_executor = create_executor(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let right_executor = create_executor(right, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let left_executor =
+                create_executor(left, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let right_executor =
+                create_executor(right, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
                 Some(table_name.clone())
             } else {
@@ -279,8 +367,10 @@ fn create_executor<'a>(
             left_key,
             right_key,
         } => {
-            let left_executor = create_executor(left, bpm, lm, tx_id, snapshot, select_stmt)?;
-            let right_executor = create_executor(right, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let left_executor =
+                create_executor(left, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let right_executor =
+                create_executor(right, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
                 Some(table_name.clone())
             } else {
@@ -301,14 +391,16 @@ fn create_executor<'a>(
             )?))
         }
         PhysicalPlan::Projection { input, expressions } => {
-            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
             Ok(Box::new(ProjectionExecutor::new(
                 input_executor,
                 expressions.clone(),
             )))
         }
         PhysicalPlan::Sort { input, order_by } => {
-            let input_executor = create_executor(input, bpm, lm, tx_id, snapshot, select_stmt)?;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
             Ok(Box::new(SortExecutor::new(
                 input_executor,
                 order_by.clone(),
@@ -978,8 +1070,12 @@ fn execute_create_index(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, table_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, table_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
     lm.lock(
@@ -1020,8 +1116,19 @@ fn execute_create_index(
     }
 
     if table_page_id != INVALID_PAGE_ID {
-        let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-        let rows_with_ids = scan_table(bpm, lm, table_page_id, &schema, tx_id, snapshot, false)?;
+        let schema = system_catalog
+            .lock()
+            .unwrap()
+            .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+        let rows_with_ids = scan_table(
+            bpm,
+            lm,
+            table_page_id,
+            &schema,
+            tx_id,
+            snapshot,
+            false,
+        )?;
         for (page_id, item_id, parsed_tuple) in rows_with_ids {
             if let Some(LiteralValue::Number(key_str)) = parsed_tuple.get(&stmt.column_name) {
                 if let Ok(key) = key_str.parse::<i32>() {
@@ -1053,8 +1160,12 @@ fn execute_insert(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, mut first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, mut first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
     lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
@@ -1176,16 +1287,31 @@ fn execute_update(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(0);
     }
 
-    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let all_rows = scan_table(
+        bpm,
+        lm,
+        first_page_id,
+        &schema,
+        tx_id,
+        snapshot,
+        false,
+    )?;
     let rows_to_update: Vec<_> = all_rows
         .into_iter()
         .filter(|(_, _, parsed)| {
@@ -1285,16 +1411,31 @@ fn execute_delete(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(0);
     }
 
-    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let all_rows = scan_table(
+        bpm,
+        lm,
+        first_page_id,
+        &schema,
+        tx_id,
+        snapshot,
+        false,
+    )?;
     let to_delete: Vec<_> = all_rows
         .into_iter()
         .filter(|(_, _, parsed)| {
@@ -1492,8 +1633,12 @@ fn execute_vacuum(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, old_first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+    let (table_oid, old_first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     lm.lock(
         tx_id,
@@ -1504,12 +1649,22 @@ fn execute_vacuum(
         return Ok(());
     }
 
-    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let live_tuples: Vec<_> =
-        scan_table(bpm, lm, old_first_page_id, &schema, tx_id, snapshot, false)?
-            .into_iter()
-            .map(|(_, _, parsed)| parsed)
-            .collect();
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let live_tuples: Vec<_> = scan_table(
+        bpm,
+        lm,
+        old_first_page_id,
+        &schema,
+        tx_id,
+        snapshot,
+        false,
+    )?
+    .into_iter()
+    .map(|(_, _, parsed)| parsed)
+    .collect();
 
     let mut new_first_page_id = INVALID_PAGE_ID;
     if !live_tuples.is_empty() {
@@ -1575,12 +1730,18 @@ fn execute_analyze(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
     const RESERVOIR_SIZE: usize = 1000;
     const MCV_LIST_SIZE: usize = 10;
     const HISTOGRAM_BINS: usize = 100;
 
-    let (table_oid, first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+    // Invalidate cache at the beginning of ANALYZE to get fresh data.
+
+    let (table_oid, first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(());
@@ -1588,32 +1749,75 @@ fn execute_analyze(
 
     lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
 
-    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let all_rows = scan_table(
+        bpm,
+        lm,
+        first_page_id,
+        &schema,
+        tx_id,
+        snapshot,
+        false,
+    )?;
     let total_rows = all_rows.len();
 
-    for (i, column) in schema.iter().enumerate() {
-        // --- Delete old statistics for this column ---
-        let delete_stmt = DeleteStatement {
-            table_name: "pg_statistic".to_string(),
-            where_clause: Some(Expression::Binary {
-                left: Box::new(Expression::Binary {
-                    left: Box::new(Expression::Column("starelid".to_string())),
-                    op: BinaryOperator::Eq,
-                    right: Box::new(Expression::Literal(LiteralValue::Number(
-                        table_oid.to_string(),
-                    ))),
-                }),
-                op: BinaryOperator::And,
-                right: Box::new(Expression::Binary {
-                    left: Box::new(Expression::Column("staattnum".to_string())),
-                    op: BinaryOperator::Eq,
-                    right: Box::new(Expression::Literal(LiteralValue::Number(i.to_string()))),
-                }),
-            }),
+    // Pre-fetch pg_statistic info to avoid re-fetching in the loop
+    let (pg_stat_oid, pg_stat_first_page_id) =
+        if let Some(info) = system_catalog
+            .lock()
+            .unwrap()
+            .find_table("pg_statistic", bpm, tx_id, snapshot)?
+        {
+            info
+        } else {
+            // This should not happen in a properly initialized database
+            return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
         };
-        execute_delete_internal(&delete_stmt, bpm, tm, lm, wm, tx_id, snapshot)?;
+    let pg_stat_schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
 
+    // --- Delete all old statistics for the entire table in one go ---
+    let mut current_page_id = pg_stat_first_page_id;
+    while current_page_id != bedrock::page::INVALID_PAGE_ID {
+        let page_guard = bpm.acquire_page(current_page_id)?;
+        let mut page = page_guard.write();
+        let mut modified = false;
+
+        for item_id in 0..page.get_tuple_count() {
+            if page.is_visible(snapshot, tx_id, item_id) {
+                if let Some(tuple_data) = page.get_tuple(item_id) {
+                    let parsed = parse_tuple(tuple_data, &pg_stat_schema);
+                    if let Some(relid_val) = parsed.get("starelid") {
+                        if relid_val.to_string() == table_oid.to_string() {
+                            // Match found, mark as deleted
+                            if let Some(item_id_data) = page.get_item_id_data(item_id) {
+                                let offset = item_id_data.offset;
+                                let mut header = page.read_tuple_header(offset);
+                                if header.xmax == 0 {
+                                    header.xmax = tx_id;
+                                    page.write_tuple_header(offset, &header);
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if modified {
+            // In a real system, we'd log this change to the WAL.
+        }
+        current_page_id = page.read_header().next_page_id;
+    }
+
+    // Invalidate again after deletion to ensure subsequent inserts see the clean state.
+
+    for (i, column) in schema.iter().enumerate() {
         let mut column_values: Vec<LiteralValue> = all_rows
             .iter()
             .filter_map(|(_, _, parsed_row)| parsed_row.get(&column.name).cloned())
@@ -1635,7 +1839,16 @@ fn execute_analyze(
         tuple_data.extend_from_slice(empty_text.as_bytes());
         tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes()); // stavalues
         tuple_data.extend_from_slice(empty_text.as_bytes());
-        insert_tuple_into_system_table(&tuple_data, "pg_statistic", bpm, tm, wm, tx_id, snapshot)?;
+        insert_tuple_into_system_table(
+            &tuple_data,
+            "pg_statistic",
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            snapshot,
+            system_catalog,
+        )?;
 
         if total_rows == 0 {
             continue;
@@ -1688,6 +1901,7 @@ fn execute_analyze(
                 wm,
                 tx_id,
                 snapshot,
+                system_catalog,
             )?;
         }
 
@@ -1725,6 +1939,7 @@ fn execute_analyze(
                 wm,
                 tx_id,
                 snapshot,
+                system_catalog,
             )?;
         }
     }
@@ -1742,8 +1957,12 @@ fn insert_tuple_into_system_table(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, mut first_page_id) = find_table(table_name, bpm, tx_id, snapshot)?
+    let (table_oid, mut first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
 
     if first_page_id == INVALID_PAGE_ID {
@@ -1844,16 +2063,31 @@ fn execute_delete_internal(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, first_page_id) = find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, first_page_id) = system_catalog
+        .lock()
+        .unwrap()
+        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(0);
     }
 
-    let schema = get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut rows_affected = 0;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let all_rows = scan_table(
+        bpm,
+        lm,
+        first_page_id,
+        &schema,
+        tx_id,
+        snapshot,
+        false,
+    )?;
     let to_delete: Vec<_> = all_rows
         .into_iter()
         .filter(|(_, _, parsed)| {

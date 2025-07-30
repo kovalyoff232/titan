@@ -122,7 +122,7 @@ impl WalManager {
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
-                if let Ok(mut file) = file_clone.lock() {
+                if let Ok(file) = file_clone.lock() {
                     let _ = file.sync_all();
                 }
             }
@@ -510,7 +510,7 @@ impl Drop for WalManager {
             handle.join().unwrap();
         }
         // Final sync on drop
-        if let Ok(mut file) = self.file.lock() {
+        if let Ok(file) = self.file.lock() {
             let _ = file.sync_all();
         }
     }
