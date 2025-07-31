@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -62,7 +62,10 @@ pub enum WalRecord {
         data: Vec<u8>,
     },
     /// A checkpoint record.
-    Checkpoint,
+    Checkpoint {
+        active_tx_table: HashMap<u32, Lsn>,
+        dirty_page_table: HashMap<PageId, Lsn>,
+    },
     /// Sets the next_page_id pointer of a page.
     SetNextPageId {
         tx_id: u32,
@@ -91,7 +94,7 @@ impl WalRecord {
             WalRecord::BTreePage { tx_id, .. } => *tx_id,
             WalRecord::SetNextPageId { tx_id, .. } => *tx_id,
             WalRecord::CompensationLogRecord { tx_id, .. } => *tx_id,
-            WalRecord::Checkpoint => 0, // Checkpoints don't belong to a tx
+            WalRecord::Checkpoint { .. } => 0, // Checkpoints don't belong to a tx
         }
     }
 }
@@ -99,7 +102,9 @@ impl WalRecord {
 /// The WAL manager.
 pub struct WalManager {
     file: Arc<Mutex<File>>,
+    path: PathBuf,
     next_lsn: AtomicU64,
+    last_checkpoint_lsn: AtomicU64,
     sync_thread_handle: Option<thread::JoinHandle<()>>,
     stop_sync_thread: Arc<AtomicBool>,
 }
@@ -107,14 +112,16 @@ pub struct WalManager {
 impl WalManager {
     /// Opens the WAL file and initializes the manager.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
             .create(true)
             .write(true)
-            .open(path)?;
+            .open(&path_buf)?;
 
         let file_len = file.metadata()?.len();
         let next_lsn = AtomicU64::new(file_len);
+        let last_checkpoint_lsn = AtomicU64::new(0);
         let file_arc = Arc::new(Mutex::new(file));
         let stop_sync_thread = Arc::new(AtomicBool::new(false));
 
@@ -131,7 +138,9 @@ impl WalManager {
 
         Ok(Self {
             file: file_arc,
+            path: path_buf,
             next_lsn,
+            last_checkpoint_lsn,
             sync_thread_handle: Some(handle),
             stop_sync_thread,
         })
@@ -203,6 +212,50 @@ impl WalManager {
 
         Ok((Self::deserialize_record(&record_buf), header.prev_lsn))
     }
+ 
+    pub fn checkpoint(
+        &mut self,
+        active_tx_table: HashMap<u32, Lsn>,
+        dirty_page_table: HashMap<PageId, Lsn>,
+    ) -> io::Result<()> {
+        let checkpoint_record = WalRecord::Checkpoint {
+            active_tx_table,
+            dirty_page_table,
+        };
+        let lsn = self.log(0, 0, &checkpoint_record)?;
+        self.last_checkpoint_lsn.store(lsn, Ordering::SeqCst);
+        self.truncate_wal()
+    }
+
+    fn truncate_wal(&mut self) -> io::Result<()> {
+        let last_checkpoint_lsn = self.last_checkpoint_lsn.load(Ordering::SeqCst);
+        if last_checkpoint_lsn == 0 {
+            return Ok(());
+        }
+
+        let mut file = self.file.lock().unwrap();
+        let file_len = file.metadata()?.len();
+
+        if last_checkpoint_lsn < file_len {
+            let mut temp_path = self.path.clone();
+            temp_path.set_extension("tmp");
+            let mut temp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+
+            file.seek(SeekFrom::Start(last_checkpoint_lsn))?;
+            io::copy(&mut *file, &mut temp_file)?;
+
+            std::fs::rename(&temp_path, &self.path)?;
+            self.next_lsn
+                .store(file_len - last_checkpoint_lsn, Ordering::SeqCst);
+            self.last_checkpoint_lsn.store(0, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
 
     /// Recovers the database from the WAL using the ARIES algorithm.
     /// Returns the highest transaction ID found in the WAL.
@@ -223,9 +276,44 @@ impl WalManager {
         let mut highest_tx_id = 0;
         let mut active_tx_table: HashMap<u32, Lsn> = HashMap::new();
         let mut dirty_page_table: HashMap<PageId, Lsn> = HashMap::new();
+        let mut last_checkpoint_lsn = 0;
 
-
+        // Analysis pass: find the last checkpoint and build initial tables
         let mut current_pos = 0;
+        while current_pos < buf.len() {
+            let header_slice =
+                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
+            let header: WalRecordHeader =
+                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+
+            let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
+            let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
+            let record_end = record_start + record_len;
+            let record_buf = &buf[record_start..record_end];
+
+            if let Some(WalRecord::Checkpoint {
+                active_tx_table: att,
+                dirty_page_table: dpt,
+            }) = Self::deserialize_record(record_buf)
+            {
+                active_tx_table = att;
+                dirty_page_table = dpt;
+                last_checkpoint_lsn = current_pos as Lsn;
+            }
+            current_pos += header.total_len as usize;
+        }
+
+        // Start analysis from the last checkpoint
+        current_pos = last_checkpoint_lsn as usize;
+        // We need to skip the checkpoint record itself
+        if current_pos > 0 {
+            let header_slice =
+                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
+            let header: WalRecordHeader =
+                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+            current_pos += header.total_len as usize;
+        }
+
         while current_pos < buf.len() {
             let header_slice =
                 &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
@@ -241,15 +329,22 @@ impl WalManager {
             let record_end = record_start + record_len;
             let record_buf = &buf[record_start..record_end];
 
+            let mut hasher = Hasher::new();
+            hasher.update(record_buf);
+            if hasher.finalize() != header.crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL record CRC mismatch",
+                ));
+            }
+
             if let Some(record) = Self::deserialize_record(record_buf) {
-              
                 if record.tx_id() != 0 && !active_tx_table.contains_key(&record.tx_id()) {
                     active_tx_table.insert(record.tx_id(), current_pos as Lsn);
                 }
 
                 match record {
                     WalRecord::Commit { tx_id } | WalRecord::Abort { tx_id } => {
-                        
                         active_tx_table.remove(&tx_id);
                     }
                     WalRecord::InsertTuple { page_id, .. }
@@ -257,7 +352,6 @@ impl WalManager {
                     | WalRecord::UpdateTuple { page_id, .. }
                     | WalRecord::BTreePage { page_id, .. }
                     | WalRecord::SetNextPageId { page_id, .. } => {
-                        
                         dirty_page_table
                             .entry(page_id)
                             .or_insert(current_pos as Lsn);
@@ -282,9 +376,18 @@ impl WalManager {
             let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
             let record_end = record_start + record_len;
             let record_buf = &buf[record_start..record_end];
-
-            if let Some(WalRecord::BTreePage { page_id, data, .. }) =
-                Self::deserialize_record(record_buf)
+ 
+             let mut hasher = Hasher::new();
+             hasher.update(record_buf);
+             if hasher.finalize() != header.crc {
+                 return Err(io::Error::new(
+                     io::ErrorKind::InvalidData,
+                     "WAL record CRC mismatch",
+                 ));
+             }
+ 
+             if let Some(WalRecord::BTreePage { page_id, data, .. }) =
+                 Self::deserialize_record(record_buf)
             {
                 let mut page = pager.read_page(page_id)?;
                 if page.read_header().lsn < current_pos as u64 {
@@ -325,9 +428,18 @@ impl WalManager {
                 let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
                 let record_end = record_start + record_len;
                 let record_buf = &buf[record_start..record_end];
-
-                if let Some(WalRecord::UpdateTuple { page_id, .. }) =
-                    Self::deserialize_record(record_buf)
+ 
+                 let mut hasher = Hasher::new();
+                 hasher.update(record_buf);
+                 if hasher.finalize() != header.crc {
+                     return Err(io::Error::new(
+                         io::ErrorKind::InvalidData,
+                         "WAL record CRC mismatch",
+                     ));
+                 }
+ 
+                 if let Some(WalRecord::UpdateTuple { page_id, .. }) =
+                     Self::deserialize_record(record_buf)
                 {
                    
                     let page = pager.read_page(page_id)?;
