@@ -352,8 +352,11 @@ pub fn btree_delete(
         && root_page.btree_header().num_cells == 0
     {
         let new_root_id = *root_page.right_child();
-        // TODO: Deallocate the old root page
+        let old_root_id = root_page_id;
         root_page_id = new_root_id;
+        drop(root_page);
+        drop(root_page_guard);
+        bpm.delete_page(old_root_id)?;
     }
 
     Ok(root_page_id)
@@ -593,7 +596,7 @@ fn merge_pages(
 
     log_btree_page(ctx.tm, ctx.wm, ctx.tx_id, &left_page)?;
     log_btree_page(ctx.tm, ctx.wm, ctx.tx_id, ctx.parent_page)?;
-    // TODO: Deallocate the right page
+    ctx.bpm.delete_page(right_page_id)?;
     Ok(())
 }
 

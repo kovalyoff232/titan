@@ -101,6 +101,10 @@ impl Pager {
         );
         Ok(page_id)
     }
+
+    pub fn deallocate_page(&mut self, _page_id: PageId) {
+        // For now, we don't do anything. A more sophisticated pager would add this to a free list.
+    }
 }
 
 #[cfg(test)]

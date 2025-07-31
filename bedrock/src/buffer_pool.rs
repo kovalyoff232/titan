@@ -204,6 +204,18 @@ impl BufferPoolManager {
         Ok(())
     }
 
+    pub fn delete_page(&self, page_id: PageId) -> io::Result<()> {
+        if let Some(frame_index) = self.page_table.write().unwrap().remove(&page_id) {
+            let frame = &self.frames[frame_index];
+            *frame.is_dirty.lock().unwrap() = false;
+            *frame.pin_count.lock().unwrap() = 0;
+            *frame.recently_used.lock().unwrap() = false;
+            self.free_list.lock().unwrap().push(frame_index);
+        }
+        self.pager.lock().unwrap().deallocate_page(page_id);
+        Ok(())
+    }
+
     fn find_victim_frame(&self) -> Option<usize> {
         if let Some(frame_index) = self.free_list.lock().unwrap().pop() {
             return Some(frame_index);

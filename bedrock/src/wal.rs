@@ -110,7 +110,7 @@ impl WalManager {
         let file = OpenOptions::new()
             .read(true)
             .create(true)
-            .append(true)
+            .write(true)
             .open(path)?;
 
         let file_len = file.metadata()?.len();
@@ -147,9 +147,6 @@ impl WalManager {
         let lsn = self.next_lsn.fetch_add(total_len as u64, Ordering::SeqCst);
 
         let mut hasher = Hasher::new();
-        hasher.update(&total_len.to_be_bytes());
-        hasher.update(&tx_id.to_be_bytes());
-        hasher.update(&prev_lsn.to_be_bytes());
         hasher.update(&record_bytes);
         let crc = hasher.finalize();
 
@@ -161,6 +158,7 @@ impl WalManager {
         };
 
         let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(lsn))?;
         file.write_all(unsafe {
             std::slice::from_raw_parts(&header as *const _ as *const u8, header_len as usize)
         })?;
@@ -176,10 +174,11 @@ impl WalManager {
 
     /// Reads a WAL record from the given LSN.
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
-        if lsn == 0 {
+        let mut file = self.file.lock().unwrap();
+        if lsn >= file.metadata()?.len() {
             return Ok((None, 0));
         }
-        let mut file = self.file.lock().unwrap();
+
         file.seek(SeekFrom::Start(lsn))?;
         let mut header_buf = [0u8; std::mem::size_of::<WalRecordHeader>()];
         if file.read_exact(&mut header_buf).is_err() {
@@ -191,7 +190,16 @@ impl WalManager {
         let mut record_buf = vec![0; record_len];
         file.read_exact(&mut record_buf)?;
 
-        // TODO: CRC check
+        let mut hasher = Hasher::new();
+        hasher.update(&record_buf);
+        let crc = hasher.finalize();
+
+        if crc != header.crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL record CRC mismatch",
+            ));
+        }
 
         Ok((Self::deserialize_record(&record_buf), header.prev_lsn))
     }
