@@ -39,7 +39,7 @@ pub trait Executor {
 
 // --- Helper Functions ---
 
-fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, LiteralValue> {
+pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, LiteralValue> {
     let mut offset = 0;
     let mut parsed_tuple = HashMap::new();
 
@@ -1169,7 +1169,7 @@ fn execute_insert(
 
     let tuple_data = serialize_expressions(&stmt.values)?;
 
-    let page_id = find_or_create_page_for_insert(
+    let _page_id = find_or_create_page_for_insert(
         bpm,
         tm,
         wm,
@@ -1201,7 +1201,7 @@ fn insert_tuple_and_update_indexes(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    _system_catalog: &Arc<Mutex<SystemCatalog>>,
     table_oid: u32,
     first_page_id: &mut PageId,
     tuple_data: &[u8],
@@ -1457,12 +1457,14 @@ fn evaluate_expr_for_row_to_val<'a>(
                         BinaryOperator::Gt => Ok(LiteralValue::Bool(lnum > rnum)),
                         BinaryOperator::GtEq => Ok(LiteralValue::Bool(lnum >= rnum)),
                         BinaryOperator::And => Ok(LiteralValue::Bool(lnum != 0 && rnum != 0)),
+                        BinaryOperator::Or => Ok(LiteralValue::Bool(lnum != 0 || rnum != 0)),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => match op {
                     BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
                     BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
                     BinaryOperator::And => Ok(LiteralValue::Bool(l && r)),
+                    BinaryOperator::Or => Ok(LiteralValue::Bool(l || r)),
                     _ => Err(ExecutionError::GenericError(
                         "Unsupported operator for boolean".to_string(),
                     )),
@@ -1485,6 +1487,17 @@ fn evaluate_expr_for_row_to_val<'a>(
                 _ => Err(ExecutionError::GenericError(
                     "Type mismatch in binary expression".to_string(),
                 )),
+            }
+        }
+        Expression::Unary { op, expr } => {
+            let val = evaluate_expr_for_row_to_val(expr, row)?;
+            match op {
+                crate::parser::UnaryOperator::Not => match val {
+                    LiteralValue::Bool(b) => Ok(LiteralValue::Bool(!b)),
+                    _ => Err(ExecutionError::GenericError(
+                        "NOT operator requires a boolean expression".to_string(),
+                    )),
+                },
             }
         }
     }

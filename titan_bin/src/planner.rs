@@ -3,7 +3,6 @@
 //! This module is responsible for converting the AST from the parser into a logical plan.
 
 use crate::errors::ExecutionError;
-use crate::executor;
 use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot};
@@ -16,7 +15,6 @@ pub enum LogicalPlan {
         table_name: String,
         alias: Option<String>,
         filter: Option<Expression>,
-        total_rows: usize,
     },
     Projection {
         input: Box<LogicalPlan>,
@@ -44,29 +42,10 @@ pub fn create_logical_plan(
     // For now, we only support a single table or a single JOIN clause.
     let from_plan = match &stmt.from[0] {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = system_catalog
-                .lock()
-                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
-                .find_table(name, bpm, tx_id, snapshot)?
-                .ok_or_else(|| ExecutionError::TableNotFound(name.clone()))?;
-            let schema = system_catalog
-                .lock()
-                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-            let all_rows = executor::scan_table(
-                bpm,
-                &Arc::new(Default::default()),
-                first_page_id,
-                &schema,
-                tx_id,
-                snapshot,
-                false,
-            )?;
             LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
                 filter: stmt.where_clause.clone(),
-                total_rows: all_rows.len(),
             }
         }
         TableReference::Join {
@@ -110,29 +89,10 @@ fn build_plan_from_table_ref(
 ) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
         TableReference::Table { name } => {
-            let (table_oid, first_page_id) = system_catalog
-                .lock()
-                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
-                .find_table(name, bpm, tx_id, snapshot)?
-                .ok_or_else(|| ExecutionError::TableNotFound(name.clone()))?;
-            let schema = system_catalog
-                .lock()
-                .map_err(|e| ExecutionError::GenericError(e.to_string()))?
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-            let all_rows = executor::scan_table(
-                bpm,
-                &Arc::new(Default::default()),
-                first_page_id,
-                &schema,
-                tx_id,
-                snapshot,
-                false,
-            )?;
             Ok(LogicalPlan::Scan {
                 table_name: name.clone(),
                 alias: None,
                 filter: None,
-                total_rows: all_rows.len(),
             })
         }
         _ => Err(ExecutionError::PlanningError(

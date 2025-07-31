@@ -17,6 +17,7 @@ pub enum Statement {
     Commit,
     Rollback,
     DumpPage(u32),
+    Explain(Box<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -104,6 +105,10 @@ pub enum Expression {
         op: BinaryOperator,
         right: Box<Expression>,
     },
+    Unary {
+        op: UnaryOperator,
+        expr: Box<Expression>,
+    },
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
@@ -112,6 +117,11 @@ pub enum LiteralValue {
     String(String),
     Bool(bool),
     Date(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnaryOperator {
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -125,6 +135,7 @@ pub enum BinaryOperator {
     Gt,
     GtEq,
     And,
+    Or,
 }
 
 impl fmt::Display for Expression {
@@ -134,6 +145,7 @@ impl fmt::Display for Expression {
             Expression::Column(name) => write!(f, "{}", name),
             Expression::QualifiedColumn(table, col) => write!(f, "{}.{}", table, col),
             Expression::Binary { left, op, right } => write!(f, "({} {} {})", left, op, right),
+            Expression::Unary { op, expr } => write!(f, "({} {})", op, expr),
         }
     }
 }
@@ -145,6 +157,14 @@ impl fmt::Display for LiteralValue {
             LiteralValue::String(s) => write!(f, "{}", s),
             LiteralValue::Bool(b) => write!(f, "{}", b),
             LiteralValue::Date(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl fmt::Display for UnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnaryOperator::Not => write!(f, "NOT"),
         }
     }
 }
@@ -161,6 +181,7 @@ impl fmt::Display for BinaryOperator {
             BinaryOperator::Gt => write!(f, ">"),
             BinaryOperator::GtEq => write!(f, ">="),
             BinaryOperator::And => write!(f, "AND"),
+            BinaryOperator::Or => write!(f, "OR"),
         }
     }
 }
@@ -175,7 +196,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS"
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
-                | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" => {
+                | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" | "EXPLAIN" | "NOT" | "OR" => {
                     Err(Simple::custom(
                         span,
                         format!("keyword `{}` cannot be used as an identifier", ident),
@@ -225,9 +246,19 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         let atom = literal
             .or(qualified_column)
             .or(column)
-            .or(expr.delimited_by(just('(').padded(), just(')').padded()));
+            .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()));
 
-        let term = atom
+        let unary = text::keyword("NOT")
+            .padded()
+            .map(|_| UnaryOperator::Not)
+            .then(atom.clone())
+            .map(|(op, expr)| Expression::Unary {
+                op,
+                expr: Box::new(expr),
+            })
+            .or(atom);
+
+        let product = unary
             .clone()
             .then(
                 choice((
@@ -235,7 +266,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                     just('-').to(BinaryOperator::Minus),
                 ))
                 .padded()
-                .then(atom)
+                .then(unary)
                 .repeated(),
             )
             .foldl(|left, (op, right)| Expression::Binary {
@@ -244,7 +275,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 right: Box::new(right),
             });
 
-        let op = just("=")
+        let comparison_op = just("=")
             .to(BinaryOperator::Eq)
             .or(just("<>").to(BinaryOperator::NotEq))
             .or(just("<=").to(BinaryOperator::LtEq))
@@ -252,13 +283,46 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(just(">=").to(BinaryOperator::GtEq))
             .or(just(">").to(BinaryOperator::Gt));
 
-        term.clone()
-            .then(op.padded().then(term).repeated())
+        let comparison = product
+            .clone()
+            .then(comparison_op.padded().then(product).repeated())
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            })
+            });
+
+        let conjunction = comparison
+            .clone()
+            .then(
+                text::keyword("AND")
+                    .padded()
+                    .to(BinaryOperator::And)
+                    .then(comparison)
+                    .repeated(),
+            )
+            .foldl(|left, (op, right)| Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            });
+
+        let disjunction = conjunction
+            .clone()
+            .then(
+                text::keyword("OR")
+                    .padded()
+                    .to(BinaryOperator::Or)
+                    .then(conjunction)
+                    .repeated(),
+            )
+            .foldl(|left, (op, right)| Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            });
+
+        disjunction
     });
 
     let qualified_wildcard = ident
@@ -481,19 +545,27 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .ignore_then(ident.clone())
         .map(Statement::Analyze);
 
-    let statement = create_table
-        .or(create_index)
-        .or(select)
-        .or(insert)
-        .or(update)
-        .or(delete)
-        .or(dump_page)
-        .or(begin)
-        .or(start_transaction)
-        .or(commit)
-        .or(rollback)
-        .or(vacuum)
-        .or(analyze);
+    let statement = recursive(|statement| {
+        let explain = text::keyword("EXPLAIN")
+            .padded()
+            .ignore_then(statement)
+            .map(|stmt| Statement::Explain(Box::new(stmt)));
+
+        create_table
+            .or(create_index)
+            .or(select)
+            .or(insert)
+            .or(update)
+            .or(delete)
+            .or(dump_page)
+            .or(begin)
+            .or(start_transaction)
+            .or(commit)
+            .or(rollback)
+            .or(vacuum)
+            .or(analyze)
+            .or(explain)
+    });
 
     statement
         .padded_by(just(';').repeated())

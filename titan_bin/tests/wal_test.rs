@@ -1,5 +1,5 @@
 use bedrock::wal::{WalManager, WalRecord};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Seek, Write};
 use tempfile::tempdir;
 

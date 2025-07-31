@@ -5,6 +5,7 @@
 //! manipulating the system catalogs.
 
 use crate::errors::ExecutionError;
+use crate::optimizer::TableStats;
 use crate::types::Column;
 use bedrock::buffer_pool::BufferPoolManager;
 
@@ -19,11 +20,33 @@ pub const PG_CLASS_TABLE_OID: PageId = 0;
 /// The object ID of the `pg_attribute` table, which stores information about columns.
 pub const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
 
-pub struct SystemCatalog {}
+pub struct SystemCatalog {
+    stats_cache: Mutex<HashMap<String, Arc<TableStats>>>,
+    schema_cache: Mutex<HashMap<String, Arc<Vec<Column>>>>,
+}
 
 impl SystemCatalog {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            stats_cache: Mutex::new(HashMap::new()),
+            schema_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get_statistics(&self, table_name: &str) -> Option<Arc<TableStats>> {
+        self.stats_cache.lock().unwrap().get(table_name).cloned()
+    }
+
+    pub fn add_statistics(&self, table_name: String, stats: Arc<TableStats>) {
+        self.stats_cache.lock().unwrap().insert(table_name, stats);
+    }
+
+    pub fn get_schema(&self, table_name: &str) -> Option<Arc<Vec<Column>>> {
+        self.schema_cache.lock().unwrap().get(table_name).cloned()
+    }
+
+    pub fn add_schema(&self, table_name: String, schema: Arc<Vec<Column>>) {
+        self.schema_cache.lock().unwrap().insert(table_name, schema);
     }
 
     /// Finds a table by name in the `pg_class` catalog.

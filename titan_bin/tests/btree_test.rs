@@ -1,4 +1,4 @@
-use bedrock::btree::{btree_delete, btree_insert, btree_search};
+use bedrock::btree::{btree_delete, btree_insert};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::pager::Pager;
 use bedrock::transaction::TransactionManager;
