@@ -588,7 +588,7 @@ fn estimate_filter_selectivity(
             }
         }
         Expression::Unary { op, expr } => {
-            if let crate::parser::UnaryOperator::Not = op {
+            if matches!(op, crate::parser::UnaryOperator::Not) {
                 1.0 - estimate_filter_selectivity(expr, table_name, table_stats, system_catalog)
             } else {
                 0.5
@@ -662,10 +662,10 @@ fn find_join_condition(
                 let cond_left_table = get_table_name_from_expr(cond_left);
                 let cond_right_table = get_table_name_from_expr(cond_right);
 
-                if (cond_left_table == p1_table && cond_right_table == p2_table) {
+                if cond_left_table == p1_table && cond_right_table == p2_table {
                     return Some((*(cond_left.clone()), *(cond_right.clone())));
                 }
-                if (cond_left_table == p2_table && cond_right_table == p1_table) {
+                if cond_left_table == p2_table && cond_right_table == p1_table {
                     return Some((*(cond_right.clone()), *(cond_left.clone())));
                 }
             }
@@ -781,7 +781,7 @@ fn estimate_join_cardinality(
     let left_stats = stats.get(&left_table)?;
     let right_stats = stats.get(&right_table)?;
 
-    let mut catalog = system_catalog.lock().unwrap();
+    let catalog = system_catalog.lock().unwrap();
     let left_schema = catalog.get_schema(&left_table)?;
     let right_schema = catalog.get_schema(&right_table)?;
 

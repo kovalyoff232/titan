@@ -82,10 +82,10 @@ pub fn create_logical_plan(
 
 fn build_plan_from_table_ref(
     table_ref: &TableReference,
-    bpm: &Arc<BufferPoolManager>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    _bpm: &Arc<BufferPoolManager>,
+    _tx_id: u32,
+    _snapshot: &Snapshot,
+    _system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
         TableReference::Table { name } => {
