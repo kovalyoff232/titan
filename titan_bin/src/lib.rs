@@ -25,7 +25,9 @@ pub mod executor;
 pub mod optimizer;
 pub mod parser;
 pub mod planner;
+pub mod sql_extensions;
 pub mod types;
+pub mod window_executor;
 
 /// Writes a message to the given stream with the specified message type and data.
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
