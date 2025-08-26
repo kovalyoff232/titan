@@ -408,6 +408,36 @@ fn create_executor<'a>(
                 "MergeJoin is not supported by the iterator executor yet".to_string(),
             ))
         }
+        PhysicalPlan::HashAggregate { .. } => {
+            Err(ExecutionError::GenericError(
+                "HashAggregate not yet fully implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::StreamAggregate { .. } => {
+            Err(ExecutionError::GenericError(
+                "StreamAggregate not yet fully implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::Window { .. } => {
+            Err(ExecutionError::GenericError(
+                "Window functions not yet fully implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::MaterializeCTE { .. } => {
+            Err(ExecutionError::GenericError(
+                "MaterializeCTE not yet implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::CTEScan { .. } => {
+            Err(ExecutionError::GenericError(
+                "CTEScan not yet implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::Limit { input, .. } => {
+            // For now, just pass through to child executor
+            // TODO: Implement proper LimitExecutor
+            create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)
+        }
     }
 }
 
