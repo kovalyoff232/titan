@@ -22,9 +22,12 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SelectStatement {
+    pub with_clause: Option<Vec<CommonTableExpression>>,
     pub select_list: Vec<SelectItem>,
     pub from: Vec<TableReference>,
     pub where_clause: Option<Expression>,
+    pub group_by: Option<Vec<Expression>>,
+    pub having: Option<Expression>,
     pub order_by: Option<Vec<Expression>>,
     pub for_update: bool,
 }
@@ -109,6 +112,21 @@ pub enum Expression {
         op: UnaryOperator,
         expr: Box<Expression>,
     },
+    WindowFunction {
+        function: WindowFunctionType,
+        args: Vec<Expression>,
+        over: WindowSpec,
+    },
+    Function {
+        name: String,
+        args: Vec<Expression>,
+    },
+    Case {
+        operand: Option<Box<Expression>>,
+        when_clauses: Vec<(Expression, Expression)>,
+        else_clause: Option<Box<Expression>>,
+    },
+    Subquery(Box<SelectStatement>),
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
@@ -117,6 +135,7 @@ pub enum LiteralValue {
     String(String),
     Bool(bool),
     Date(String),
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,6 +157,61 @@ pub enum BinaryOperator {
     Or,
 }
 
+// Window Functions support
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expression>,
+    pub order_by: Vec<OrderByExpr>,
+    pub frame: Option<WindowFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrderByExpr {
+    pub expr: Expression,
+    pub asc: bool,
+    pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WindowFrame {
+    Rows(FrameBound, FrameBound),
+    Range(FrameBound, FrameBound),
+    Groups(FrameBound, FrameBound),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WindowFunctionType {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile(i32),
+    Lag { offset: i64, default: Option<Box<Expression>> },
+    Lead { offset: i64, default: Option<Box<Expression>> },
+    FirstValue,
+    LastValue,
+    NthValue(i64),
+}
+
+// Common Table Expressions (CTEs)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommonTableExpression {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub query: Box<SelectStatement>,
+    pub recursive: bool,
+}
+
 impl fmt::Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -146,6 +220,32 @@ impl fmt::Display for Expression {
             Expression::QualifiedColumn(table, col) => write!(f, "{}.{}", table, col),
             Expression::Binary { left, op, right } => write!(f, "({} {} {})", left, op, right),
             Expression::Unary { op, expr } => write!(f, "({} {})", op, expr),
+            Expression::WindowFunction { function, .. } => write!(f, "{}() OVER (...)", 
+                match function {
+                    WindowFunctionType::RowNumber => "ROW_NUMBER",
+                    WindowFunctionType::Rank => "RANK",
+                    WindowFunctionType::DenseRank => "DENSE_RANK",
+                    WindowFunctionType::PercentRank => "PERCENT_RANK",
+                    WindowFunctionType::CumeDist => "CUME_DIST",
+                    WindowFunctionType::Ntile(_) => "NTILE",
+                    WindowFunctionType::Lag { .. } => "LAG",
+                    WindowFunctionType::Lead { .. } => "LEAD",
+                    WindowFunctionType::FirstValue => "FIRST_VALUE",
+                    WindowFunctionType::LastValue => "LAST_VALUE",
+                    WindowFunctionType::NthValue(_) => "NTH_VALUE",
+                }),
+            Expression::Function { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            },
+            Expression::Case { .. } => write!(f, "CASE ... END"),
+            Expression::Subquery(_) => write!(f, "(SELECT ...)"),
         }
     }
 }
@@ -157,6 +257,7 @@ impl fmt::Display for LiteralValue {
             LiteralValue::String(s) => write!(f, "{}", s),
             LiteralValue::Bool(b) => write!(f, "{}", b),
             LiteralValue::Date(s) => write!(f, "{}", s),
+            LiteralValue::Null => write!(f, "NULL"),
         }
     }
 }
@@ -405,9 +506,12 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .map(
             |((((select_list, from), where_clause), order_by), for_update)| {
                 Statement::Select(SelectStatement {
+                    with_clause: None,
                     select_list,
                     from: from.unwrap_or_default(),
                     where_clause,
+                    group_by: None,
+                    having: None,
                     order_by,
                     for_update: for_update.is_some(),
                 })

@@ -3,11 +3,12 @@
 //! This module is responsible for converting the AST from the parser into a logical plan.
 
 use crate::errors::ExecutionError;
-use crate::parser::{Expression, SelectItem, SelectStatement, TableReference};
+use crate::parser::{Expression, SelectItem, SelectStatement, TableReference, CommonTableExpression};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot};
 use crate::catalog::SystemCatalog;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -30,6 +31,73 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         order_by: Vec<Expression>,
     },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_by: Vec<Expression>,
+        aggregates: Vec<AggregateExpr>,
+        having: Option<Expression>,
+    },
+    Window {
+        input: Box<LogicalPlan>,
+        window_functions: Vec<WindowFunctionPlan>,
+    },
+    CteRef {
+        name: String,
+    },
+    WithCte {
+        cte_list: Vec<CommonTableExpression>,
+        input: Box<LogicalPlan>,
+    },
+    SetOperation {
+        op: SetOperationType,
+        all: bool,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
+    Limit {
+        input: Box<LogicalPlan>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregateExpr {
+    pub function: String,
+    pub args: Vec<Expression>,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFunctionPlan {
+    pub function: String,
+    pub args: Vec<Expression>,
+    pub partition_by: Vec<Expression>,
+    pub order_by: Vec<Expression>,
+    pub frame: Option<WindowFramePlan>,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum WindowFramePlan {
+    Rows(FrameBoundPlan, FrameBoundPlan),
+    Range(FrameBoundPlan, FrameBoundPlan),
+}
+
+#[derive(Debug, Clone)]
+pub enum FrameBoundPlan {
+    UnboundedPreceding,
+    CurrentRow,
+    UnboundedFollowing,
+    Preceding(i64),
+    Following(i64),
+}
+
+#[derive(Debug, Clone)]
+pub enum SetOperationType {
+    Union,
+    Intersect,
+    Except,
 }
 
 pub fn create_logical_plan(
@@ -39,32 +107,70 @@ pub fn create_logical_plan(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
-    // For now, we only support a single table or a single JOIN clause.
-    let from_plan = match &stmt.from[0] {
-        TableReference::Table { name } => {
-            LogicalPlan::Scan {
-                table_name: name.clone(),
-                alias: None,
-                filter: stmt.where_clause.clone(),
-            }
+    // Build initial plan from FROM clause
+    let from_plan = if stmt.from.is_empty() {
+        // Handle queries without FROM clause (e.g., SELECT 1)
+        LogicalPlan::Scan {
+            table_name: "dummy".to_string(),
+            alias: None,
+            filter: None,
         }
-        TableReference::Join {
-            left,
-            right,
-            on_condition,
-        } => {
-            let left_plan = build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
-            let right_plan = build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
-            LogicalPlan::Join {
-                left: Box::new(left_plan),
-                right: Box::new(right_plan),
-                condition: on_condition.clone(),
+    } else {
+        match &stmt.from[0] {
+            TableReference::Table { name } => {
+                LogicalPlan::Scan {
+                    table_name: name.clone(),
+                    alias: None,
+                    filter: stmt.where_clause.clone(),
+                }
+            }
+            TableReference::Join {
+                left,
+                right,
+                on_condition,
+            } => {
+                let left_plan = build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
+                let right_plan = build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
+                LogicalPlan::Join {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    condition: on_condition.clone(),
+                }
             }
         }
     };
 
     let mut plan = from_plan;
 
+    // Handle WHERE clause (if not already applied in scan)
+    if let Some(where_clause) = &stmt.where_clause {
+        if !matches!(plan, LogicalPlan::Scan { .. }) {
+            // WHERE clause wasn't applied in scan, add as separate filter
+            // This would be optimized later to push down filters
+        }
+    }
+
+    // Handle GROUP BY and aggregations
+    if let Some(group_by) = &stmt.group_by {
+        let aggregates = extract_aggregates(&stmt.select_list)?;
+        plan = LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_by: group_by.clone(),
+            aggregates,
+            having: stmt.having.clone(),
+        };
+    }
+
+    // Handle window functions
+    let window_functions = extract_window_functions(&stmt.select_list)?;
+    if !window_functions.is_empty() {
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            window_functions,
+        };
+    }
+
+    // Handle ORDER BY
     if let Some(order_by) = &stmt.order_by {
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
@@ -72,20 +178,29 @@ pub fn create_logical_plan(
         };
     }
 
+    // Handle projection
     plan = LogicalPlan::Projection {
         input: Box::new(plan),
         expressions: stmt.select_list.clone(),
     };
+
+    // Handle CTEs
+    if let Some(cte_list) = &stmt.with_clause {
+        plan = LogicalPlan::WithCte {
+            cte_list: cte_list.clone(),
+            input: Box::new(plan),
+        };
+    }
 
     Ok(plan)
 }
 
 fn build_plan_from_table_ref(
     table_ref: &TableReference,
-    bpm: &Arc<BufferPoolManager>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    _bpm: &Arc<BufferPoolManager>,
+    _tx_id: u32,
+    _snapshot: &Snapshot,
+    _system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
         TableReference::Table { name } => {
@@ -98,5 +213,118 @@ fn build_plan_from_table_ref(
         _ => Err(ExecutionError::PlanningError(
             "Nested joins not supported yet".to_string(),
         )),
+    }
+}
+
+/// Extract aggregate functions from select list
+fn extract_aggregates(select_list: &[SelectItem]) -> Result<Vec<AggregateExpr>, ExecutionError> {
+    let mut aggregates = Vec::new();
+    
+    for item in select_list {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let Expression::Function { name, args } = expr {
+                    if is_aggregate_function(name) {
+                        aggregates.push(AggregateExpr {
+                            function: name.clone(),
+                            args: args.clone(),
+                            alias: if let SelectItem::ExprWithAlias { alias, .. } = item {
+                                Some(alias.clone())
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(aggregates)
+}
+
+/// Extract window functions from select list
+fn extract_window_functions(select_list: &[SelectItem]) -> Result<Vec<WindowFunctionPlan>, ExecutionError> {
+    use crate::parser::{WindowSpec, WindowFrame, FrameBound, WindowFunctionType};
+    
+    let mut window_functions = Vec::new();
+    
+    for item in select_list {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let Expression::WindowFunction { function, args, over } = expr {
+                    let function_name = match function {
+                        WindowFunctionType::RowNumber => "ROW_NUMBER",
+                        WindowFunctionType::Rank => "RANK",
+                        WindowFunctionType::DenseRank => "DENSE_RANK",
+                        WindowFunctionType::PercentRank => "PERCENT_RANK",
+                        WindowFunctionType::CumeDist => "CUME_DIST",
+                        WindowFunctionType::Ntile(_) => "NTILE",
+                        WindowFunctionType::Lag { .. } => "LAG",
+                        WindowFunctionType::Lead { .. } => "LEAD",
+                        WindowFunctionType::FirstValue => "FIRST_VALUE",
+                        WindowFunctionType::LastValue => "LAST_VALUE",
+                        WindowFunctionType::NthValue(_) => "NTH_VALUE",
+                    }.to_string();
+                    
+                    let frame = over.frame.as_ref().map(|f| convert_window_frame(f));
+                    
+                    window_functions.push(WindowFunctionPlan {
+                        function: function_name,
+                        args: args.clone(),
+                        partition_by: over.partition_by.clone(),
+                        order_by: over.order_by.iter().map(|o| o.expr.clone()).collect(),
+                        frame,
+                        alias: if let SelectItem::ExprWithAlias { alias, .. } = item {
+                            alias.clone()
+                        } else {
+                            format!("window_{}", window_functions.len())
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(window_functions)
+}
+
+/// Check if a function name is an aggregate function
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(name.to_uppercase().as_str(), 
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | 
+        "STDDEV" | "VARIANCE" | "ARRAY_AGG" | "STRING_AGG")
+}
+
+/// Convert parser WindowFrame to planner WindowFramePlan
+fn convert_window_frame(frame: &crate::parser::WindowFrame) -> WindowFramePlan {
+    use crate::parser::{WindowFrame, FrameBound};
+    
+    match frame {
+        WindowFrame::Rows(start, end) => {
+            WindowFramePlan::Rows(convert_frame_bound(start), convert_frame_bound(end))
+        }
+        WindowFrame::Range(start, end) => {
+            WindowFramePlan::Range(convert_frame_bound(start), convert_frame_bound(end))
+        }
+        WindowFrame::Groups(start, end) => {
+            // For now, treat GROUPS like ROWS
+            WindowFramePlan::Rows(convert_frame_bound(start), convert_frame_bound(end))
+        }
+    }
+}
+
+/// Convert parser FrameBound to planner FrameBoundPlan
+fn convert_frame_bound(bound: &crate::parser::FrameBound) -> FrameBoundPlan {
+    use crate::parser::FrameBound;
+    
+    match bound {
+        FrameBound::UnboundedPreceding => FrameBoundPlan::UnboundedPreceding,
+        FrameBound::CurrentRow => FrameBoundPlan::CurrentRow,
+        FrameBound::UnboundedFollowing => FrameBoundPlan::UnboundedFollowing,
+        FrameBound::Preceding(n) => FrameBoundPlan::Preceding(*n),
+        FrameBound::Following(n) => FrameBoundPlan::Following(*n),
     }
 }

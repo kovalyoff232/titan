@@ -66,6 +66,34 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         order_by: Vec<Expression>,
     },
+    HashAggregate {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<Expression>,
+        aggregates: Vec<crate::planner::AggregateExpr>,
+        having: Option<Expression>,
+    },
+    StreamAggregate {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<Expression>,
+        aggregates: Vec<crate::planner::AggregateExpr>,
+        having: Option<Expression>,
+    },
+    Window {
+        input: Box<PhysicalPlan>,
+        window_functions: Vec<crate::planner::WindowFunctionPlan>,
+    },
+    MaterializeCTE {
+        name: String,
+        plan: Box<PhysicalPlan>,
+    },
+    CTEScan {
+        name: String,
+    },
+    Limit {
+        input: Box<PhysicalPlan>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
 }
 
 
@@ -102,19 +130,30 @@ pub fn optimize(
 }
 
 fn get_table_names(plan: &LogicalPlan) -> HashSet<String> {
+    use crate::planner::LogicalPlan;
     let mut tables = HashSet::new();
     match plan {
         LogicalPlan::Scan { table_name, .. } => {
             tables.insert(table_name.clone());
         }
-        LogicalPlan::Projection { input, .. } => {
+        LogicalPlan::Projection { input, .. } 
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Limit { input, .. } => {
             tables.extend(get_table_names(input));
         }
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::SetOperation { left, right, .. } => {
             tables.extend(get_table_names(left));
             tables.extend(get_table_names(right));
         }
-        LogicalPlan::Sort { input, .. } => {
+        LogicalPlan::CteRef { name } => {
+            // CTE reference is like a virtual table
+            tables.insert(format!("cte_{}", name));
+        }
+        LogicalPlan::WithCte { input, .. } => {
+            // TODO: Also extract tables from CTE definitions
             tables.extend(get_table_names(input));
         }
     }
@@ -402,7 +441,8 @@ fn create_physical_plan(
 
 // Fallback for non-CBO cases or when CBO fails
 fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
-     match plan {
+    use crate::planner::LogicalPlan;
+    match plan {
         LogicalPlan::Scan { table_name, filter, .. } => PhysicalPlan::TableScan { table_name, filter },
         LogicalPlan::Projection { input, expressions } => PhysicalPlan::Projection {
             input: Box::new(create_simple_physical_plan(*input)),
@@ -428,6 +468,50 @@ fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
             input: Box::new(create_simple_physical_plan(*input)),
             order_by,
+        },
+        LogicalPlan::Aggregate { input, group_by, aggregates, having } => {
+            // Choose between Hash and Stream aggregate based on whether input is sorted
+            PhysicalPlan::HashAggregate {
+                input: Box::new(create_simple_physical_plan(*input)),
+                group_by,
+                aggregates,
+                having,
+            }
+        },
+        LogicalPlan::Window { input, window_functions } => PhysicalPlan::Window {
+            input: Box::new(create_simple_physical_plan(*input)),
+            window_functions,
+        },
+        LogicalPlan::CteRef { name } => PhysicalPlan::CTEScan { name },
+        LogicalPlan::WithCte { cte_list, input } => {
+            // For simplicity, materialize all CTEs
+            // TODO: Implement recursive CTE handling
+            let mut result = create_simple_physical_plan(*input);
+            for cte in cte_list.iter().rev() {
+                result = PhysicalPlan::MaterializeCTE {
+                    name: cte.name.clone(),
+                    plan: Box::new(result),
+                };
+            }
+            result
+        },
+        LogicalPlan::SetOperation { op: _, all: _, left, right } => {
+            // For now, implement set operations using hash join
+            // TODO: Implement proper SetOperation physical operator
+            let left_physical = create_simple_physical_plan(*left);
+            let right_physical = create_simple_physical_plan(*right);
+            // This is a simplification - real implementation would handle UNION/INTERSECT/EXCEPT
+            PhysicalPlan::HashJoin {
+                left: Box::new(left_physical),
+                right: Box::new(right_physical),
+                left_key: Expression::Literal(LiteralValue::Number("1".to_string())),
+                right_key: Expression::Literal(LiteralValue::Number("1".to_string())),
+            }
+        },
+        LogicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+            input: Box::new(create_simple_physical_plan(*input)),
+            limit,
+            offset,
         },
     }
 }
@@ -588,7 +672,7 @@ fn estimate_filter_selectivity(
             }
         }
         Expression::Unary { op, expr } => {
-            if let crate::parser::UnaryOperator::Not = op {
+            if matches!(op, crate::parser::UnaryOperator::Not) {
                 1.0 - estimate_filter_selectivity(expr, table_name, table_stats, system_catalog)
             } else {
                 0.5
@@ -637,12 +721,18 @@ fn find_first_table(plan: &PhysicalPlan) -> Option<String> {
     match plan {
         PhysicalPlan::TableScan { table_name, .. } => Some(table_name.clone()),
         PhysicalPlan::IndexScan { table_name, .. } => Some(table_name.clone()),
-        PhysicalPlan::Filter { input, .. } => find_first_table(input),
-        PhysicalPlan::Projection { input, .. } => find_first_table(input),
-        PhysicalPlan::Sort { input, .. } => find_first_table(input),
-        PhysicalPlan::HashJoin { left, .. } => find_first_table(left),
-        PhysicalPlan::MergeJoin { left, .. } => find_first_table(left),
-        PhysicalPlan::NestedLoopJoin { left, .. } => find_first_table(left),
+        PhysicalPlan::Filter { input, .. } 
+        | PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::StreamAggregate { input, .. }
+        | PhysicalPlan::Window { input, .. }
+        | PhysicalPlan::Limit { input, .. } => find_first_table(input),
+        PhysicalPlan::HashJoin { left, .. }
+        | PhysicalPlan::MergeJoin { left, .. }
+        | PhysicalPlan::NestedLoopJoin { left, .. } => find_first_table(left),
+        PhysicalPlan::MaterializeCTE { plan, .. } => find_first_table(plan),
+        PhysicalPlan::CTEScan { name } => Some(format!("cte_{}", name)),
     }
 }
 
@@ -651,6 +741,7 @@ fn find_join_condition(
     p1: &PlanInfo,
     p2: &PlanInfo,
 ) -> Option<(Expression, Expression)> {
+    use crate::planner::LogicalPlan;
     match plan {
         LogicalPlan::Join { left, right, condition } => {
             if let Expression::Binary { left: cond_left, op: BinaryOperator::Eq, right: cond_right } = condition {
@@ -662,19 +753,26 @@ fn find_join_condition(
                 let cond_left_table = get_table_name_from_expr(cond_left);
                 let cond_right_table = get_table_name_from_expr(cond_right);
 
-                if (cond_left_table == p1_table && cond_right_table == p2_table) {
+                if cond_left_table == p1_table && cond_right_table == p2_table {
                     return Some((*(cond_left.clone()), *(cond_right.clone())));
                 }
-                if (cond_left_table == p2_table && cond_right_table == p1_table) {
+                if cond_left_table == p2_table && cond_right_table == p1_table {
                     return Some((*(cond_right.clone()), *(cond_left.clone())));
                 }
             }
             // If the current join condition doesn't match, check nested joins.
             find_join_condition(left, p1, p2).or_else(|| find_join_condition(right, p1, p2))
         }
-        LogicalPlan::Projection { input, .. } => find_join_condition(input, p1, p2),
-        LogicalPlan::Sort { input, .. } => find_join_condition(input, p1, p2),
-        LogicalPlan::Scan { .. } => None,
+        LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Limit { input, .. } => find_join_condition(input, p1, p2),
+        LogicalPlan::Scan { .. } | LogicalPlan::CteRef { .. } => None,
+        LogicalPlan::WithCte { input, .. } => find_join_condition(input, p1, p2),
+        LogicalPlan::SetOperation { left, right, .. } => {
+            find_join_condition(left, p1, p2).or_else(|| find_join_condition(right, p1, p2))
+        }
     }
 }
 
@@ -686,12 +784,19 @@ fn get_table_name_from_expr(expr: &Expression) -> Option<String> {
 }
 
 fn get_filter_from_logical_plan(plan: &LogicalPlan) -> Option<&Expression> {
+   use crate::planner::LogicalPlan;
    match plan {
        LogicalPlan::Scan { filter, .. } => filter.as_ref(),
-       LogicalPlan::Projection { input, .. } => get_filter_from_logical_plan(input),
-       LogicalPlan::Sort { input, .. } => get_filter_from_logical_plan(input),
+       LogicalPlan::Projection { input, .. }
+       | LogicalPlan::Sort { input, .. }
+       | LogicalPlan::Aggregate { input, .. }
+       | LogicalPlan::Window { input, .. }
+       | LogicalPlan::Limit { input, .. } => get_filter_from_logical_plan(input),
+       LogicalPlan::WithCte { input, .. } => get_filter_from_logical_plan(input),
        // In a real system, filters can also be part of the join condition
-       LogicalPlan::Join { .. } => None,
+       LogicalPlan::Join { .. }
+       | LogicalPlan::SetOperation { .. }
+       | LogicalPlan::CteRef { .. } => None,
    }
 }
 
@@ -781,7 +886,7 @@ fn estimate_join_cardinality(
     let left_stats = stats.get(&left_table)?;
     let right_stats = stats.get(&right_table)?;
 
-    let mut catalog = system_catalog.lock().unwrap();
+    let catalog = system_catalog.lock().unwrap();
     let left_schema = catalog.get_schema(&left_table)?;
     let right_schema = catalog.get_schema(&right_table)?;
 

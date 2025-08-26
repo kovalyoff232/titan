@@ -408,6 +408,47 @@ fn create_executor<'a>(
                 "MergeJoin is not supported by the iterator executor yet".to_string(),
             ))
         }
+        PhysicalPlan::HashAggregate { input, group_by, aggregates, having } => {
+            use crate::aggregate_executor::HashAggregateExecutor;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            Ok(Box::new(HashAggregateExecutor::new(
+                input_executor,
+                group_by.clone(),
+                aggregates.clone(),
+                having.clone(),
+            )))
+        }
+        PhysicalPlan::StreamAggregate { .. } => {
+            Err(ExecutionError::GenericError(
+                "StreamAggregate not yet fully implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::Window { .. } => {
+            Err(ExecutionError::GenericError(
+                "Window functions not yet fully implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::MaterializeCTE { .. } => {
+            Err(ExecutionError::GenericError(
+                "MaterializeCTE not yet implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::CTEScan { .. } => {
+            Err(ExecutionError::GenericError(
+                "CTEScan not yet implemented".to_string(),
+            ))
+        }
+        PhysicalPlan::Limit { input, limit, offset } => {
+            use crate::limit_executor::LimitExecutor;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            Ok(Box::new(LimitExecutor::new(
+                input_executor,
+                limit.map(|l| l as usize),
+                offset.unwrap_or(0) as usize,
+            )))
+        }
     }
 }
 
@@ -1387,7 +1428,7 @@ pub fn scan_table(
     Ok(rows)
 }
 
-fn evaluate_expr_for_row(
+pub fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<bool, ExecutionError> {
@@ -1399,7 +1440,7 @@ fn evaluate_expr_for_row(
     }
 }
 
-fn evaluate_expr_for_row_to_val<'a>(
+pub fn evaluate_expr_for_row_to_val<'a>(
     expr: &'a Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<LiteralValue, ExecutionError> {
@@ -1499,6 +1540,59 @@ fn evaluate_expr_for_row_to_val<'a>(
                     )),
                 },
             }
+        }
+        Expression::WindowFunction { .. } => {
+            // Window functions are handled by WindowFunctionExecutor
+            Err(ExecutionError::GenericError(
+                "Window functions cannot be evaluated in WHERE clause".to_string(),
+            ))
+        }
+        Expression::Function { name, args } => {
+            // Simple function evaluation (limited support for now)
+            match name.to_uppercase().as_str() {
+                "COUNT" => Ok(LiteralValue::Number("1".to_string())),
+                "SUM" | "AVG" | "MIN" | "MAX" => {
+                    if !args.is_empty() {
+                        evaluate_expr_for_row_to_val(&args[0], row)
+                    } else {
+                        Ok(LiteralValue::Null)
+                    }
+                }
+                _ => Err(ExecutionError::GenericError(
+                    format!("Unsupported function: {}", name),
+                ))
+            }
+        }
+        Expression::Case { operand, when_clauses, else_clause } => {
+            // CASE expression evaluation
+            for (condition, result) in when_clauses {
+                let cond_result = if let Some(op) = operand {
+                    let op_val = evaluate_expr_for_row_to_val(op, row)?;
+                    let cond_val = evaluate_expr_for_row_to_val(condition, row)?;
+                    op_val == cond_val
+                } else {
+                    match evaluate_expr_for_row_to_val(condition, row)? {
+                        LiteralValue::Bool(b) => b,
+                        _ => false,
+                    }
+                };
+                
+                if cond_result {
+                    return evaluate_expr_for_row_to_val(result, row);
+                }
+            }
+            
+            if let Some(else_expr) = else_clause {
+                evaluate_expr_for_row_to_val(else_expr, row)
+            } else {
+                Ok(LiteralValue::Null)
+            }
+        }
+        Expression::Subquery(_) => {
+            // Subqueries require special handling with executor context
+            Err(ExecutionError::GenericError(
+                "Subqueries are not yet supported in this context".to_string(),
+            ))
         }
     }
 }
@@ -2141,6 +2235,11 @@ impl<'a> Executor for UpdateExecutor<'a> {
                                 let days = date.signed_duration_since(epoch).num_days() as i32;
                                 new_data.extend_from_slice(&days.to_be_bytes());
                             }
+                            LiteralValue::Null => {
+                                // For NULL values, we could either skip or write a special marker
+                                // For now, let's write 4 zero bytes to represent NULL
+                                new_data.extend_from_slice(&0i32.to_be_bytes());
+                            }
                         }
                     }
                 }
@@ -2201,6 +2300,10 @@ fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionErro
                 let days = date.signed_duration_since(epoch).num_days() as i32;
                 tuple_data.extend_from_slice(&days.to_be_bytes());
             }
+            Expression::Literal(LiteralValue::Null) => {
+                // For NULL values, write 4 zero bytes
+                tuple_data.extend_from_slice(&0i32.to_be_bytes());
+            }
             _ => {
                 return Err(ExecutionError::GenericError(
                     "Unsupported expression type for insert".to_string(),
@@ -2233,6 +2336,10 @@ fn serialize_literal_map(
                     let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
                     let days = date.signed_duration_since(epoch).num_days() as i32;
                     new_data.extend_from_slice(&days.to_be_bytes());
+                }
+                LiteralValue::Null => {
+                    // For NULL values, write a special marker
+                    new_data.extend_from_slice(&0i32.to_be_bytes());
                 }
             }
         }

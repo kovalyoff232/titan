@@ -386,20 +386,18 @@ impl WalManager {
                  ));
              }
  
-             if let Some(WalRecord::BTreePage { page_id, data, .. }) =
-                 Self::deserialize_record(record_buf)
-            {
-                let mut page = pager.read_page(page_id)?;
-                if page.read_header().lsn < current_pos as u64 {
-                    page.data.copy_from_slice(&data);
-                    let mut header = page.read_header();
-                    header.lsn = current_pos as u64;
-                    page.write_header(&header);
-                    pager.write_page(&page)?;
-                }
-            } else {
-               
-            }
+            if let Some(WalRecord::BTreePage { page_id, data, .. }) =
+                Self::deserialize_record(record_buf)
+           {
+               let mut page = pager.read_page(page_id)?;
+               if page.read_header().lsn < current_pos as u64 {
+                   page.data.copy_from_slice(&data);
+                   let mut header = page.read_header();
+                   header.lsn = current_pos as u64;
+                   page.write_header(&header);
+                   pager.write_page(&page)?;
+               }
+           }
             current_pos += header.total_len as usize;
         }
 

@@ -6,6 +6,8 @@
 pub mod btree;
 /// The buffer pool manager.
 pub mod buffer_pool;
+/// Advanced buffer pool manager with ARC algorithm.
+pub mod arc_buffer_pool;
 /// The lock manager for concurrency control.
 pub mod lock_manager;
 /// The page layout and data structures.
