@@ -14,6 +14,7 @@ rand = "0.8"
 postgres = "0.19.7"
 serial_test = "3.0.0"
 tempfile = "3.10.1"
+criterion = "0.5"
 
 [[test]]
 name = "vacuum_test"
@@ -22,3 +23,7 @@ path = "tests/vacuum_test.rs"
 [[test]]
 name = "optimizer_test"
 path = "tests/optimizer_test.rs"
+
+[[bench]]
+name = "simple_benchmark"
+harness = false
