@@ -408,10 +408,16 @@ fn create_executor<'a>(
                 "MergeJoin is not supported by the iterator executor yet".to_string(),
             ))
         }
-        PhysicalPlan::HashAggregate { .. } => {
-            Err(ExecutionError::GenericError(
-                "HashAggregate not yet fully implemented".to_string(),
-            ))
+        PhysicalPlan::HashAggregate { input, group_by, aggregates, having } => {
+            use crate::aggregate_executor::HashAggregateExecutor;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            Ok(Box::new(HashAggregateExecutor::new(
+                input_executor,
+                group_by.clone(),
+                aggregates.clone(),
+                having.clone(),
+            )))
         }
         PhysicalPlan::StreamAggregate { .. } => {
             Err(ExecutionError::GenericError(
@@ -433,10 +439,15 @@ fn create_executor<'a>(
                 "CTEScan not yet implemented".to_string(),
             ))
         }
-        PhysicalPlan::Limit { input, .. } => {
-            // For now, just pass through to child executor
-            // TODO: Implement proper LimitExecutor
-            create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)
+        PhysicalPlan::Limit { input, limit, offset } => {
+            use crate::limit_executor::LimitExecutor;
+            let input_executor =
+                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            Ok(Box::new(LimitExecutor::new(
+                input_executor,
+                limit.map(|l| l as usize),
+                offset.unwrap_or(0) as usize,
+            )))
         }
     }
 }
@@ -1417,7 +1428,7 @@ pub fn scan_table(
     Ok(rows)
 }
 
-fn evaluate_expr_for_row(
+pub fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<bool, ExecutionError> {
@@ -1429,7 +1440,7 @@ fn evaluate_expr_for_row(
     }
 }
 
-fn evaluate_expr_for_row_to_val<'a>(
+pub fn evaluate_expr_for_row_to_val<'a>(
     expr: &'a Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<LiteralValue, ExecutionError> {

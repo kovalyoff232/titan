@@ -19,9 +19,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+pub mod aggregate_executor;
 pub mod catalog;
 pub mod errors;
 pub mod executor;
+pub mod limit_executor;
 pub mod optimizer;
 pub mod parser;
 pub mod planner;
