@@ -28,14 +28,20 @@ pub struct HashAggregateExecutor<'a> {
 
 #[derive(Debug, Clone)]
 struct AggregateState {
+    // Map from aggregate function index to its state
+    states: Vec<SingleAggregateState>,
+}
+
+#[derive(Debug, Clone)]
+struct SingleAggregateState {
     count: i64,
     sum: f64,
     min: Option<LiteralValue>,
     max: Option<LiteralValue>,
-    values: Vec<LiteralValue>, // For AVG and other functions that need all values
+    values: Vec<LiteralValue>, // For functions that need all values
 }
 
-impl Default for AggregateState {
+impl Default for SingleAggregateState {
     fn default() -> Self {
         Self {
             count: 0,
@@ -43,6 +49,14 @@ impl Default for AggregateState {
             min: None,
             max: None,
             values: Vec::new(),
+        }
+    }
+}
+
+impl Default for AggregateState {
+    fn default() -> Self {
+        Self {
+            states: Vec::new(),
         }
     }
 }
@@ -109,13 +123,19 @@ impl<'a> HashAggregateExecutor<'a> {
             }
             
             // Get or create aggregate state for this group
-            let state = self.groups.entry(group_key).or_default();
+            let state = self.groups.entry(group_key).or_insert_with(|| {
+                AggregateState {
+                    states: vec![SingleAggregateState::default(); self.aggregates.len()],
+                }
+            });
             
             // Update aggregate state inline to avoid borrow issues
-            for agg in &self.aggregates {
+            for (agg_idx, agg) in self.aggregates.iter().enumerate() {
+                let agg_state = &mut state.states[agg_idx];
+                
                 // For COUNT(*), we don't need to evaluate arguments
                 if agg.function.to_uppercase() == "COUNT" && agg.args.is_empty() {
-                    state.count += 1;
+                    agg_state.count += 1;
                     continue;
                 }
                 
@@ -130,32 +150,32 @@ impl<'a> HashAggregateExecutor<'a> {
                     
                     match agg.function.to_uppercase().as_str() {
                         "COUNT" => {
-                            state.count += 1;
+                            agg_state.count += 1;
                         }
                         "SUM" => {
                             if let LiteralValue::Number(n) = &val {
-                                state.sum += n.parse::<f64>().unwrap_or(0.0);
+                                agg_state.sum += n.parse::<f64>().unwrap_or(0.0);
                             }
                         }
                         "AVG" => {
                             if let LiteralValue::Number(n) = &val {
-                                state.sum += n.parse::<f64>().unwrap_or(0.0);
-                                state.count += 1;
+                                agg_state.sum += n.parse::<f64>().unwrap_or(0.0);
+                                agg_state.count += 1;
                             }
                         }
                         "MIN" => {
-                            if state.min.is_none() || val < *state.min.as_ref().unwrap() {
-                                state.min = Some(val);
+                            if agg_state.min.is_none() || val < *agg_state.min.as_ref().unwrap() {
+                                agg_state.min = Some(val);
                             }
                         }
                         "MAX" => {
-                            if state.max.is_none() || val > *state.max.as_ref().unwrap() {
-                                state.max = Some(val);
+                            if agg_state.max.is_none() || val > *agg_state.max.as_ref().unwrap() {
+                                agg_state.max = Some(val);
                             }
                         }
                         _ => {
                             // For unsupported aggregates, store all values
-                            state.values.push(val);
+                            agg_state.values.push(val);
                         }
                     }
                 }
@@ -171,8 +191,8 @@ impl<'a> HashAggregateExecutor<'a> {
             result_row.extend_from_slice(group_key);
             
             // Add aggregate results
-            for agg in &self.aggregates {
-                let agg_result = self.compute_aggregate_result(state, agg)?;
+            for (agg_idx, agg) in self.aggregates.iter().enumerate() {
+                let agg_result = self.compute_aggregate_result(&state.states[agg_idx], agg)?;
                 result_row.push(agg_result);
             }
             
@@ -197,7 +217,13 @@ impl<'a> HashAggregateExecutor<'a> {
         let mut map = HashMap::new();
         for (i, col) in self.input.schema().iter().enumerate() {
             if i < row.len() {
-                map.insert(col.name.clone(), LiteralValue::String(row[i].clone()));
+                let value = match col.type_id {
+                    23 => LiteralValue::Number(row[i].clone()), // INT
+                    16 => LiteralValue::Bool(row[i] == "t" || row[i] == "true"), // BOOL  
+                    1082 => LiteralValue::Date(row[i].clone()), // DATE
+                    _ => LiteralValue::String(row[i].clone()), // TEXT and others
+                };
+                map.insert(col.name.clone(), value);
             }
         }
         map
@@ -213,77 +239,34 @@ impl<'a> HashAggregateExecutor<'a> {
         map
     }
     
-    fn update_aggregate_state(
-        &self,
-        state: &mut AggregateState,
-        agg: &AggregateExpr,
-        row_map: &HashMap<String, LiteralValue>,
-    ) -> Result<(), ExecutionError> {
-        // For COUNT(*), we don't need to evaluate arguments
-        if agg.function.to_uppercase() == "COUNT" && agg.args.is_empty() {
-            state.count += 1;
-            return Ok(());
-        }
-        
-        // For other aggregates, evaluate the argument
-        if let Some(arg) = agg.args.first() {
-            let val = evaluate_expr_for_row_to_val(arg, row_map)?;
-            
-            // Skip NULL values for most aggregates (except COUNT)
-            if matches!(val, LiteralValue::Null) && agg.function.to_uppercase() != "COUNT" {
-                return Ok(());
-            }
-            
-            match agg.function.to_uppercase().as_str() {
-                "COUNT" => {
-                    state.count += 1;
-                }
-                "SUM" => {
-                    if let LiteralValue::Number(n) = &val {
-                        state.sum += n.parse::<f64>().unwrap_or(0.0);
-                    }
-                }
-                "AVG" => {
-                    if let LiteralValue::Number(n) = &val {
-                        state.sum += n.parse::<f64>().unwrap_or(0.0);
-                        state.count += 1;
-                    }
-                }
-                "MIN" => {
-                    if state.min.is_none() || val < *state.min.as_ref().unwrap() {
-                        state.min = Some(val);
-                    }
-                }
-                "MAX" => {
-                    if state.max.is_none() || val > *state.max.as_ref().unwrap() {
-                        state.max = Some(val);
-                    }
-                }
-                _ => {
-                    // For unsupported aggregates, store all values
-                    state.values.push(val);
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
     fn compute_aggregate_result(
         &self,
-        state: &AggregateState,
+        state: &SingleAggregateState,
         agg: &AggregateExpr,
     ) -> Result<String, ExecutionError> {
         let result = match agg.function.to_uppercase().as_str() {
             "COUNT" => state.count.to_string(),
-            "SUM" => state.sum.to_string(),
+            "SUM" => {
+                // Format as integer if it's a whole number, otherwise with decimals
+                if state.sum.fract() == 0.0 {
+                    (state.sum as i64).to_string()
+                } else {
+                    state.sum.to_string()
+                }
+            },
             "AVG" => {
                 if state.count > 0 {
-                    (state.sum / state.count as f64).to_string()
+                    let avg = state.sum / state.count as f64;
+                    // Format as integer if it's a whole number, otherwise with decimals
+                    if avg.fract() == 0.0 {
+                        (avg as i64).to_string()
+                    } else {
+                        avg.to_string()
+                    }
                 } else {
                     "NULL".to_string()
                 }
-            }
+            },
             "MIN" => {
                 state.min.as_ref()
                     .map(|v| v.to_string())

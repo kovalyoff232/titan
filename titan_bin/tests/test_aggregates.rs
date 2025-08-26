@@ -172,13 +172,18 @@ mod tests {
 
         assert_eq!(results.len(), 2); // Two products
         
+        // Debug output to see what we actually get
+        for row in &results {
+            println!("Row: {:?}", row);
+        }
+        
         for row in &results {
             if row[0] == "A" {
-                assert_eq!(row[1], "300"); // SUM for A
-                assert_eq!(row[2], "150"); // AVG for A
+                assert_eq!(row[1], "300", "SUM for A failed: got {}", row[1]); // SUM for A
+                assert_eq!(row[2], "150", "AVG for A failed: got {}", row[2]); // AVG for A
             } else if row[0] == "B" {
-                assert_eq!(row[1], "400"); // SUM for B
-                assert_eq!(row[2], "200"); // AVG for B
+                assert_eq!(row[1], "400", "SUM for B failed: got {}", row[1]); // SUM for B
+                assert_eq!(row[2], "200", "AVG for B failed: got {}", row[2]); // AVG for B
             }
         }
     }
