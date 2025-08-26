@@ -8,7 +8,6 @@ use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot};
 use crate::catalog::SystemCatalog;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
@@ -246,7 +245,7 @@ fn extract_aggregates(select_list: &[SelectItem]) -> Result<Vec<AggregateExpr>, 
 
 /// Extract window functions from select list
 fn extract_window_functions(select_list: &[SelectItem]) -> Result<Vec<WindowFunctionPlan>, ExecutionError> {
-    use crate::parser::{WindowSpec, WindowFrame, FrameBound, WindowFunctionType};
+    use crate::parser::WindowFunctionType;
     
     let mut window_functions = Vec::new();
     
@@ -300,7 +299,7 @@ fn is_aggregate_function(name: &str) -> bool {
 
 /// Convert parser WindowFrame to planner WindowFramePlan
 fn convert_window_frame(frame: &crate::parser::WindowFrame) -> WindowFramePlan {
-    use crate::parser::{WindowFrame, FrameBound};
+    use crate::parser::WindowFrame;
     
     match frame {
         WindowFrame::Rows(start, end) => {

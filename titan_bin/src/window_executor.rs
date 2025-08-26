@@ -4,8 +4,7 @@ use crate::errors::ExecutionError;
 use crate::executor::Executor;
 use crate::parser::{Expression, LiteralValue};
 use crate::sql_extensions::{
-    WindowFunction, WindowSpec, WindowFrame, FrameBound,
-    AggregateFunction, CteContext, CteTable,
+    WindowFunction, WindowSpec, CteContext,
     window_exec::{WindowExecutor, WindowPartition},
 };
 use crate::types::Column;
@@ -20,6 +19,10 @@ pub struct WindowFunctionExecutor<'a> {
     input: Box<dyn Executor + 'a>,
     window_functions: Vec<(WindowFunction, WindowSpec, String)>, // (function, spec, alias)
     schema: Vec<Column>,
+    // State for iteration
+    executed: bool,
+    results: Vec<Row>,
+    index: usize,
 }
 
 impl<'a> WindowFunctionExecutor<'a> {
@@ -40,6 +43,9 @@ impl<'a> WindowFunctionExecutor<'a> {
             input,
             window_functions,
             schema,
+            executed: false,
+            results: Vec::new(),
+            index: 0,
         }
     }
     
@@ -190,25 +196,18 @@ impl<'a> WindowFunctionExecutor<'a> {
 impl<'a> Executor for WindowFunctionExecutor<'a> {
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
         // Window functions require materializing all rows first
-        // This is a simplified implementation
-        static mut EXECUTED: bool = false;
-        static mut RESULTS: Vec<Row> = Vec::new();
-        static mut INDEX: usize = 0;
+        if !self.executed {
+            self.results = self.execute_window_functions()?;
+            self.executed = true;
+            self.index = 0;
+        }
         
-        unsafe {
-            if !EXECUTED {
-                RESULTS = self.execute_window_functions()?;
-                EXECUTED = true;
-                INDEX = 0;
-            }
-            
-            if INDEX < RESULTS.len() {
-                let row = RESULTS[INDEX].clone();
-                INDEX += 1;
-                Ok(Some(row))
-            } else {
-                Ok(None)
-            }
+        if self.index < self.results.len() {
+            let row = self.results[self.index].clone();
+            self.index += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
         }
     }
     
