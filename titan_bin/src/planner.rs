@@ -142,7 +142,7 @@ pub fn create_logical_plan(
     let mut plan = from_plan;
 
     // Handle WHERE clause (if not already applied in scan)
-    if let Some(where_clause) = &stmt.where_clause {
+    if let Some(_where_clause) = &stmt.where_clause {
         if !matches!(plan, LogicalPlan::Scan { .. }) {
             // WHERE clause wasn't applied in scan, add as separate filter
             // This would be optimized later to push down filters

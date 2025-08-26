@@ -303,17 +303,15 @@ impl<'a> Executor for HashAggregateExecutor<'a> {
 }
 
 /// Stream-based aggregate executor (for pre-sorted input)
+/// NOTE: This is a placeholder implementation. The actual implementation
+/// would process groups streaming-style as they come from a sorted input.
+#[allow(dead_code)]
 pub struct StreamAggregateExecutor<'a> {
-    input: Box<dyn Executor + 'a>,
-    group_by: Vec<Expression>,
-    aggregates: Vec<AggregateExpr>,
-    having: Option<Expression>,
+    _input: Box<dyn Executor + 'a>,
+    _group_by: Vec<Expression>,
+    _aggregates: Vec<AggregateExpr>,
+    _having: Option<Expression>,
     schema: Vec<Column>,
-    
-    // Current group state
-    current_group: Option<Vec<String>>,
-    current_state: AggregateState,
-    done: bool,
 }
 
 impl<'a> StreamAggregateExecutor<'a> {
@@ -348,14 +346,11 @@ impl<'a> StreamAggregateExecutor<'a> {
         }
         
         Self {
-            input,
-            group_by,
-            aggregates,
-            having,
+            _input: input,
+            _group_by: group_by,
+            _aggregates: aggregates,
+            _having: having,
             schema,
-            current_group: None,
-            current_state: AggregateState::default(),
-            done: false,
         }
     }
     
