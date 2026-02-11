@@ -16,7 +16,33 @@ use bedrock::wal::{WalManager, WalRecord};
 use bedrock::{PageId, btree};
 use chrono::NaiveDate;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn lock_system_catalog<'a>(
+    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
+    system_catalog
+        .lock()
+        .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))
+}
+
+fn lock_wal<'a>(
+    wm: &'a Arc<Mutex<WalManager>>,
+) -> Result<MutexGuard<'a, WalManager>, ExecutionError> {
+    wm.lock()
+        .map_err(|_| ExecutionError::GenericError("wal lock poisoned".to_string()))
+}
+
+fn parse_i32_literal(value: &str, context: &str) -> Result<i32, ExecutionError> {
+    value.parse::<i32>().map_err(|_| {
+        ExecutionError::GenericError(format!("Invalid integer value in {}: {}", context, value))
+    })
+}
+
+fn epoch_date() -> Result<NaiveDate, ExecutionError> {
+    NaiveDate::from_ymd_opt(2000, 1, 1)
+        .ok_or_else(|| ExecutionError::GenericError("failed to construct epoch date".to_string()))
+}
 
 pub(super) fn execute_insert(
     stmt: &InsertStatement,
@@ -28,9 +54,7 @@ pub(super) fn execute_insert(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, mut first_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, mut first_page_id) = lock_system_catalog(system_catalog)?
         .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
@@ -77,10 +101,8 @@ fn insert_tuple_and_update_indexes(
 
     let item_id = insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)?;
 
-    let schema = system_catalog
-        .lock()
-        .unwrap()
-        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema =
+        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let parsed_tuple = parse_tuple(tuple_data, &schema);
     let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
 
@@ -114,30 +136,29 @@ pub(super) fn execute_update(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, first_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
         .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(0);
     }
 
-    let schema = system_catalog
-        .lock()
-        .unwrap()
-        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema =
+        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
     let mut rows_affected = 0;
     let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
-    let rows_to_update: Vec<_> = all_rows
-        .into_iter()
-        .filter(|(_, _, parsed)| {
-            stmt.where_clause
-                .as_ref()
-                .map_or(true, |p| evaluate_expr_for_row(p, parsed).unwrap_or(false))
-        })
-        .collect();
+    let mut rows_to_update = Vec::new();
+    for row_entry in all_rows {
+        let should_update = if let Some(predicate) = &stmt.where_clause {
+            evaluate_expr_for_row(predicate, &row_entry.2)?
+        } else {
+            true
+        };
+        if should_update {
+            rows_to_update.push(row_entry);
+        }
+    }
 
     for (page_id, item_id, old_parsed) in rows_to_update {
         lm.lock(
@@ -168,7 +189,9 @@ pub(super) fn execute_update(
         let new_data = serialize_literal_map(&new_parsed, &schema)?;
 
         let before_page = page.data.to_vec();
-        let item_id_data = page.get_item_id_data(item_id).unwrap();
+        let item_id_data = page.get_item_id_data(item_id).ok_or_else(|| {
+            ExecutionError::GenericError("missing item metadata for visible tuple".to_string())
+        })?;
         let mut header = page.read_tuple_header(item_id_data.offset);
         header.xmax = tx_id;
         page.write_tuple_header(item_id_data.offset, &header);
@@ -184,7 +207,7 @@ pub(super) fn execute_update(
 
         rows_affected += 1;
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
+        let lsn = lock_wal(wm)?.log(
             tx_id,
             prev_lsn,
             &WalRecord::UpdateTuple {
@@ -243,8 +266,15 @@ pub(super) fn execute_delete(
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
     let mut executor = DeleteExecutor::new(stmt, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)?;
-    let result = executor.next()?.unwrap();
-    Ok(result[0].parse().unwrap())
+    let result = executor.next()?.ok_or_else(|| {
+        ExecutionError::GenericError("delete executor did not produce result row".to_string())
+    })?;
+    let rows_deleted = result
+        .first()
+        .ok_or_else(|| ExecutionError::GenericError("missing rows_deleted field".to_string()))?
+        .parse::<u32>()
+        .map_err(|_| ExecutionError::GenericError("invalid rows_deleted value".to_string()))?;
+    Ok(rows_deleted)
 }
 
 pub(super) fn scan_table(
@@ -311,15 +341,11 @@ impl<'a> DeleteExecutor<'a> {
         snapshot: &'a Snapshot,
         system_catalog: &'a Arc<Mutex<SystemCatalog>>,
     ) -> Result<Self, ExecutionError> {
-        let (table_oid, first_page_id) = system_catalog
-            .lock()
-            .unwrap()
+        let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
             .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
             .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-        let schema = system_catalog
-            .lock()
-            .unwrap()
+        let schema = lock_system_catalog(system_catalog)?
             .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
         let indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
 
@@ -378,9 +404,12 @@ impl<'a> Executor for DeleteExecutor<'a> {
             if page.is_visible(self.snapshot, self.tx_id, item_id) {
                 if let Some(tuple_data) = page.get_tuple(item_id) {
                     let parsed_row = parse_tuple(tuple_data, &self.schema);
-                    if self.stmt.where_clause.as_ref().map_or(true, |p| {
-                        evaluate_expr_for_row(p, &parsed_row).unwrap_or(false)
-                    }) {
+                    let should_delete = if let Some(predicate) = &self.stmt.where_clause {
+                        evaluate_expr_for_row(predicate, &parsed_row)?
+                    } else {
+                        true
+                    };
+                    if should_delete {
                         self.lm.lock(
                             self.tx_id,
                             LockableResource::Tuple((self.current_page_id, item_id)),
@@ -399,7 +428,7 @@ impl<'a> Executor for DeleteExecutor<'a> {
                             let after_page = page.data.to_vec();
 
                             let prev_lsn = self.tm.get_last_lsn(self.tx_id).unwrap_or(0);
-                            let lsn = self.wm.lock().unwrap().log(
+                            let lsn = lock_wal(self.wm)?.log(
                                 self.tx_id,
                                 prev_lsn,
                                 &WalRecord::DeleteTuple {
@@ -449,11 +478,11 @@ impl<'a> Executor for DeleteExecutor<'a> {
 
 pub(super) fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionError> {
     let mut tuple_data = Vec::new();
+    let epoch = epoch_date()?;
     for value in values {
         match value {
-            Expression::Literal(LiteralValue::Number(n)) => {
-                tuple_data.extend_from_slice(&n.parse::<i32>().unwrap_or(0).to_be_bytes())
-            }
+            Expression::Literal(LiteralValue::Number(n)) => tuple_data
+                .extend_from_slice(&parse_i32_literal(n, "insert expression")?.to_be_bytes()),
             Expression::Literal(LiteralValue::String(s)) => {
                 tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
                 tuple_data.extend_from_slice(s.as_bytes());
@@ -462,7 +491,6 @@ pub(super) fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, Ex
             Expression::Literal(LiteralValue::Date(s)) => {
                 let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
                     .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
-                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
                 let days = date.signed_duration_since(epoch).num_days() as i32;
                 tuple_data.extend_from_slice(&days.to_be_bytes());
             }
@@ -484,12 +512,12 @@ pub(super) fn serialize_literal_map(
     schema: &[Column],
 ) -> Result<Vec<u8>, ExecutionError> {
     let mut new_data = Vec::new();
+    let epoch = epoch_date()?;
     for col in schema {
         if let Some(val) = map.get(&col.name) {
             match val {
-                LiteralValue::Number(n) => {
-                    new_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes())
-                }
+                LiteralValue::Number(n) => new_data
+                    .extend_from_slice(&parse_i32_literal(n, "row serialization")?.to_be_bytes()),
                 LiteralValue::String(s) => {
                     new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
                     new_data.extend_from_slice(s.as_bytes());
@@ -498,7 +526,6 @@ pub(super) fn serialize_literal_map(
                 LiteralValue::Date(s) => {
                     let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
                         .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
-                    let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
                     let days = date.signed_duration_since(epoch).num_days() as i32;
                     new_data.extend_from_slice(&days.to_be_bytes());
                 }
@@ -575,7 +602,7 @@ pub(super) fn insert_tuple_and_log(
     let after_page = page.data.to_vec();
 
     let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-    let lsn = wm.lock().unwrap().log(
+    let lsn = lock_wal(wm)?.log(
         tx_id,
         prev_lsn,
         &WalRecord::InsertTuple {
@@ -591,4 +618,34 @@ pub(super) fn insert_tuple_and_log(
     header.lsn = lsn;
     page.write_header(&header);
     Ok(item_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{serialize_expressions, serialize_literal_map};
+    use crate::parser::{Expression, LiteralValue};
+    use crate::types::Column;
+    use std::collections::HashMap;
+
+    #[test]
+    fn serialize_expressions_rejects_invalid_integer_literal() {
+        let values = vec![Expression::Literal(LiteralValue::Number(
+            "1.25".to_string(),
+        ))];
+        let result = serialize_expressions(&values);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_literal_map_rejects_invalid_integer_literal() {
+        let mut map = HashMap::new();
+        map.insert("id".to_string(), LiteralValue::Number("abc".to_string()));
+        let schema = vec![Column {
+            name: "id".to_string(),
+            type_id: 23,
+        }];
+
+        let result = serialize_literal_map(&map, &schema);
+        assert!(result.is_err());
+    }
 }
