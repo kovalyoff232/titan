@@ -36,6 +36,9 @@ pub(super) struct InsertPathCtx<'a> {
     pub(super) snapshot: &'a Snapshot,
 }
 
+pub(super) type ParsedRow = HashMap<String, LiteralValue>;
+pub(super) type ScannedRow = (PageId, u16, ParsedRow);
+
 fn lock_system_catalog<'a>(
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
 ) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
@@ -331,7 +334,7 @@ pub(super) fn scan_table(
     tx_id: u32,
     snapshot: &Snapshot,
     for_update: bool,
-) -> Result<Vec<(PageId, u16, HashMap<String, LiteralValue>)>, ExecutionError> {
+) -> Result<Vec<ScannedRow>, ExecutionError> {
     let mut rows = Vec::new();
     if first_page_id == INVALID_PAGE_ID {
         return Ok(rows);

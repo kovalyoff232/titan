@@ -28,7 +28,7 @@ pub use helpers::parse_tuple;
 use join::{HashJoinExecutor, NestedLoopJoinExecutor};
 use maintenance::{MaintenanceCtx, execute_analyze, execute_vacuum};
 use pipeline::{FilterExecutor, ProjectionExecutor, SortExecutor};
-use scan::{IndexScanExecutor, TableScanExecutor};
+use scan::{IndexScanExecutor, TableScanConfig, TableScanExecutor};
 
 pub trait Executor {
     fn next(&mut self) -> Result<Option<Row>, ExecutionError>;
@@ -191,12 +191,14 @@ fn create_executor<'a>(
             let scan_executor = Box::new(TableScanExecutor::new(
                 ctx.bpm,
                 ctx.lm,
-                first_page_id,
-                schema,
-                ctx.tx_id,
-                ctx.snapshot,
-                ctx.select_stmt.for_update,
-                None,
+                TableScanConfig {
+                    first_page_id,
+                    schema,
+                    tx_id: ctx.tx_id,
+                    snapshot: ctx.snapshot,
+                    for_update: ctx.select_stmt.for_update,
+                    filter: None,
+                },
             ));
 
             if let Some(predicate) = filter {

@@ -44,26 +44,30 @@ pub(super) struct TableScanExecutor<'a> {
     current_item_id: u16,
 }
 
+pub(super) struct TableScanConfig<'a> {
+    pub(super) first_page_id: PageId,
+    pub(super) schema: Vec<Column>,
+    pub(super) tx_id: u32,
+    pub(super) snapshot: &'a Snapshot,
+    pub(super) for_update: bool,
+    pub(super) filter: Option<Expression>,
+}
+
 impl<'a> TableScanExecutor<'a> {
     pub(super) fn new(
         bpm: &'a Arc<BufferPoolManager>,
         lm: &'a Arc<LockManager>,
-        first_page_id: PageId,
-        schema: Vec<Column>,
-        tx_id: u32,
-        snapshot: &'a Snapshot,
-        for_update: bool,
-        filter: Option<Expression>,
+        config: TableScanConfig<'a>,
     ) -> Self {
         Self {
             bpm,
             lm,
-            schema,
-            tx_id,
-            snapshot,
-            for_update,
-            filter,
-            current_page_id: first_page_id,
+            schema: config.schema,
+            tx_id: config.tx_id,
+            snapshot: config.snapshot,
+            for_update: config.for_update,
+            filter: config.filter,
+            current_page_id: config.first_page_id,
             current_item_id: 0,
         }
     }
