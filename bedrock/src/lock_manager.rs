@@ -267,20 +267,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    #[test]
-    fn shared_locks_are_compatible() {
-        let lm = LockManager::new();
-        let resource = LockableResource::Table(7);
-
-        assert!(lm.lock(1, resource, LockMode::Shared).is_ok());
-        assert!(lm.lock(2, resource, LockMode::Shared).is_ok());
-
-        lm.unlock_all(1);
-        lm.unlock_all(2);
-    }
-
-    #[test]
-    fn deadlock_is_detected_for_two_transactions() {
+    fn run_two_tx_deadlock_round() -> usize {
         let lm = Arc::new(LockManager::new());
         let a = LockableResource::Table(11);
         let b = LockableResource::Table(12);
@@ -297,30 +284,54 @@ mod tests {
             if result.is_err() {
                 lm_t1.unlock_all(1);
             }
-            tx_t1.send(("t1", result)).unwrap();
+            tx_t1.send(result).unwrap();
         });
 
         let lm_t2 = Arc::clone(&lm);
-        let tx_t2 = tx.clone();
         let h2 = thread::spawn(move || {
             let result = lm_t2.lock(2, a, LockMode::Exclusive);
             lm_t2.unlock_all(2);
-            tx_t2.send(("t2", result)).unwrap();
+            tx.send(result).unwrap();
         });
 
-        let r1 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let r2 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let r1 = rx.recv_timeout(Duration::from_millis(400)).unwrap();
+        let r2 = rx.recv_timeout(Duration::from_millis(400)).unwrap();
 
         h1.join().unwrap();
         h2.join().unwrap();
 
         let mut deadlock_count = 0;
-        for (_, res) in [r1, r2] {
+        for res in [r1, r2] {
             if matches!(res, Err(LockError::Deadlock)) {
                 deadlock_count += 1;
             }
         }
+        deadlock_count
+    }
 
+    #[test]
+    fn shared_locks_are_compatible() {
+        let lm = LockManager::new();
+        let resource = LockableResource::Table(7);
+
+        assert!(lm.lock(1, resource, LockMode::Shared).is_ok());
+        assert!(lm.lock(2, resource, LockMode::Shared).is_ok());
+
+        lm.unlock_all(1);
+        lm.unlock_all(2);
+    }
+
+    #[test]
+    fn deadlock_is_detected_for_two_transactions() {
+        let deadlock_count = run_two_tx_deadlock_round();
         assert!(deadlock_count >= 1);
+    }
+
+    #[test]
+    fn deadlock_detection_stable_over_many_rounds() {
+        for _ in 0..100 {
+            let deadlock_count = run_two_tx_deadlock_round();
+            assert!(deadlock_count >= 1);
+        }
     }
 }
