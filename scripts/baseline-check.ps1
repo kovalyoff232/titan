@@ -1,6 +1,10 @@
 param(
     [switch]$SkipTests,
-    [switch]$SkipClippy
+    [switch]$SkipClippy,
+    [int]$FmtTimeoutSec = 120,
+    [int]$ClippyTimeoutSec = 900,
+    [int]$BuildTimeoutSec = 900,
+    [int]$TestTimeoutSec = 420
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,13 +57,13 @@ $clippyCmd = "& '$cargo' clippy --package titan_bin --lib -- -W clippy::unwrap_u
 $buildCmd = "& '$cargo' test --workspace --no-run"
 $testCmd = "& '$cargo' test --workspace"
 
-Invoke-Step -Name "format-check" -Command $fmtCmd -TimeoutSec 120
+Invoke-Step -Name "format-check" -Command $fmtCmd -TimeoutSec $FmtTimeoutSec
 if (-not $SkipClippy) {
-    Invoke-Step -Name "clippy-core" -Command $clippyCmd -TimeoutSec 900
+    Invoke-Step -Name "clippy-core" -Command $clippyCmd -TimeoutSec $ClippyTimeoutSec
 }
-Invoke-Step -Name "build-check" -Command $buildCmd -TimeoutSec 900
+Invoke-Step -Name "build-check" -Command $buildCmd -TimeoutSec $BuildTimeoutSec
 if (-not $SkipTests) {
-    Invoke-Step -Name "test-run" -Command $testCmd -TimeoutSec 900
+    Invoke-Step -Name "test-run" -Command $testCmd -TimeoutSec $TestTimeoutSec
 }
 
 Write-Host "Baseline checks completed."

@@ -74,7 +74,7 @@ fn parse_simple_query_payload(payload: &[u8]) -> io::Result<String> {
 
 fn lock_wal<'a>(wal: &'a Arc<Mutex<WalManager>>) -> io::Result<MutexGuard<'a, WalManager>> {
     wal.lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "wal lock poisoned"))
+        .map_err(|_| io::Error::other("wal lock poisoned"))
 }
 
 fn abort_transaction(
@@ -445,12 +445,8 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
 
     if db_is_new {
         println!("[INIT] New database detected, initializing system tables.");
-        initialize_db(&bpm, &tm, &lm, &wal, &system_catalog).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to initialize database: {:?}", e),
-            )
-        })?;
+        initialize_db(&bpm, &tm, &lm, &wal, &system_catalog)
+            .map_err(|e| io::Error::other(format!("failed to initialize database: {:?}", e)))?;
 
         println!("[INIT] Flushing all pages to disk after initialization.");
         bpm.flush_all_pages()?;

@@ -628,7 +628,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let dump_page = text::keyword("DUMP")
         .padded()
         .ignore_then(text::keyword("PAGE").padded())
-        .ignore_then(text::int(10).map(|s: String| s.parse().unwrap()))
+        .ignore_then(text::int(10).try_map(|s: String, span| {
+            s.parse::<u32>()
+                .map_err(|_| Simple::custom(span, format!("invalid page id: {}", s)))
+        }))
         .map(Statement::DumpPage);
 
     let begin = text::keyword("BEGIN").padded().to(Statement::Begin);
@@ -677,4 +680,21 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .repeated()
         .then_ignore(end())
         .parse(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Statement, sql_parser};
+
+    #[test]
+    fn dump_page_parses_valid_u32() {
+        let parsed = sql_parser("DUMP PAGE 42;").expect("DUMP PAGE should parse");
+        assert_eq!(parsed, vec![Statement::DumpPage(42)]);
+    }
+
+    #[test]
+    fn dump_page_rejects_out_of_range_value() {
+        let parsed = sql_parser("DUMP PAGE 4294967296;");
+        assert!(parsed.is_err());
+    }
 }

@@ -373,9 +373,12 @@ impl WalManager {
             match &entry.record {
                 WalRecord::BTreePage { page_id, data, .. } => {
                     let mut page = pager.read_page(*page_id)?;
-                    if page.read_header().lsn < entry.lsn {
+                    let header = page.read_header();
+                    let should_apply = header.lsn < entry.lsn
+                        || (header.lsn == entry.lsn && page.data.as_slice() != data.as_slice());
+                    if should_apply {
                         page.data.copy_from_slice(data);
-                        let mut header = page.read_header();
+                        let mut header = header;
                         header.lsn = entry.lsn;
                         page.write_header(&header);
                         pager.write_page(&page)?;
@@ -387,8 +390,11 @@ impl WalManager {
                     ..
                 } => {
                     let mut page = pager.read_page(*page_id)?;
-                    if page.read_header().lsn < entry.lsn {
-                        let mut header = page.read_header();
+                    let header = page.read_header();
+                    let should_apply = header.lsn < entry.lsn
+                        || (header.lsn == entry.lsn && header.next_page_id != *next_page_id);
+                    if should_apply {
+                        let mut header = header;
                         header.next_page_id = *next_page_id;
                         header.lsn = entry.lsn;
                         page.write_header(&header);
@@ -411,11 +417,16 @@ impl WalManager {
                     ..
                 } => {
                     let mut page = pager.read_page(*page_id)?;
-                    if page.read_header().lsn < entry.lsn {
+                    let header = page.read_header();
+                    let should_apply = header.lsn < entry.lsn
+                        || (header.lsn == entry.lsn
+                            && after_page.len() == page.data.len()
+                            && page.data.as_slice() != after_page.as_slice());
+                    if should_apply {
                         if after_page.len() == page.data.len() {
                             page.data.copy_from_slice(after_page);
                         }
-                        let mut header = page.read_header();
+                        let mut header = header;
                         header.lsn = entry.lsn;
                         page.write_header(&header);
                         pager.write_page(&page)?;
@@ -575,6 +586,37 @@ mod tests {
         let mut wal = WalManager::open(&wal_path).unwrap();
         let err = wal.read_record(lsn).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_recover_applies_lsn_zero_update_on_empty_page() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("recover_lsn_zero.wal");
+        let db_path = dir.path().join("recover_lsn_zero.db");
+
+        let before_page = page_image(0, 0x01);
+        let after_page = page_image(0, 0xAA);
+
+        {
+            let mut wal = WalManager::open(&wal_path).unwrap();
+            let update = WalRecord::UpdateTuple {
+                tx_id: 3,
+                page_id: 0,
+                item_id: 0,
+                before_page: before_page.clone(),
+                after_page: after_page.clone(),
+            };
+            let lsn = wal.log(3, 0, &update).unwrap();
+            assert_eq!(lsn, 0);
+            wal.log(3, lsn, &WalRecord::Commit { tx_id: 3 }).unwrap();
+        }
+
+        let mut pager = Pager::open(&db_path).unwrap();
+        let highest_tx = WalManager::recover(&wal_path, &mut pager).unwrap();
+        let page = pager.read_page(0).unwrap();
+
+        assert_eq!(highest_tx, 3);
+        assert_eq!(page.data.to_vec(), after_page);
     }
 
     #[test]
