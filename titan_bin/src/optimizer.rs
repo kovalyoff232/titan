@@ -4,6 +4,7 @@ use crate::parser::{Expression, LiteralValue, SelectItem};
 use crate::planner::LogicalPlan;
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -136,6 +137,118 @@ struct PlanInfo {
     plan: Arc<PhysicalPlan>,
     cost: f64,
     cardinality: f64,
+}
+
+fn compare_plan_info_stable(a: &PlanInfo, b: &PlanInfo) -> Ordering {
+    match a.cost.partial_cmp(&b.cost).unwrap_or(Ordering::Equal) {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+
+    match a
+        .cardinality
+        .partial_cmp(&b.cardinality)
+        .unwrap_or(Ordering::Equal)
+    {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+
+    physical_plan_stability_key(&a.plan).cmp(&physical_plan_stability_key(&b.plan))
+}
+
+fn physical_plan_stability_key(plan: &PhysicalPlan) -> String {
+    match plan {
+        PhysicalPlan::TableScan { table_name, filter } => {
+            format!("scan:{table_name}:{filter:?}")
+        }
+        PhysicalPlan::IndexScan {
+            table_name,
+            index_name,
+            key,
+        } => format!("idx:{table_name}:{index_name}:{key}"),
+        PhysicalPlan::Filter { input, predicate } => {
+            format!(
+                "filter:{}:{predicate:?}",
+                physical_plan_stability_key(input)
+            )
+        }
+        PhysicalPlan::Projection { input, expressions } => {
+            format!(
+                "proj:{}:{expressions:?}",
+                physical_plan_stability_key(input)
+            )
+        }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => format!(
+            "hjoin:{}:{}:{left_key:?}:{right_key:?}",
+            physical_plan_stability_key(left),
+            physical_plan_stability_key(right)
+        ),
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => format!(
+            "mjoin:{}:{}:{left_key:?}:{right_key:?}",
+            physical_plan_stability_key(left),
+            physical_plan_stability_key(right)
+        ),
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            condition,
+        } => format!(
+            "nlj:{}:{}:{condition:?}",
+            physical_plan_stability_key(left),
+            physical_plan_stability_key(right)
+        ),
+        PhysicalPlan::Sort { input, order_by } => {
+            format!("sort:{}:{order_by:?}", physical_plan_stability_key(input))
+        }
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+            having,
+        } => format!(
+            "hagg:{}:{group_by:?}:{aggregates:?}:{having:?}",
+            physical_plan_stability_key(input)
+        ),
+        PhysicalPlan::StreamAggregate {
+            input,
+            group_by,
+            aggregates,
+            having,
+        } => format!(
+            "sagg:{}:{group_by:?}:{aggregates:?}:{having:?}",
+            physical_plan_stability_key(input)
+        ),
+        PhysicalPlan::Window {
+            input,
+            window_functions,
+        } => format!(
+            "window:{}:{window_functions:?}",
+            physical_plan_stability_key(input)
+        ),
+        PhysicalPlan::MaterializeCTE { name, plan } => {
+            format!("matcte:{name}:{}", physical_plan_stability_key(plan))
+        }
+        PhysicalPlan::CTEScan { name } => format!("ctescan:{name}"),
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => format!(
+            "limit:{}:{limit:?}:{offset:?}",
+            physical_plan_stability_key(input)
+        ),
+    }
 }
 
 fn create_physical_plan(

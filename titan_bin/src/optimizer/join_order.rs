@@ -1,8 +1,7 @@
-use super::{PhysicalPlan, PlanInfo, TableStats};
+use super::{PhysicalPlan, PlanInfo, TableStats, compare_plan_info_stable};
 use crate::catalog::SystemCatalog;
 use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use crate::planner::LogicalPlan;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -151,8 +150,7 @@ pub(super) fn choose_best_join_plan(
             }
 
             if !best_plans_for_subset.is_empty() {
-                best_plans_for_subset
-                    .sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap_or(Ordering::Equal));
+                best_plans_for_subset.sort_by(compare_plan_info_stable);
                 cache.insert(subset_mask, best_plans_for_subset);
             }
         }
@@ -162,4 +160,83 @@ pub(super) fn choose_best_join_plan(
     cache
         .get(&final_mask)
         .and_then(|plans| plans.first().cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimizer::physical_plan_stability_key;
+    use std::collections::HashMap;
+
+    fn build_two_table_equi_join() -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Scan {
+                table_name: "a".to_string(),
+                alias: None,
+                filter: None,
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                table_name: "b".to_string(),
+                alias: None,
+                filter: None,
+            }),
+            condition: Expression::Binary {
+                left: Box::new(Expression::QualifiedColumn(
+                    "a".to_string(),
+                    "id".to_string(),
+                )),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expression::QualifiedColumn(
+                    "b".to_string(),
+                    "id".to_string(),
+                )),
+            },
+        }
+    }
+
+    #[test]
+    fn stable_compare_breaks_equal_cost_ties_by_plan_key() {
+        let mut candidates = vec![
+            PlanInfo {
+                plan: Arc::new(PhysicalPlan::TableScan {
+                    table_name: "z_table".to_string(),
+                    filter: None,
+                }),
+                cost: 1.0,
+                cardinality: 10.0,
+            },
+            PlanInfo {
+                plan: Arc::new(PhysicalPlan::TableScan {
+                    table_name: "a_table".to_string(),
+                    filter: None,
+                }),
+                cost: 1.0,
+                cardinality: 10.0,
+            },
+        ];
+
+        candidates.sort_by(compare_plan_info_stable);
+        let first_key = physical_plan_stability_key(&candidates[0].plan);
+        let second_key = physical_plan_stability_key(&candidates[1].plan);
+        assert!(first_key < second_key);
+    }
+
+    #[test]
+    fn choose_best_join_plan_is_stable_across_invocations() {
+        let logical = build_two_table_equi_join();
+        let table_names = vec!["a".to_string(), "b".to_string()];
+        let stats: HashMap<String, Arc<TableStats>> = HashMap::new();
+        let system_catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+
+        let expected = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+            .map(|p| physical_plan_stability_key(&p.plan))
+            .expect("expected a plan");
+
+        for _ in 0..50 {
+            let current = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+                .map(|p| physical_plan_stability_key(&p.plan))
+                .expect("expected a plan");
+            assert_eq!(current, expected);
+        }
+    }
 }
