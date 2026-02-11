@@ -12,7 +12,7 @@ pub struct Pager {
 impl Pager {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path_ref = path.as_ref();
-        println!("[Pager::open] Opening database file at: {path_ref:?}");
+        crate::bedrock_debug_log!("[Pager::open] Opening database file at: {path_ref:?}");
         if let Some(parent) = path_ref.parent() {
             create_dir_all(parent)?;
         }
@@ -25,16 +25,20 @@ impl Pager {
 
         let file_size = file.metadata()?.len();
         let num_pages = (file_size / PAGE_SIZE as u64) as u32;
-        println!("[Pager::open] File size: {file_size}, initial num_pages: {num_pages}");
+        crate::bedrock_debug_log!(
+            "[Pager::open] File size: {file_size}, initial num_pages: {num_pages}"
+        );
 
         Ok(Self { file, num_pages })
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
-        println!("[Pager::read_page] Reading page_id: {page_id}");
+        crate::bedrock_debug_log!("[Pager::read_page] Reading page_id: {page_id}");
         let mut page = Page::new(page_id);
         if page_id >= self.num_pages {
-            println!("[Pager::read_page] Page {page_id} is new, returning initialized page.");
+            crate::bedrock_debug_log!(
+                "[Pager::read_page] Page {page_id} is new, returning initialized page."
+            );
             return Ok(page);
         }
 
@@ -43,32 +47,32 @@ impl Pager {
 
         let bytes_read = self.file.read(&mut page.data)?;
         if bytes_read == 0 {
-            println!(
+            crate::bedrock_debug_log!(
                 "[Pager::read_page] Read 0 bytes for page {page_id}, using fresh initialized page."
             );
         } else if bytes_read < PAGE_SIZE {
-            println!(
+            crate::bedrock_debug_log!(
                 "[Pager::read_page] Read {bytes_read} bytes (less than page size), zeroing rest."
             );
             for i in bytes_read..PAGE_SIZE {
                 page.data[i] = 0;
             }
         } else {
-            println!("[Pager::read_page] Successfully read full page {page_id}");
+            crate::bedrock_debug_log!("[Pager::read_page] Successfully read full page {page_id}");
         }
 
         Ok(page)
     }
 
     pub fn write_page(&mut self, page: &Page) -> io::Result<()> {
-        println!("[Pager::write_page] Writing page_id: {}", page.id);
+        crate::bedrock_debug_log!("[Pager::write_page] Writing page_id: {}", page.id);
         let offset = page.id as u64 * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&page.data)?;
         self.file.sync_all()?;
         if page.id >= self.num_pages {
             self.num_pages = page.id + 1;
-            println!(
+            crate::bedrock_debug_log!(
                 "[Pager::write_page] Increased num_pages to {}",
                 self.num_pages
             );
@@ -79,7 +83,7 @@ impl Pager {
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         let page_id = self.num_pages;
         self.num_pages += 1;
-        println!(
+        crate::bedrock_debug_log!(
             "[Pager::allocate_page] Allocating new page_id: {page_id}. New num_pages: {}",
             self.num_pages
         );

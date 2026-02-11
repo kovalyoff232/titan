@@ -26,6 +26,19 @@ const SSL_REQUEST_CODE: u32 = 80_877_103;
 const PG_PROTOCOL_V3: u32 = 196_608;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+pub fn debug_logs_enabled() -> bool {
+    std::env::var_os("TITAN_DEBUG_LOG").is_some()
+}
+
+#[macro_export]
+macro_rules! titan_debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_logs_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
 fn parse_startup_code(startup_buf: &[u8], read_len: usize) -> io::Result<u32> {
     if read_len < 8 || startup_buf.len() < 8 {
         return Err(io::Error::new(
@@ -187,7 +200,7 @@ fn handle_client(
     wal: Arc<Mutex<WalManager>>,
     system_catalog: Arc<Mutex<catalog::SystemCatalog>>,
 ) -> io::Result<()> {
-    println!(
+    crate::titan_debug_log!(
         "[handle_client] New connection from: {}",
         stream.peer_addr()?
     );
@@ -201,7 +214,7 @@ fn handle_client(
 
     let request_code = parse_startup_code(&startup_buf, startup_len)?;
     if request_code == SSL_REQUEST_CODE {
-        println!("[handle_client] SSLRequest received, denying.");
+        crate::titan_debug_log!("[handle_client] SSLRequest received, denying.");
         stream.write_all(b"N")?;
         startup_len = stream.read(&mut startup_buf)?;
         if startup_len == 0 {
@@ -215,13 +228,13 @@ fn handle_client(
     }
 
     let protocol_version = parse_startup_code(&startup_buf, startup_len)?;
-    println!("[handle_client] Protocol version: {}", protocol_version);
+    crate::titan_debug_log!("[handle_client] Protocol version: {}", protocol_version);
     if protocol_version != PG_PROTOCOL_V3 {
         send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
         return Ok(());
     }
 
-    println!("[handle_client] Sending AuthenticationOk and ReadyForQuery.");
+    crate::titan_debug_log!("[handle_client] Sending AuthenticationOk and ReadyForQuery.");
     write_message(&mut stream, b'R', &0i32.to_be_bytes())?;
     send_ready_for_query(&mut stream)?;
 
@@ -232,10 +245,14 @@ fn handle_client(
     loop {
         let mut msg_type = [0u8; 1];
         if stream.read_exact(&mut msg_type).is_err() {
-            println!("[handle_client] Connection closed by peer.");
+            crate::titan_debug_log!("[handle_client] Connection closed by peer.");
             if in_transaction {
                 if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
-                    println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                    crate::titan_debug_log!(
+                        "[handle_client] Failed to abort tx_id {}: {}",
+                        tx_id,
+                        e
+                    );
                 }
             }
             return Ok(());
@@ -253,18 +270,18 @@ fn handle_client(
                 let query_str = match parse_simple_query_payload(&buffer[..len]) {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("[handle_client] Invalid query payload: {}", e);
+                        crate::titan_debug_log!("[handle_client] Invalid query payload: {}", e);
                         send_error_response(&mut stream, "Invalid simple query payload", "08P01")?;
                         send_ready_for_query(&mut stream)?;
                         continue;
                     }
                 };
-                println!("[handle_client] Received query: '{}'", query_str);
+                crate::titan_debug_log!("[handle_client] Received query: '{}'", query_str);
 
                 let stmts = match parser::sql_parser(&query_str) {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("[handle_client] Parsing failed: {:?}", e);
+                        crate::titan_debug_log!("[handle_client] Parsing failed: {:?}", e);
                         send_error_response(
                             &mut stream,
                             &format!("Parsing failed: {:?}", e),
@@ -281,12 +298,16 @@ fn handle_client(
                     if !in_transaction {
                         tx_id = tm.begin();
                         in_transaction = true;
-                        println!("[handle_client] Started transaction with tx_id: {}", tx_id);
+                        crate::titan_debug_log!(
+                            "[handle_client] Started transaction with tx_id: {}",
+                            tx_id
+                        );
                     }
 
-                    println!(
+                    crate::titan_debug_log!(
                         "[handle_client] Executing statement: {:?} in tx_id: {}",
-                        stmt, tx_id
+                        stmt,
+                        tx_id
                     );
                     let snapshot = tm.create_snapshot(tx_id);
                     let exec_ctx = executor::ExecuteCtx {
@@ -331,13 +352,17 @@ fn handle_client(
                             last_result = Some(res);
                         }
                         Err(errors::ExecutionError::SerializationFailure) => {
-                            println!(
+                            crate::titan_debug_log!(
                                 "[handle_client] Serialization failure for tx_id: {}.",
                                 tx_id
                             );
                             send_error_response(&mut stream, "Serialization failure", "40001")?;
                             if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
-                                println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                                crate::titan_debug_log!(
+                                    "[handle_client] Failed to abort tx_id {}: {}",
+                                    tx_id,
+                                    e
+                                );
                             }
                             in_transaction = false;
                             in_explicit_transaction = false;
@@ -345,7 +370,7 @@ fn handle_client(
                             break;
                         }
                         Err(e) => {
-                            println!("[handle_client] Execution failed: {:?}", e);
+                            crate::titan_debug_log!("[handle_client] Execution failed: {:?}", e);
                             send_error_response(
                                 &mut stream,
                                 &format!("Execution failed: {:?}", e),
@@ -355,9 +380,10 @@ fn handle_client(
                                 if let Err(abort_err) =
                                     abort_transaction(&tm, &wal, &bpm, &lm, tx_id)
                                 {
-                                    println!(
+                                    crate::titan_debug_log!(
                                         "[handle_client] Failed to abort tx_id {}: {}",
-                                        tx_id, abort_err
+                                        tx_id,
+                                        abort_err
                                     );
                                 }
                                 in_transaction = false;
@@ -393,7 +419,7 @@ fn handle_client(
                 }
 
                 if in_transaction && !in_explicit_transaction {
-                    println!(
+                    crate::titan_debug_log!(
                         "[handle_client] Committing implicit transaction with tx_id: {}",
                         tx_id
                     );
@@ -404,16 +430,22 @@ fn handle_client(
                 send_ready_for_query(&mut stream)?;
             }
             b'X' => {
-                println!("[handle_client] Terminate message received. Closing connection.");
+                crate::titan_debug_log!(
+                    "[handle_client] Terminate message received. Closing connection."
+                );
                 if in_transaction {
                     if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
-                        println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                        crate::titan_debug_log!(
+                            "[handle_client] Failed to abort tx_id {}: {}",
+                            tx_id,
+                            e
+                        );
                     }
                 }
                 return Ok(());
             }
             _ => {
-                println!(
+                crate::titan_debug_log!(
                     "[handle_client] Received unknown message type: {}",
                     msg_type[0]
                 );
@@ -423,15 +455,16 @@ fn handle_client(
 }
 
 pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<()> {
-    println!(
+    crate::titan_debug_log!(
         "[run_server] Starting server with db_path: {} and wal_path: {}",
-        db_path, wal_path
+        db_path,
+        wal_path
     );
 
     let mut pager_for_recovery = Pager::open(db_path)?;
     let db_is_new = pager_for_recovery.num_pages == 0;
     let highest_tx_id = WalManager::recover(wal_path, &mut pager_for_recovery)?;
-    println!(
+    crate::titan_debug_log!(
         "[RECOVERY] Completed. Highest TX ID found: {}",
         highest_tx_id
     );
@@ -444,13 +477,13 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
     let system_catalog = Arc::new(Mutex::new(catalog::SystemCatalog::new()));
 
     if db_is_new {
-        println!("[INIT] New database detected, initializing system tables.");
+        crate::titan_debug_log!("[INIT] New database detected, initializing system tables.");
         initialize_db(&bpm, &tm, &lm, &wal, &system_catalog)
             .map_err(|e| io::Error::other(format!("failed to initialize database: {:?}", e)))?;
 
-        println!("[INIT] Flushing all pages to disk after initialization.");
+        crate::titan_debug_log!("[INIT] Flushing all pages to disk after initialization.");
         bpm.flush_all_pages()?;
-        println!("[INIT] Flushing completed.");
+        crate::titan_debug_log!("[INIT] Flushing completed.");
     }
 
     let listener = TcpListener::bind(addr)?;
@@ -473,12 +506,12 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
                         wal_clone,
                         system_catalog_clone,
                     ) {
-                        println!("Error handling client: {}", e);
+                        eprintln!("Error handling client: {}", e);
                     }
                 });
             }
             Err(e) => {
-                println!("Connection failed: {}", e);
+                eprintln!("Connection failed: {}", e);
             }
         }
     }
@@ -492,11 +525,11 @@ fn initialize_db(
     wal: &Arc<Mutex<WalManager>>,
     system_catalog: &Arc<Mutex<catalog::SystemCatalog>>,
 ) -> Result<(), errors::ExecutionError> {
-    println!("[initialize_db] Starting database initialization.");
+    crate::titan_debug_log!("[initialize_db] Starting database initialization.");
     let tx_id = tm.begin();
     let snapshot = tm.create_snapshot(tx_id);
 
-    println!("[initialize_db] Creating pg_class table.");
+    crate::titan_debug_log!("[initialize_db] Creating pg_class table.");
     let create_pg_class = parser::CreateTableStatement {
         table_name: "pg_class".to_string(),
         columns: vec![
@@ -520,9 +553,9 @@ fn initialize_db(
         snapshot: &snapshot,
     };
     executor::execute(&parser::Statement::CreateTable(create_pg_class), &exec_ctx)?;
-    println!("[initialize_db] pg_class table created.");
+    crate::titan_debug_log!("[initialize_db] pg_class table created.");
 
-    println!("[initialize_db] Creating pg_attribute table.");
+    crate::titan_debug_log!("[initialize_db] Creating pg_attribute table.");
     let create_pg_attribute = parser::CreateTableStatement {
         table_name: "pg_attribute".to_string(),
         columns: vec![
@@ -544,9 +577,9 @@ fn initialize_db(
         &parser::Statement::CreateTable(create_pg_attribute),
         &exec_ctx,
     )?;
-    println!("[initialize_db] pg_attribute table created.");
+    crate::titan_debug_log!("[initialize_db] pg_attribute table created.");
 
-    println!("[initialize_db] Creating pg_statistic table.");
+    crate::titan_debug_log!("[initialize_db] Creating pg_statistic table.");
     let create_pg_statistic = parser::CreateTableStatement {
         table_name: "pg_statistic".to_string(),
         columns: vec![
@@ -584,14 +617,14 @@ fn initialize_db(
         &parser::Statement::CreateTable(create_pg_statistic),
         &exec_ctx,
     )?;
-    println!("[initialize_db] pg_statistic table created.");
+    crate::titan_debug_log!("[initialize_db] pg_statistic table created.");
 
     let mut wal_guard = lock_wal(wal)
         .map_err(|e| errors::ExecutionError::GenericError(format!("wal lock failed: {}", e)))?;
     tm.commit_with_wal(tx_id, &mut wal_guard)?;
     drop(wal_guard);
     lm.unlock_all(tx_id);
-    println!("[initialize_db] Initialization transaction committed.");
+    crate::titan_debug_log!("[initialize_db] Initialization transaction committed.");
     Ok(())
 }
 

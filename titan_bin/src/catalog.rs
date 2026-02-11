@@ -112,9 +112,12 @@ impl SystemCatalog {
                     if tuple_data.len() >= 9 + name_len {
                         let table_name = String::from_utf8_lossy(&tuple_data[9..9 + name_len]);
                         if table_name == name {
-                            println!(
+                            crate::titan_debug_log!(
                                 "[find_table] Checking item_id: {}, xmin: {}, xmax: {}, visible: true, name: {}",
-                                i, header.xmin, header.xmax, table_name
+                                i,
+                                header.xmin,
+                                header.xmax,
+                                table_name
                             );
                             if let (Some(table_oid), Some(table_page_id)) =
                                 (read_u32(tuple_data, 0), read_u32(tuple_data, 4))
@@ -124,9 +127,12 @@ impl SystemCatalog {
                                     .is_none_or(|(xmin, _, _)| header.xmin > *xmin)
                                 {
                                     best_candidate = Some((header.xmin, table_oid, table_page_id));
-                                    println!(
+                                    crate::titan_debug_log!(
                                         "[find_table] Found candidate for '{}': oid={}, page_id={}, xmin={}",
-                                        name, table_oid, table_page_id, header.xmin
+                                        name,
+                                        table_oid,
+                                        table_page_id,
+                                        header.xmin
                                     );
                                 }
                             }
@@ -137,13 +143,16 @@ impl SystemCatalog {
         }
 
         if let Some((xmin, oid, page_id)) = best_candidate {
-            println!(
+            crate::titan_debug_log!(
                 "[find_table] Selected best candidate for '{}': oid={}, page_id={}, xmin={}",
-                name, oid, page_id, xmin
+                name,
+                oid,
+                page_id,
+                xmin
             );
             Ok(Some((oid, page_id)))
         } else {
-            println!("[find_table] No visible table named '{}' found.", name);
+            crate::titan_debug_log!("[find_table] No visible table named '{}' found.", name);
             Ok(None)
         }
     }

@@ -93,14 +93,14 @@ impl Page {
         let needed_space = tuple_len + item_id_len;
 
         let header = self.read_header();
-        println!(
+        crate::bedrock_debug_log!(
             "[Page::add_tuple] PageId: {}, Needed space: {}, Free space: {}",
             self.id,
             needed_space,
             header.upper_offset.saturating_sub(header.lower_offset)
         );
         if header.upper_offset.saturating_sub(header.lower_offset) < needed_space as u16 {
-            println!("[Page::add_tuple] Not enough space on page {}", self.id);
+            crate::bedrock_debug_log!("[Page::add_tuple] Not enough space on page {}", self.id);
             return None;
         }
 
@@ -131,9 +131,12 @@ impl Page {
         header.upper_offset = tuple_offset;
         self.write_header(&header);
 
-        println!(
+        crate::bedrock_debug_log!(
             "[Page::add_tuple] Added tuple to page {}, item_id_index: {}, xmin: {}, xmax: {}",
-            self.id, item_id_index, xmin, xmax
+            self.id,
+            item_id_index,
+            xmin,
+            xmax
         );
 
         Some(item_id_index)

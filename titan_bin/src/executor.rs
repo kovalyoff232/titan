@@ -61,7 +61,7 @@ pub fn execute(stmt: &Statement, ctx: &ExecuteCtx<'_>) -> Result<ExecuteResult, 
             let physical_plan =
                 optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)?;
 
-            println!("[Executor] Physical Plan: {:?}", physical_plan);
+            crate::titan_debug_log!("[Executor] Physical Plan: {:?}", physical_plan);
 
             let build_ctx = ExecutorBuildCtx {
                 bpm,

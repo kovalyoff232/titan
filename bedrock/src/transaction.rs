@@ -61,7 +61,7 @@ fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl TransactionManager {
     pub fn new(initial_tx_id: TransactionId) -> Self {
-        println!(
+        crate::bedrock_debug_log!(
             "[TM::new] Initializing with next_transaction_id = {}",
             initial_tx_id
         );
@@ -79,7 +79,7 @@ impl TransactionManager {
 
     pub fn get_next_oid(&self) -> u32 {
         let oid = self.state.next_oid.fetch_add(1, Ordering::SeqCst);
-        println!("[TM::get_next_oid] Vending new OID: {}", oid);
+        crate::bedrock_debug_log!("[TM::get_next_oid] Vending new OID: {}", oid);
         oid
     }
 
@@ -127,7 +127,7 @@ impl TransactionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(tx_id, TransactionStatus::Active);
-        println!(
+        crate::bedrock_debug_log!(
             "[TM::begin] Started tx_id: {}. Active transactions: {:?}",
             tx_id,
             lock_mutex_recover(&self.state.active_transactions)
@@ -143,7 +143,7 @@ impl TransactionManager {
             .remove(&tx_id);
         lock_mutex_recover(&self.state.last_lsns).remove(&tx_id);
         lock_mutex_recover(&self.state.tx_statuses).remove(&tx_id);
-        println!(
+        crate::bedrock_debug_log!(
             "[TM::commit] Committed tx_id: {}. Active transactions: {:?}",
             tx_id,
             lock_mutex_recover(&self.state.active_transactions)
@@ -221,7 +221,7 @@ impl TransactionManager {
         wal: &mut WalManager,
         bpm: &Arc<BufferPoolManager>,
     ) -> std::io::Result<()> {
-        println!("[TM::abort] Aborting tx_id: {}", tx_id);
+        crate::bedrock_debug_log!("[TM::abort] Aborting tx_id: {}", tx_id);
         self.transition_status(
             tx_id,
             &[TransactionStatus::Active, TransactionStatus::Committing],
@@ -322,7 +322,7 @@ impl TransactionManager {
         lock_mutex_recover(&self.state.last_lsns).remove(&tx_id);
         lock_mutex_recover(&self.state.tx_statuses).remove(&tx_id);
 
-        println!(
+        crate::bedrock_debug_log!(
             "[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}",
             tx_id,
             lock_mutex_recover(&self.state.active_transactions)
@@ -346,9 +346,10 @@ impl TransactionManager {
             xmax,
             active_transactions: Arc::new(active_txns.clone()),
         };
-        println!(
+        crate::bedrock_debug_log!(
             "[TM::create_snapshot] Created for tx {}: {:?}",
-            _current_tx_id, snapshot
+            _current_tx_id,
+            snapshot
         );
         snapshot
     }
