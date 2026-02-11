@@ -246,7 +246,7 @@ fn create_executor<'a>(
                 condition.clone(),
                 left_table_name,
                 right_table_name,
-            )))
+            )?))
         }
         PhysicalPlan::HashJoin {
             left,

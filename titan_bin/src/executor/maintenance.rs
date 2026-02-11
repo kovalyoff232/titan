@@ -12,7 +12,15 @@ use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::WalManager;
 use rand::thread_rng;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn lock_system_catalog<'a>(
+    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
+    system_catalog
+        .lock()
+        .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))
+}
 
 pub(super) fn execute_vacuum(
     table_name: &str,
@@ -24,9 +32,7 @@ pub(super) fn execute_vacuum(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, old_first_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, old_first_page_id) = lock_system_catalog(system_catalog)?
         .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     lm.lock(
@@ -38,10 +44,8 @@ pub(super) fn execute_vacuum(
         return Ok(());
     }
 
-    let schema = system_catalog
-        .lock()
-        .unwrap()
-        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema =
+        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let live_tuples: Vec<_> =
         scan_table(bpm, lm, old_first_page_id, &schema, tx_id, snapshot, false)?
             .into_iter()
@@ -107,9 +111,7 @@ fn analyze_table_and_update_stats(
     const MCV_LIST_SIZE: usize = 10;
     const HISTOGRAM_BINS: usize = 100;
 
-    let (table_oid, first_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
         .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     if first_page_id == INVALID_PAGE_ID {
@@ -118,27 +120,20 @@ fn analyze_table_and_update_stats(
 
     lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
 
-    let schema = system_catalog
-        .lock()
-        .unwrap()
-        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let schema =
+        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
     let total_rows = all_rows.len();
 
-    let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) = system_catalog
-        .lock()
-        .unwrap()
-        .find_table("pg_statistic", bpm, tx_id, snapshot)?
+    let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) =
+        lock_system_catalog(system_catalog)?.find_table("pg_statistic", bpm, tx_id, snapshot)?
     {
         info
     } else {
         return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
     };
     let pg_stat_schema =
-        system_catalog
-            .lock()
-            .unwrap()
-            .get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
+        lock_system_catalog(system_catalog)?.get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
 
     let mut current_page_id = pg_stat_first_page_id;
     while current_page_id != bedrock::page::INVALID_PAGE_ID {
@@ -328,9 +323,7 @@ fn insert_tuple_into_system_table(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, mut first_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, mut first_page_id) = lock_system_catalog(system_catalog)?
         .find_table(table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
 

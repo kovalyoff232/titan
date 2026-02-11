@@ -9,7 +9,28 @@ use bedrock::lock_manager::{LockManager, LockMode, LockableResource};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::Snapshot;
 use bedrock::{PageId, btree};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+fn materialize_row(
+    schema: &[Column],
+    parsed_row: &HashMap<String, LiteralValue>,
+) -> Result<Row, ExecutionError> {
+    let mut row = Vec::with_capacity(schema.len());
+    for col in schema {
+        let value = parsed_row.get(&col.name).ok_or_else(|| {
+            ExecutionError::GenericError(format!(
+                "Tuple decode mismatch: missing column {} in scanned row",
+                col.name
+            ))
+        })?;
+        match value {
+            LiteralValue::Bool(b) => row.push((if *b { "t" } else { "f" }).to_string()),
+            _ => row.push(value.to_string()),
+        }
+    }
+    Ok(row)
+}
 
 pub(super) struct TableScanExecutor<'a> {
     bpm: &'a Arc<BufferPoolManager>,
@@ -86,17 +107,7 @@ impl<'a> Executor for TableScanExecutor<'a> {
                             continue;
                         }
                     }
-                    let row: Row = self
-                        .schema
-                        .iter()
-                        .map(|col| {
-                            let val = parsed_row.get(&col.name).unwrap();
-                            match val {
-                                LiteralValue::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
-                                _ => val.to_string(),
-                            }
-                        })
-                        .collect();
+                    let row = materialize_row(&self.schema, &parsed_row)?;
                     return Ok(Some(row));
                 }
             }
@@ -140,26 +151,51 @@ impl<'a> Executor for IndexScanExecutor<'a> {
     }
 
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
-        if self.done || self.tuple_id.is_none() {
+        if self.done {
             return Ok(None);
         }
         self.done = true;
 
-        let (page_id, item_id) = self.tuple_id.unwrap();
+        let Some((page_id, item_id)) = self.tuple_id else {
+            return Ok(None);
+        };
         let page_guard = self.bpm.acquire_page(page_id)?;
         let page = page_guard.read();
 
         if page.is_visible(self.snapshot, self.tx_id, item_id) {
             if let Some(tuple_data) = page.get_tuple(item_id) {
                 let parsed = parse_tuple(tuple_data, &self.schema);
-                let row = self
-                    .schema
-                    .iter()
-                    .map(|col| parsed.get(&col.name).unwrap().to_string())
-                    .collect();
+                let row = materialize_row(&self.schema, &parsed)?;
                 return Ok(Some(row));
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::materialize_row;
+    use crate::parser::LiteralValue;
+    use crate::types::Column;
+    use std::collections::HashMap;
+
+    #[test]
+    fn materialize_row_returns_error_for_missing_column() {
+        let schema = vec![
+            Column {
+                name: "id".to_string(),
+                type_id: 23,
+            },
+            Column {
+                name: "name".to_string(),
+                type_id: 25,
+            },
+        ];
+        let mut parsed = HashMap::new();
+        parsed.insert("id".to_string(), LiteralValue::Number("1".to_string()));
+
+        let result = materialize_row(&schema, &parsed);
+        assert!(result.is_err());
     }
 }

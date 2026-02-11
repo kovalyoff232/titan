@@ -25,7 +25,7 @@ impl<'a> NestedLoopJoinExecutor<'a> {
         condition: Expression,
         left_table_name: Option<String>,
         right_table_name: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, ExecutionError> {
         let mut joined_schema = Vec::new();
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -51,13 +51,13 @@ impl<'a> NestedLoopJoinExecutor<'a> {
         }
 
         let mut right_rows = Vec::new();
-        while let Ok(Some(row)) = right.next() {
+        while let Some(row) = right.next()? {
             right_rows.push(row);
         }
 
-        let left_row = left.next().unwrap_or(None);
+        let left_row = left.next()?;
 
-        Self {
+        Ok(Self {
             left,
             right,
             condition,
@@ -67,7 +67,7 @@ impl<'a> NestedLoopJoinExecutor<'a> {
             right_cursor: 0,
             left_table_name,
             right_table_name,
-        }
+        })
     }
 }
 
@@ -86,7 +86,11 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
                 let right_row = &self.right_rows[self.right_cursor];
                 self.right_cursor += 1;
 
-                let left_row = self.left_row.as_ref().unwrap();
+                let Some(left_row) = self.left_row.as_ref() else {
+                    return Err(ExecutionError::GenericError(
+                        "NestedLoopJoin invariant violation: missing current left row".to_string(),
+                    ));
+                };
                 let left_map = row_vec_to_map(
                     left_row,
                     self.left.schema(),
@@ -183,7 +187,12 @@ impl<'a> Executor for HashJoinExecutor<'a> {
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
         loop {
             if let Some(match_row) = self.current_matches.pop() {
-                let mut joined_row = self.current_left_row.as_ref().unwrap().clone();
+                let Some(current_left_row) = self.current_left_row.as_ref() else {
+                    return Err(ExecutionError::GenericError(
+                        "HashJoin invariant violation: missing current left row".to_string(),
+                    ));
+                };
+                let mut joined_row = current_left_row.clone();
                 joined_row.extend(match_row);
                 return Ok(Some(joined_row));
             }
@@ -193,7 +202,11 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                 return Ok(None);
             }
             self.current_left_row = left_row;
-            let left_row_ref = self.current_left_row.as_ref().unwrap();
+            let Some(left_row_ref) = self.current_left_row.as_ref() else {
+                return Err(ExecutionError::GenericError(
+                    "HashJoin invariant violation: left row unexpectedly absent".to_string(),
+                ));
+            };
 
             let left_map = row_vec_to_map(
                 left_row_ref,
@@ -209,5 +222,66 @@ impl<'a> Executor for HashJoinExecutor<'a> {
                 self.current_matches.clear();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NestedLoopJoinExecutor;
+    use crate::errors::ExecutionError;
+    use crate::executor::{Executor, Row};
+    use crate::parser::{Expression, LiteralValue};
+    use crate::types::Column;
+
+    struct EmptyExecutor {
+        schema: Vec<Column>,
+    }
+
+    impl EmptyExecutor {
+        fn new() -> Self {
+            Self { schema: Vec::new() }
+        }
+    }
+
+    impl Executor for EmptyExecutor {
+        fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+            Ok(None)
+        }
+
+        fn schema(&self) -> &Vec<Column> {
+            &self.schema
+        }
+    }
+
+    struct FailingExecutor {
+        schema: Vec<Column>,
+    }
+
+    impl FailingExecutor {
+        fn new() -> Self {
+            Self { schema: Vec::new() }
+        }
+    }
+
+    impl Executor for FailingExecutor {
+        fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+            Err(ExecutionError::GenericError(
+                "injected right-side failure".to_string(),
+            ))
+        }
+
+        fn schema(&self) -> &Vec<Column> {
+            &self.schema
+        }
+    }
+
+    #[test]
+    fn nested_loop_join_constructor_propagates_right_input_errors() {
+        let left = Box::new(EmptyExecutor::new());
+        let right = Box::new(FailingExecutor::new());
+        let condition = Expression::Literal(LiteralValue::Bool(true));
+
+        let result = NestedLoopJoinExecutor::new(left, right, condition, None, None);
+        assert!(matches!(result, Err(ExecutionError::GenericError(_))));
     }
 }
