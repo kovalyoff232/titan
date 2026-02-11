@@ -321,7 +321,7 @@ struct DeleteExecutor<'a> {
     wm: &'a Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &'a Snapshot,
-    schema: Vec<Column>,
+    table_schema: Vec<Column>,
     indexes: Vec<IntIndexInfo>,
     output_schema: Vec<Column>,
     current_page_id: PageId,
@@ -345,9 +345,10 @@ impl<'a> DeleteExecutor<'a> {
             .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
             .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-        let schema = lock_system_catalog(system_catalog)?
+        let table_schema = lock_system_catalog(system_catalog)?
             .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-        let indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
+        let indexes =
+            load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &table_schema)?;
 
         let output_schema = vec![Column {
             name: "rows_deleted".to_string(),
@@ -362,7 +363,7 @@ impl<'a> DeleteExecutor<'a> {
             wm,
             tx_id,
             snapshot,
-            schema,
+            table_schema,
             indexes,
             output_schema,
             current_page_id: first_page_id,
@@ -403,7 +404,7 @@ impl<'a> Executor for DeleteExecutor<'a> {
 
             if page.is_visible(self.snapshot, self.tx_id, item_id) {
                 if let Some(tuple_data) = page.get_tuple(item_id) {
-                    let parsed_row = parse_tuple(tuple_data, &self.schema);
+                    let parsed_row = parse_tuple(tuple_data, &self.table_schema);
                     let should_delete = if let Some(predicate) = &self.stmt.where_clause {
                         evaluate_expr_for_row(predicate, &parsed_row)?
                     } else {
