@@ -90,7 +90,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bedrock"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1345,7 +1345,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "titan_bin"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bedrock",
  "bytes",

@@ -159,7 +159,7 @@ impl BufferPoolManager {
     fn evict_if_dirty(&self, frame_index: usize) -> io::Result<()> {
         let frame = &self.frames[frame_index];
         let mut page_table = self.page_table.write().unwrap();
-        if let Some((&old_page_id, _)) = page_table.iter().find(|(_, &idx)| idx == frame_index) {
+        if let Some((&old_page_id, _)) = page_table.iter().find(|&(_, &idx)| idx == frame_index) {
             let mut is_dirty = frame.is_dirty.lock().unwrap();
             if *is_dirty {
                 let page_to_write = frame.page.read().unwrap().clone();
