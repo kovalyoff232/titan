@@ -191,7 +191,8 @@ impl WalManager {
 
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
         let mut file = lock_mutex_recover(&self.file);
-        if lsn >= file.metadata()?.len() {
+        let file_len = file.metadata()?.len();
+        if lsn >= file_len {
             return Ok((None, 0));
         }
 
@@ -202,7 +203,23 @@ impl WalManager {
         }
         let header: WalRecordHeader = unsafe { std::mem::transmute(header_buf) };
 
-        let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
+        let header_len = std::mem::size_of::<WalRecordHeader>();
+        if header.total_len < header_len as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL record has invalid length",
+            ));
+        }
+
+        let total_len = header.total_len as u64;
+        if lsn.saturating_add(total_len) > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL record is truncated",
+            ));
+        }
+
+        let record_len = header.total_len as usize - header_len;
         let mut record_buf = vec![0; record_len];
         file.read_exact(&mut record_buf)?;
 
@@ -217,7 +234,11 @@ impl WalManager {
             ));
         }
 
-        Ok((Self::deserialize_record(&record_buf), header.prev_lsn))
+        let record = Self::deserialize_record(&record_buf).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "WAL record decode failed")
+        })?;
+
+        Ok((Some(record), header.prev_lsn))
     }
 
     pub fn checkpoint(
@@ -596,6 +617,57 @@ mod tests {
         file.seek(SeekFrom::Start(lsn + header_len)).unwrap();
         file.write_all(&byte).unwrap();
         file.flush().unwrap();
+
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let err = wal.read_record(lsn).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_record_rejects_invalid_total_len() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("invalid_total_len.wal");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&wal_path)
+            .unwrap();
+        let header = WalRecordHeader {
+            total_len: (std::mem::size_of::<WalRecordHeader>() as u32) - 1,
+            tx_id: 1,
+            prev_lsn: 0,
+            crc: 0,
+        };
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const WalRecordHeader).cast::<u8>(),
+                std::mem::size_of::<WalRecordHeader>(),
+            )
+        };
+        file.write_all(header_bytes).unwrap();
+        file.flush().unwrap();
+
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let err = wal.read_record(0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_record_rejects_truncated_record() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("truncated_record.wal");
+
+        let lsn = {
+            let mut wal = WalManager::open(&wal_path).unwrap();
+            wal.log(7, 0, &sample_record(5)).unwrap()
+        };
+
+        let meta = std::fs::metadata(&wal_path).unwrap();
+        let truncated_len = meta.len().saturating_sub(2);
+        let file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        file.set_len(truncated_len).unwrap();
 
         let mut wal = WalManager::open(&wal_path).unwrap();
         let err = wal.read_record(lsn).unwrap_err();
