@@ -3,7 +3,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    Select(SelectStatement),
+    Select(Box<SelectStatement>),
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     Insert(InsertStatement),
@@ -494,7 +494,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         )
         .map(
             |((((select_list, from), where_clause), order_by), for_update)| {
-                Statement::Select(SelectStatement {
+                Statement::Select(Box::new(SelectStatement {
                     with_clause: None,
                     select_list,
                     from: from.unwrap_or_default(),
@@ -503,7 +503,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                     having: None,
                     order_by,
                     for_update: for_update.is_some(),
-                })
+                }))
             },
         );
 

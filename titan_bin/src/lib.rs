@@ -289,16 +289,16 @@ fn handle_client(
                         stmt, tx_id
                     );
                     let snapshot = tm.create_snapshot(tx_id);
-                    let result = executor::execute(
-                        &stmt,
-                        &bpm,
-                        &tm,
-                        &lm,
-                        &wal,
-                        &system_catalog,
+                    let exec_ctx = executor::ExecuteCtx {
+                        bpm: &bpm,
+                        tm: &tm,
+                        lm: &lm,
+                        wm: &wal,
+                        system_catalog: &system_catalog,
                         tx_id,
-                        &snapshot,
-                    );
+                        snapshot: &snapshot,
+                    };
+                    let result = executor::execute(&stmt, &exec_ctx);
 
                     match &stmt {
                         parser::Statement::Begin => {
@@ -510,16 +510,16 @@ fn initialize_db(
             },
         ],
     };
-    executor::execute(
-        &parser::Statement::CreateTable(create_pg_class),
+    let exec_ctx = executor::ExecuteCtx {
         bpm,
         tm,
         lm,
-        wal,
+        wm: wal,
         system_catalog,
         tx_id,
-        &snapshot,
-    )?;
+        snapshot: &snapshot,
+    };
+    executor::execute(&parser::Statement::CreateTable(create_pg_class), &exec_ctx)?;
     println!("[initialize_db] pg_class table created.");
 
     println!("[initialize_db] Creating pg_attribute table.");
@@ -542,13 +542,7 @@ fn initialize_db(
     };
     executor::execute(
         &parser::Statement::CreateTable(create_pg_attribute),
-        bpm,
-        tm,
-        lm,
-        wal,
-        system_catalog,
-        tx_id,
-        &snapshot,
+        &exec_ctx,
     )?;
     println!("[initialize_db] pg_attribute table created.");
 
@@ -588,13 +582,7 @@ fn initialize_db(
     };
     executor::execute(
         &parser::Statement::CreateTable(create_pg_statistic),
-        bpm,
-        tm,
-        lm,
-        wal,
-        system_catalog,
-        tx_id,
-        &snapshot,
+        &exec_ctx,
     )?;
     println!("[initialize_db] pg_statistic table created.");
 

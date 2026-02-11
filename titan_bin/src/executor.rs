@@ -35,16 +35,25 @@ pub trait Executor {
     fn schema(&self) -> &Vec<Column>;
 }
 
-pub fn execute(
-    stmt: &Statement,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-) -> Result<ExecuteResult, ExecutionError> {
+pub struct ExecuteCtx<'a> {
+    pub bpm: &'a Arc<BufferPoolManager>,
+    pub tm: &'a Arc<TransactionManager>,
+    pub lm: &'a Arc<LockManager>,
+    pub wm: &'a Arc<Mutex<WalManager>>,
+    pub system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+    pub tx_id: u32,
+    pub snapshot: &'a Snapshot,
+}
+
+pub fn execute(stmt: &Statement, ctx: &ExecuteCtx<'_>) -> Result<ExecuteResult, ExecutionError> {
+    let bpm = ctx.bpm;
+    let tm = ctx.tm;
+    let lm = ctx.lm;
+    let wm = ctx.wm;
+    let system_catalog = ctx.system_catalog;
+    let tx_id = ctx.tx_id;
+    let snapshot = ctx.snapshot;
+
     match stmt {
         Statement::Select(select_stmt) => {
             let logical_plan =
