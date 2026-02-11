@@ -3,6 +3,24 @@ use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use chrono::prelude::*;
 use std::collections::HashMap;
 
+fn parse_i32_literal(value: &str) -> Result<i32, ExecutionError> {
+    value.parse::<i32>().map_err(|_| {
+        ExecutionError::GenericError(format!(
+            "Invalid integer value in expression evaluation: {}",
+            value
+        ))
+    })
+}
+
+fn parse_date_literal(value: &str) -> Result<NaiveDate, ExecutionError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        ExecutionError::GenericError(format!(
+            "Invalid date value in expression evaluation: {}",
+            value
+        ))
+    })
+}
+
 pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
@@ -58,8 +76,8 @@ pub(crate) fn evaluate_expr_for_row_to_val(
             let rval = evaluate_expr_for_row_to_val(right, row)?;
             match (lval, rval) {
                 (LiteralValue::Number(l), LiteralValue::Number(r)) => {
-                    let lnum = l.parse::<i32>().unwrap();
-                    let rnum = r.parse::<i32>().unwrap();
+                    let lnum = parse_i32_literal(&l)?;
+                    let rnum = parse_i32_literal(&r)?;
                     match op {
                         BinaryOperator::Plus => Ok(LiteralValue::Number((lnum + rnum).to_string())),
                         BinaryOperator::Minus => {
@@ -85,8 +103,8 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     )),
                 },
                 (LiteralValue::Date(l), LiteralValue::Date(r)) => {
-                    let ldate = NaiveDate::parse_from_str(&l, "%Y-%m-%d").unwrap();
-                    let rdate = NaiveDate::parse_from_str(&r, "%Y-%m-%d").unwrap();
+                    let ldate = parse_date_literal(&l)?;
+                    let rdate = parse_date_literal(&r)?;
                     match op {
                         BinaryOperator::Eq => Ok(LiteralValue::Bool(ldate == rdate)),
                         BinaryOperator::NotEq => Ok(LiteralValue::Bool(ldate != rdate)),
@@ -163,5 +181,51 @@ pub(crate) fn evaluate_expr_for_row_to_val(
         Expression::Subquery(_) => Err(ExecutionError::GenericError(
             "Subqueries are not yet supported in this context".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evaluate_expr_for_row_to_val;
+    use crate::errors::ExecutionError;
+    use crate::parser::{BinaryOperator, Expression, LiteralValue};
+    use std::collections::HashMap;
+
+    #[test]
+    fn invalid_integer_literal_returns_error_instead_of_panicking() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("1.5".to_string()))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(LiteralValue::Number("1".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert!(matches!(
+            result,
+            Err(ExecutionError::GenericError(msg))
+            if msg.contains("Invalid integer value")
+        ));
+    }
+
+    #[test]
+    fn invalid_date_literal_returns_error_instead_of_panicking() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Date(
+                "2025-13-01".to_string(),
+            ))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(LiteralValue::Date(
+                "2025-01-01".to_string(),
+            ))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert!(matches!(
+            result,
+            Err(ExecutionError::GenericError(msg))
+            if msg.contains("Invalid date value")
+        ));
     }
 }

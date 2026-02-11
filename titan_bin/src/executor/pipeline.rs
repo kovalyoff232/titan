@@ -81,11 +81,9 @@ impl<'a> Executor for ProjectionExecutor<'a> {
     }
 
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
-        let next_row = self.input.next()?;
-        if next_row.is_none() {
+        let Some(row) = self.input.next()? else {
             return Ok(None);
-        }
-        let row = next_row.unwrap();
+        };
 
         if self
             .expressions
@@ -168,9 +166,12 @@ impl<'a> SortExecutor<'a> {
                 }
                 25 => val_a.cmp(val_b),
                 1082 => {
-                    let date_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d").unwrap();
-                    let date_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d").unwrap();
-                    date_a.cmp(&date_b)
+                    let parsed_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d");
+                    let parsed_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d");
+                    match (parsed_a, parsed_b) {
+                        (Ok(date_a), Ok(date_b)) => date_a.cmp(&date_b),
+                        _ => val_a.cmp(val_b),
+                    }
                 }
                 16 => {
                     let bool_a = val_a == "t";
@@ -201,5 +202,73 @@ impl<'a> Executor for SortExecutor<'a> {
         let row = self.sorted_rows[self.cursor].clone();
         self.cursor += 1;
         Ok(Some(row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Executor, Row, SortExecutor};
+    use crate::parser::Expression;
+    use crate::types::Column;
+
+    struct StaticRowsExecutor {
+        schema: Vec<Column>,
+        rows: Vec<Row>,
+        cursor: usize,
+    }
+
+    impl StaticRowsExecutor {
+        fn new(schema: Vec<Column>, rows: Vec<Row>) -> Self {
+            Self {
+                schema,
+                rows,
+                cursor: 0,
+            }
+        }
+    }
+
+    impl Executor for StaticRowsExecutor {
+        fn next(&mut self) -> Result<Option<Row>, crate::errors::ExecutionError> {
+            if self.cursor >= self.rows.len() {
+                return Ok(None);
+            }
+            let row = self.rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        }
+
+        fn schema(&self) -> &Vec<Column> {
+            &self.schema
+        }
+    }
+
+    #[test]
+    fn sort_executor_handles_invalid_date_values_without_panicking() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "event_date".to_string(),
+                type_id: 1082,
+            }],
+            vec![
+                vec!["2024-01-02".to_string()],
+                vec!["not-a-date".to_string()],
+                vec!["2023-12-30".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![Expression::Column("event_date".to_string())],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row[0].clone());
+        }
+
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0], "2023-12-30");
+        assert!(sorted.contains(&"not-a-date".to_string()));
     }
 }
