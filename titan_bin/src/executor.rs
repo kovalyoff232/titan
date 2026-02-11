@@ -8,6 +8,7 @@ use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::lock_manager::LockManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::WalManager;
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex};
 
 type Row = Vec<String>;
@@ -48,22 +49,19 @@ pub fn execute(
             let logical_plan =
                 planner::create_logical_plan(select_stmt, bpm, tx_id, snapshot, system_catalog)?;
             let physical_plan =
-                optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)
-                    .map_err(|_| {
-                        ExecutionError::PlanningError("Failed to create physical plan".to_string())
-                    })?;
+                optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)?;
 
             println!("[Executor] Physical Plan: {:?}", physical_plan);
 
-            let mut executor = create_executor(
-                &physical_plan,
+            let build_ctx = ExecutorBuildCtx {
                 bpm,
                 lm,
                 tx_id,
                 snapshot,
                 select_stmt,
                 system_catalog,
-            )?;
+            };
+            let mut executor = create_executor(&build_ctx, &physical_plan)?;
             let schema = executor.schema().clone();
             let mut rows = Vec::new();
             while let Some(row) = executor.next()? {
@@ -137,34 +135,46 @@ pub fn execute(
     }
 }
 
-fn create_executor<'a>(
-    plan: &'a PhysicalPlan,
+struct ExecutorBuildCtx<'a> {
     bpm: &'a Arc<BufferPoolManager>,
     lm: &'a Arc<LockManager>,
     tx_id: u32,
     snapshot: &'a Snapshot,
     select_stmt: &'a SelectStatement,
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+}
+
+fn lock_system_catalog<'a>(
+    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
+    system_catalog
+        .lock()
+        .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))
+}
+
+fn create_executor<'a>(
+    ctx: &ExecutorBuildCtx<'a>,
+    plan: &'a PhysicalPlan,
 ) -> Result<Box<dyn Executor + 'a>, ExecutionError> {
     match plan {
         PhysicalPlan::TableScan { table_name, filter } => {
-            let (table_oid, first_page_id) = system_catalog
-                .lock()
-                .unwrap()
-                .find_table(table_name, bpm, tx_id, snapshot)?
+            let (table_oid, first_page_id) = lock_system_catalog(ctx.system_catalog)?
+                .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
-            let schema = system_catalog
-                .lock()
-                .unwrap()
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+                ctx.bpm,
+                table_oid,
+                ctx.tx_id,
+                ctx.snapshot,
+            )?;
             let scan_executor = Box::new(TableScanExecutor::new(
-                bpm,
-                lm,
+                ctx.bpm,
+                ctx.lm,
                 first_page_id,
                 schema,
-                tx_id,
-                snapshot,
-                select_stmt.for_update,
+                ctx.tx_id,
+                ctx.snapshot,
+                ctx.select_stmt.for_update,
                 None,
             ));
 
@@ -182,34 +192,31 @@ fn create_executor<'a>(
             index_name,
             key,
         } => {
-            let (table_oid, _first_page_id) = system_catalog
-                .lock()
-                .unwrap()
-                .find_table(table_name, bpm, tx_id, snapshot)?
+            let (table_oid, _first_page_id) = lock_system_catalog(ctx.system_catalog)?
+                .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
-            let schema = system_catalog
-                .lock()
-                .unwrap()
-                .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+            let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+                ctx.bpm,
+                table_oid,
+                ctx.tx_id,
+                ctx.snapshot,
+            )?;
 
-            let (_index_oid, index_root_page_id) = system_catalog
-                .lock()
-                .unwrap()
-                .find_table(index_name, bpm, tx_id, snapshot)?
+            let (_index_oid, index_root_page_id) = lock_system_catalog(ctx.system_catalog)?
+                .find_table(index_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(index_name.clone()))?;
 
             Ok(Box::new(IndexScanExecutor::new(
-                bpm,
+                ctx.bpm,
                 schema,
                 index_root_page_id,
                 *key,
-                tx_id,
-                snapshot,
+                ctx.tx_id,
+                ctx.snapshot,
             )))
         }
         PhysicalPlan::Filter { input, predicate } => {
-            let input_executor =
-                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let input_executor = create_executor(ctx, input)?;
             Ok(Box::new(FilterExecutor::new(
                 input_executor,
                 predicate.clone(),
@@ -220,10 +227,8 @@ fn create_executor<'a>(
             right,
             condition,
         } => {
-            let left_executor =
-                create_executor(left, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
-            let right_executor =
-                create_executor(right, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let left_executor = create_executor(ctx, left)?;
+            let right_executor = create_executor(ctx, right)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
                 Some(table_name.clone())
             } else {
@@ -248,10 +253,8 @@ fn create_executor<'a>(
             left_key,
             right_key,
         } => {
-            let left_executor =
-                create_executor(left, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
-            let right_executor =
-                create_executor(right, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let left_executor = create_executor(ctx, left)?;
+            let right_executor = create_executor(ctx, right)?;
             let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
                 Some(table_name.clone())
             } else {
@@ -272,16 +275,14 @@ fn create_executor<'a>(
             )?))
         }
         PhysicalPlan::Projection { input, expressions } => {
-            let input_executor =
-                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let input_executor = create_executor(ctx, input)?;
             Ok(Box::new(ProjectionExecutor::new(
                 input_executor,
                 expressions.clone(),
             )))
         }
         PhysicalPlan::Sort { input, order_by } => {
-            let input_executor =
-                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let input_executor = create_executor(ctx, input)?;
             Ok(Box::new(SortExecutor::new(
                 input_executor,
                 order_by.clone(),
@@ -297,8 +298,7 @@ fn create_executor<'a>(
             having,
         } => {
             use crate::aggregate_executor::HashAggregateExecutor;
-            let input_executor =
-                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let input_executor = create_executor(ctx, input)?;
             Ok(Box::new(HashAggregateExecutor::new(
                 input_executor,
                 group_by.clone(),
@@ -324,8 +324,7 @@ fn create_executor<'a>(
             offset,
         } => {
             use crate::limit_executor::LimitExecutor;
-            let input_executor =
-                create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
+            let input_executor = create_executor(ctx, input)?;
             Ok(Box::new(LimitExecutor::new(
                 input_executor,
                 limit.map(|l| l as usize),
