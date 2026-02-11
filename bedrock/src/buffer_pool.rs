@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::failpoint;
 use crate::pager::Pager;
 use crate::{Page, PageId};
 
@@ -192,6 +193,7 @@ impl BufferPoolManager {
 
     pub fn flush_all_pages(&self) -> io::Result<()> {
         for (&page_id, _) in read_lock_recover(&self.page_table).iter() {
+            failpoint::maybe_fail("bpm.flush.before_page")?;
             self.flush_page(page_id)?;
         }
         Ok(())
@@ -239,5 +241,63 @@ impl BufferPoolManager {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BufferPoolManager;
+    use crate::failpoint;
+    use crate::pager::Pager;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn flush_all_pages_persists_dirty_page_without_failpoint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("flush_ok.db");
+
+        let pager = Pager::open(&db_path).unwrap();
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let page_guard = bpm.new_page().unwrap();
+        let page_id = page_guard.read().id;
+        {
+            let mut page = page_guard.write();
+            page.data[256] = 0xAB;
+        }
+        drop(page_guard);
+
+        failpoint::clear();
+        bpm.flush_all_pages().unwrap();
+
+        let mut pager_reopen = Pager::open(&db_path).unwrap();
+        let page = pager_reopen.read_page(page_id).unwrap();
+        assert_eq!(page.data[256], 0xAB);
+    }
+
+    #[test]
+    fn flush_all_pages_failpoint_before_page_keeps_dirty_data_unflushed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("flush_failpoint.db");
+
+        let pager = Pager::open(&db_path).unwrap();
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let page_guard = bpm.new_page().unwrap();
+        let page_id = page_guard.read().id;
+        {
+            let mut page = page_guard.write();
+            page.data[256] = 0xCD;
+        }
+        drop(page_guard);
+
+        failpoint::clear();
+        failpoint::enable("bpm.flush.before_page");
+        let err = bpm.flush_all_pages().unwrap_err();
+        failpoint::clear();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+
+        let mut pager_reopen = Pager::open(&db_path).unwrap();
+        let page = pager_reopen.read_page(page_id).unwrap();
+        assert_ne!(page.data[256], 0xCD);
     }
 }
