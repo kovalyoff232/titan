@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::pager::Pager;
 use crate::{Page, PageId};
@@ -29,14 +29,29 @@ pub struct PageGuard<'a> {
     frame: Arc<Frame>,
 }
 
+fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_lock_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_lock_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl<'a> PageGuard<'a> {
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Page> {
-        self.frame.page.read().unwrap()
+        read_lock_recover(&self.frame.page)
     }
 
     pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Page> {
-        *self.frame.is_dirty.lock().unwrap() = true;
-        self.frame.page.write().unwrap()
+        *lock_mutex_recover(&self.frame.is_dirty) = true;
+        write_lock_recover(&self.frame.page)
     }
 }
 
@@ -69,7 +84,7 @@ impl BufferPoolManager {
     }
 
     pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<PageGuard<'_>> {
-        if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
+        if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
             let frame = self.frames[frame_index].clone();
             self.pin_frame(&frame);
             return Ok(PageGuard {
@@ -86,19 +101,16 @@ impl BufferPoolManager {
 
         self.evict_if_dirty(frame_index)?;
 
-        let new_page = self.pager.lock().unwrap().read_page(page_id)?;
+        let new_page = lock_mutex_recover(&self.pager).read_page(page_id)?;
 
         {
-            let mut page = frame.page.write().unwrap();
+            let mut page = write_lock_recover(&frame.page);
             *page = new_page;
-            *frame.is_dirty.lock().unwrap() = false;
+            *lock_mutex_recover(&frame.is_dirty) = false;
             self.pin_frame(&frame);
         }
 
-        self.page_table
-            .write()
-            .unwrap()
-            .insert(page_id, frame_index);
+        write_lock_recover(&self.page_table).insert(page_id, frame_index);
         Ok(PageGuard {
             bpm: self,
             page_id,
@@ -114,19 +126,16 @@ impl BufferPoolManager {
 
         self.evict_if_dirty(frame_index)?;
 
-        let new_page_id = self.pager.lock().unwrap().allocate_page()?;
+        let new_page_id = lock_mutex_recover(&self.pager).allocate_page()?;
 
         {
-            let mut page = frame.page.write().unwrap();
+            let mut page = write_lock_recover(&frame.page);
             *page = Page::new(new_page_id);
-            *frame.is_dirty.lock().unwrap() = true;
+            *lock_mutex_recover(&frame.is_dirty) = true;
             self.pin_frame(&frame);
         }
 
-        self.page_table
-            .write()
-            .unwrap()
-            .insert(new_page_id, frame_index);
+        write_lock_recover(&self.page_table).insert(new_page_id, frame_index);
         Ok(PageGuard {
             bpm: self,
             page_id: new_page_id,
@@ -135,22 +144,22 @@ impl BufferPoolManager {
     }
 
     fn pin_frame(&self, frame: &Arc<Frame>) {
-        let mut pin_count = frame.pin_count.lock().unwrap();
+        let mut pin_count = lock_mutex_recover(&frame.pin_count);
         *pin_count += 1;
-        *frame.recently_used.lock().unwrap() = true;
+        *lock_mutex_recover(&frame.recently_used) = true;
     }
 
     fn evict_if_dirty(&self, frame_index: usize) -> io::Result<()> {
         let frame = &self.frames[frame_index];
-        let mut page_table = self.page_table.write().unwrap();
+        let mut page_table = write_lock_recover(&self.page_table);
         if let Some((&old_page_id, _)) = page_table.iter().find(|&(_, &idx)| idx == frame_index) {
-            let mut is_dirty = frame.is_dirty.lock().unwrap();
+            let mut is_dirty = lock_mutex_recover(&frame.is_dirty);
             if *is_dirty {
-                let page_to_write = frame.page.read().unwrap().clone();
+                let page_to_write = read_lock_recover(&frame.page).clone();
                 drop(page_table);
-                self.pager.lock().unwrap().write_page(&page_to_write)?;
+                lock_mutex_recover(&self.pager).write_page(&page_to_write)?;
                 *is_dirty = false;
-                self.page_table.write().unwrap().remove(&old_page_id);
+                write_lock_recover(&self.page_table).remove(&old_page_id);
             } else {
                 page_table.remove(&old_page_id);
             }
@@ -159,9 +168,9 @@ impl BufferPoolManager {
     }
 
     fn unpin_page(&self, page_id: PageId) {
-        if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
+        if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
             let frame = &self.frames[frame_index];
-            let mut pin_count = frame.pin_count.lock().unwrap();
+            let mut pin_count = lock_mutex_recover(&frame.pin_count);
             if *pin_count > 0 {
                 *pin_count -= 1;
             }
@@ -169,12 +178,12 @@ impl BufferPoolManager {
     }
 
     pub fn flush_page(&self, page_id: PageId) -> io::Result<()> {
-        if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
+        if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
             let frame = &self.frames[frame_index];
-            let mut is_dirty = frame.is_dirty.lock().unwrap();
+            let mut is_dirty = lock_mutex_recover(&frame.is_dirty);
             if *is_dirty {
-                let page = frame.page.read().unwrap();
-                self.pager.lock().unwrap().write_page(&page)?;
+                let page = read_lock_recover(&frame.page);
+                lock_mutex_recover(&self.pager).write_page(&page)?;
                 *is_dirty = false;
             }
         }
@@ -182,26 +191,26 @@ impl BufferPoolManager {
     }
 
     pub fn flush_all_pages(&self) -> io::Result<()> {
-        for (&page_id, _) in self.page_table.read().unwrap().iter() {
+        for (&page_id, _) in read_lock_recover(&self.page_table).iter() {
             self.flush_page(page_id)?;
         }
         Ok(())
     }
 
     pub fn delete_page(&self, page_id: PageId) -> io::Result<()> {
-        if let Some(frame_index) = self.page_table.write().unwrap().remove(&page_id) {
+        if let Some(frame_index) = write_lock_recover(&self.page_table).remove(&page_id) {
             let frame = &self.frames[frame_index];
-            *frame.is_dirty.lock().unwrap() = false;
-            *frame.pin_count.lock().unwrap() = 0;
-            *frame.recently_used.lock().unwrap() = false;
-            self.free_list.lock().unwrap().push(frame_index);
+            *lock_mutex_recover(&frame.is_dirty) = false;
+            *lock_mutex_recover(&frame.pin_count) = 0;
+            *lock_mutex_recover(&frame.recently_used) = false;
+            lock_mutex_recover(&self.free_list).push(frame_index);
         }
-        self.pager.lock().unwrap().deallocate_page(page_id);
+        lock_mutex_recover(&self.pager).deallocate_page(page_id);
         Ok(())
     }
 
     fn find_victim_frame(&self) -> Option<usize> {
-        if let Some(frame_index) = self.free_list.lock().unwrap().pop() {
+        if let Some(frame_index) = lock_mutex_recover(&self.free_list).pop() {
             return Some(frame_index);
         }
 
@@ -210,17 +219,17 @@ impl BufferPoolManager {
             return None;
         }
 
-        let mut clock_hand = self.clock_hand.lock().unwrap();
+        let mut clock_hand = lock_mutex_recover(&self.clock_hand);
 
         for _ in 0..(frame_count * 2) {
             let frame_index = *clock_hand;
             *clock_hand = (*clock_hand + 1) % frame_count;
 
             let frame = &self.frames[frame_index];
-            let pin_count = frame.pin_count.lock().unwrap();
+            let pin_count = lock_mutex_recover(&frame.pin_count);
 
             if *pin_count == 0 {
-                let mut recently_used = frame.recently_used.lock().unwrap();
+                let mut recently_used = lock_mutex_recover(&frame.recently_used);
                 if *recently_used {
                     *recently_used = false;
                 } else {
