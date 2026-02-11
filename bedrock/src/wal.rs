@@ -24,7 +24,7 @@ pub struct WalRecordHeader {
     pub crc: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum WalRecord {
     Commit {
         tx_id: u32,
@@ -495,5 +495,67 @@ impl Drop for WalManager {
         if let Ok(file) = self.file.lock() {
             let _ = file.sync_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WalManager, WalRecord, WalRecordHeader};
+    use crate::PageId;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use tempfile::tempdir;
+
+    fn sample_record(page_id: PageId) -> WalRecord {
+        WalRecord::InsertTuple {
+            tx_id: 7,
+            page_id,
+            item_id: 1,
+            before_page: vec![1, 2, 3, 4],
+            after_page: vec![5, 6, 7, 8],
+        }
+    }
+
+    #[test]
+    fn test_log_and_read_record_roundtrip() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("roundtrip.wal");
+
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let record = sample_record(42);
+        let lsn = wal.log(7, 0, &record).unwrap();
+
+        let (decoded, prev_lsn) = wal.read_record(lsn).unwrap();
+        assert_eq!(prev_lsn, 0);
+        assert_eq!(decoded, Some(record));
+    }
+
+    #[test]
+    fn test_crc_mismatch_is_detected() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("crc_mismatch.wal");
+
+        let lsn = {
+            let mut wal = WalManager::open(&wal_path).unwrap();
+            wal.log(7, 0, &sample_record(11)).unwrap()
+        };
+
+        let header_len = std::mem::size_of::<WalRecordHeader>() as u64;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(lsn + header_len)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(lsn + header_len)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let err = wal.read_record(lsn).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

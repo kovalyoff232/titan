@@ -1,4 +1,5 @@
 use crate::buffer_pool::BufferPoolManager;
+use crate::failpoint;
 use crate::page::TransactionId;
 use crate::wal::{Lsn, WalManager, WalRecord};
 use std::collections::{HashMap, HashSet};
@@ -103,9 +104,11 @@ impl TransactionManager {
         tx_id: TransactionId,
         wal: &mut WalManager,
     ) -> std::io::Result<()> {
+        failpoint::maybe_fail("tm.commit.before_wal")?;
         let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
         let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Commit { tx_id })?;
         self.set_last_lsn(tx_id, lsn);
+        failpoint::maybe_fail("tm.commit.after_wal")?;
         self.finalize_commit(tx_id);
         Ok(())
     }
@@ -116,6 +119,14 @@ impl TransactionManager {
 
     pub fn set_last_lsn(&self, tx_id: TransactionId, lsn: Lsn) {
         self.state.last_lsns.lock().unwrap().insert(tx_id, lsn);
+    }
+
+    pub fn is_active(&self, tx_id: TransactionId) -> bool {
+        self.state
+            .active_transactions
+            .lock()
+            .unwrap()
+            .contains(&tx_id)
     }
 
     pub fn abort(
@@ -190,6 +201,7 @@ impl TransactionManager {
             current_lsn = prev_lsn;
         }
 
+        failpoint::maybe_fail("tm.abort.before_abort_record")?;
         let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
         wal.log(tx_id, last_lsn, &WalRecord::Abort { tx_id })?;
 
@@ -235,6 +247,10 @@ impl TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failpoint;
+    use crate::pager::Pager;
+    use crate::wal::WalManager;
+    use tempfile::tempdir;
 
     #[test]
     fn test_transaction_manager_snapshot() {
@@ -282,5 +298,61 @@ mod tests {
 
         assert!(snapshot.is_visible(11));
         assert!(snapshot.is_visible(19));
+    }
+
+    #[test]
+    fn test_commit_failpoint_before_wal_keeps_transaction_active() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("before_wal.wal");
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+        let tx_id = tm.begin();
+
+        failpoint::clear();
+        failpoint::enable("tm.commit.before_wal");
+        let res = tm.commit_with_wal(tx_id, &mut wal);
+        failpoint::clear();
+
+        assert!(res.is_err());
+        assert!(tm.is_active(tx_id));
+    }
+
+    #[test]
+    fn test_commit_failpoint_after_wal_keeps_transaction_active() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("after_wal.wal");
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+        let tx_id = tm.begin();
+
+        failpoint::clear();
+        failpoint::enable("tm.commit.after_wal");
+        let res = tm.commit_with_wal(tx_id, &mut wal);
+        failpoint::clear();
+
+        assert!(res.is_err());
+        assert!(tm.is_active(tx_id));
+        assert!(tm.get_last_lsn(tx_id).is_some());
+    }
+
+    #[test]
+    fn test_abort_failpoint_before_abort_record_keeps_transaction_active() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("abort_before_record.wal");
+        let db_path = dir.path().join("abort_before_record.db");
+
+        let pager = Pager::open(&db_path).unwrap();
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+        let tx_id = tm.begin();
+
+        failpoint::clear();
+        failpoint::enable("tm.abort.before_abort_record");
+        let res = tm.abort(tx_id, &mut wal, &bpm);
+        failpoint::clear();
+
+        assert!(res.is_err());
+        assert!(tm.is_active(tx_id));
     }
 }

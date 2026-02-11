@@ -4,6 +4,8 @@ pub mod btree;
 
 pub mod buffer_pool;
 
+pub mod failpoint;
+
 pub mod lock_manager;
 
 pub mod page;
