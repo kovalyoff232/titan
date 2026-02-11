@@ -2,6 +2,7 @@
 
 # Rust
 /target/
+**/target/
 
 # Database files
 *.db
