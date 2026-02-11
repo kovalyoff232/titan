@@ -60,6 +60,18 @@ jobs:
 
     - name: Run tests (per-target timeout)
       timeout-minutes: 25
+      env:
+        TITAN_RECOVERY_REPORT: ${{ github.workspace }}/target/reports/recovery-reconciliation.json
       run: |
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-tests-with-timeout.ps1 `
           -TimeoutSec 300
+
+    - name: Upload recovery reconciliation report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-reconciliation-report
+        if-no-files-found: warn
+        path: |
+          target/reports/recovery-reconciliation.json
+          titan_bin/target/reports/recovery-reconciliation.json

@@ -1,10 +1,21 @@
 use postgres::{Client, NoTls, SimpleQueryMessage};
+use serde::Serialize;
 use serial_test::serial;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+#[derive(Serialize)]
+struct RecoveryReconciliationReport {
+    expected_rows: Vec<Vec<String>>,
+    after_first_restart_rows: Vec<Vec<String>>,
+    after_second_restart_rows: Vec<Vec<String>>,
+    match_after_first_restart: bool,
+    match_after_second_restart: bool,
+}
 
 fn server_binary_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -61,6 +72,24 @@ fn query_rows(client: &mut Client, sql: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn maybe_write_recovery_report(report: &RecoveryReconciliationReport) {
+    let Ok(path) = std::env::var("TITAN_RECOVERY_REPORT") else {
+        return;
+    };
+
+    let report_path = if Path::new(&path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path)
+    };
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent).expect("create recovery report directory");
+    }
+
+    let payload = serde_json::to_string_pretty(report).expect("serialize recovery report");
+    fs::write(&report_path, payload).expect("write recovery report");
+}
+
 #[test]
 #[serial]
 fn committed_rows_survive_multiple_restarts() {
@@ -83,13 +112,12 @@ fn committed_rows_survive_multiple_restarts() {
     drop(client);
     stop_server(&mut server);
 
+    let expected_rows = vec![vec!["1".to_string(), "alpha".to_string()]];
+
     let mut server = start_server(&db_path, &wal_path, &addr);
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
     let rows_after_restart = query_rows(&mut client, "SELECT id, name FROM restart_t ORDER BY id;");
-    assert_eq!(
-        rows_after_restart,
-        vec![vec!["1".to_string(), "alpha".to_string()]]
-    );
+    assert_eq!(rows_after_restart, expected_rows);
 
     drop(client);
     stop_server(&mut server);
@@ -98,10 +126,16 @@ fn committed_rows_survive_multiple_restarts() {
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
     let rows_after_second_restart =
         query_rows(&mut client, "SELECT id, name FROM restart_t ORDER BY id;");
-    assert_eq!(
-        rows_after_second_restart,
-        vec![vec!["1".to_string(), "alpha".to_string()]]
-    );
+    assert_eq!(rows_after_second_restart, expected_rows);
+
+    let report = RecoveryReconciliationReport {
+        expected_rows: expected_rows.clone(),
+        after_first_restart_rows: rows_after_restart,
+        after_second_restart_rows: rows_after_second_restart,
+        match_after_first_restart: true,
+        match_after_second_restart: true,
+    };
+    maybe_write_recovery_report(&report);
 
     drop(client);
     stop_server(&mut server);
