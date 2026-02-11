@@ -47,6 +47,17 @@ jobs:
       timeout-minutes: 20
       run: cargo test --workspace --no-run --verbose
 
+    - name: Benchmark smoke (Titan only)
+      timeout-minutes: 12
+      run: |
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-baseline-benchmark.ps1 `
+          -Target titan `
+          -Rows 200 `
+          -Iterations 10 `
+          -Warmup 2 `
+          -BuildTimeoutSec 360 `
+          -RunTimeoutSec 360
+
     - name: Run tests
       timeout-minutes: 20
       run: cargo test --workspace --verbose
