@@ -1,0 +1,6 @@
+msrv = "1.85.0"
+too-many-arguments-threshold = 7
+type-complexity-threshold = 200
+cognitive-complexity-threshold = 25
+enum-variant-size-threshold = 200
+allow-unwrap-in-tests = true

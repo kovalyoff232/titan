@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$SkipClippy
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,10 +49,14 @@ function Invoke-Step {
 }
 
 $fmtCmd = "& '$cargo' fmt --all -- --check"
+$clippyCmd = "& '$cargo' clippy --package titan_bin --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic"
 $buildCmd = "& '$cargo' test --workspace --no-run"
 $testCmd = "& '$cargo' test --workspace"
 
 Invoke-Step -Name "format-check" -Command $fmtCmd -TimeoutSec 120
+if (-not $SkipClippy) {
+    Invoke-Step -Name "clippy-core" -Command $clippyCmd -TimeoutSec 900
+}
 Invoke-Step -Name "build-check" -Command $buildCmd -TimeoutSec 900
 if (-not $SkipTests) {
     Invoke-Step -Name "test-run" -Command $testCmd -TimeoutSec 900
