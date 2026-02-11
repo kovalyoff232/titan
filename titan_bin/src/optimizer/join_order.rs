@@ -389,6 +389,52 @@ mod tests {
     }
 
     #[test]
+    fn chooses_index_scan_through_multi_wrapped_scan() {
+        let logical = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Projection {
+                    input: Box::new(LogicalPlan::Scan {
+                        table_name: "users".to_string(),
+                        alias: None,
+                        filter: Some(Expression::Binary {
+                            left: Box::new(Expression::Column("id".to_string())),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(Expression::Literal(LiteralValue::Number(
+                                "9".to_string(),
+                            ))),
+                        }),
+                    }),
+                    expressions: vec![],
+                }),
+                order_by: vec![],
+            }),
+            limit: Some(5),
+            offset: Some(0),
+        };
+        let table_names = vec!["users".to_string()];
+        let stats = prepare_single_table_stats(10_000.0, 10_000.0);
+        let system_catalog = prepare_catalog_with_users_schema();
+
+        let expected_key = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+            .map(|p| physical_plan_stability_key(&p.plan))
+            .expect("expected a plan");
+
+        for _ in 0..50 {
+            let best = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+                .expect("expected a plan");
+            let current_key = physical_plan_stability_key(&best.plan);
+            assert_eq!(current_key, expected_key);
+            match &*best.plan {
+                PhysicalPlan::IndexScan { key, .. } => {
+                    assert_eq!(*key, 9);
+                    assert_eq!(best.cardinality, 1.0);
+                }
+                other => panic!("expected index scan, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn extracts_index_predicate_with_qualified_column_and_literal_on_left() {
         let logical = LogicalPlan::Scan {
             table_name: "users".to_string(),
