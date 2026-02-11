@@ -1,4 +1,4 @@
-use crate::{PageId, pager::Pager};
+use crate::{PageId, failpoint, pager::Pager};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -214,12 +214,14 @@ impl WalManager {
         active_tx_table: HashMap<u32, Lsn>,
         dirty_page_table: HashMap<PageId, Lsn>,
     ) -> io::Result<()> {
+        failpoint::maybe_fail("wal.checkpoint.before_record")?;
         let checkpoint_record = WalRecord::Checkpoint {
             active_tx_table,
             dirty_page_table,
         };
         let lsn = self.log(0, 0, &checkpoint_record)?;
         self.last_checkpoint_lsn.store(lsn, Ordering::SeqCst);
+        failpoint::maybe_fail("wal.checkpoint.before_truncate")?;
         self.truncate_wal()
     }
 
@@ -512,7 +514,8 @@ impl Drop for WalManager {
 #[cfg(test)]
 mod tests {
     use super::{WalManager, WalRecord, WalRecordHeader};
-    use crate::{Page, PageId, pager::Pager};
+    use crate::{Page, PageId, failpoint, pager::Pager};
+    use std::collections::HashMap;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
@@ -714,5 +717,43 @@ mod tests {
 
         assert_eq!(highest_tx, 9);
         assert_eq!(page.data.to_vec(), expected_after);
+    }
+
+    #[test]
+    fn test_checkpoint_failpoint_before_record_preserves_existing_wal() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("checkpoint_before_record.wal");
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let original_lsn = wal.log(7, 0, &WalRecord::Commit { tx_id: 7 }).unwrap();
+
+        failpoint::clear();
+        failpoint::enable("wal.checkpoint.before_record");
+        let err = wal.checkpoint(HashMap::new(), HashMap::new()).unwrap_err();
+        failpoint::clear();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let (record, _) = wal.read_record(original_lsn).unwrap();
+        assert_eq!(record, Some(WalRecord::Commit { tx_id: 7 }));
+    }
+
+    #[test]
+    fn test_checkpoint_failpoint_before_truncate_keeps_wal_untruncated() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("checkpoint_before_truncate.wal");
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let _ = wal.log(8, 0, &WalRecord::Commit { tx_id: 8 }).unwrap();
+        let len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+        failpoint::clear();
+        failpoint::enable("wal.checkpoint.before_truncate");
+        let err = wal.checkpoint(HashMap::new(), HashMap::new()).unwrap_err();
+        failpoint::clear();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let len_after = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            len_after > len_before,
+            "checkpoint record should be appended when truncate is skipped"
+        );
     }
 }

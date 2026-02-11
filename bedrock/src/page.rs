@@ -267,3 +267,83 @@ impl Page {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn snapshot(xmin: TransactionId, xmax: TransactionId, active: &[TransactionId]) -> Snapshot {
+        Snapshot {
+            xmin,
+            xmax,
+            active_transactions: Arc::new(active.iter().copied().collect::<HashSet<_>>()),
+        }
+    }
+
+    fn set_xmax(page: &mut Page, item_id: u16, xmax: TransactionId) {
+        let item = page.get_item_id_data(item_id).expect("item exists");
+        let mut header = page.read_tuple_header(item.offset);
+        header.xmax = xmax;
+        page.write_tuple_header(item.offset, &header);
+    }
+
+    #[test]
+    fn own_insert_is_visible_and_own_delete_is_invisible() {
+        let mut page = Page::new(0);
+        let tx = 10;
+        let item_id = page
+            .add_tuple(b"hello", tx, 0)
+            .expect("tuple should be added");
+        let snap = snapshot(10, 11, &[tx]);
+
+        assert!(page.is_visible(&snap, tx, item_id));
+        set_xmax(&mut page, item_id, tx);
+        assert!(!page.is_visible(&snap, tx, item_id));
+    }
+
+    #[test]
+    fn concurrent_uncommitted_insert_is_not_visible() {
+        let mut page = Page::new(0);
+        let writer_tx = 20;
+        let reader_tx = 30;
+        let item_id = page
+            .add_tuple(b"v", writer_tx, 0)
+            .expect("tuple should be added");
+        let snap = snapshot(20, 31, &[writer_tx, reader_tx]);
+
+        assert!(!page.is_visible(&snap, reader_tx, item_id));
+    }
+
+    #[test]
+    fn concurrent_committed_insert_is_visible() {
+        let mut page = Page::new(0);
+        let writer_tx = 20;
+        let reader_tx = 30;
+        let item_id = page
+            .add_tuple(b"v", writer_tx, 0)
+            .expect("tuple should be added");
+        let snap = snapshot(30, 31, &[reader_tx]);
+
+        assert!(page.is_visible(&snap, reader_tx, item_id));
+    }
+
+    #[test]
+    fn committed_delete_is_not_visible_but_in_progress_delete_is_visible() {
+        let mut page = Page::new(0);
+        let creator_tx = 20;
+        let deleter_tx = 25;
+        let reader_tx = 30;
+        let item_id = page
+            .add_tuple(b"v", creator_tx, 0)
+            .expect("tuple should be added");
+        set_xmax(&mut page, item_id, deleter_tx);
+
+        let committed_delete_snapshot = snapshot(30, 31, &[reader_tx]);
+        assert!(!page.is_visible(&committed_delete_snapshot, reader_tx, item_id));
+
+        let in_progress_delete_snapshot = snapshot(25, 31, &[deleter_tx, reader_tx]);
+        assert!(page.is_visible(&in_progress_delete_snapshot, reader_tx, item_id));
+    }
+}
