@@ -2,12 +2,11 @@
 
 #[cfg(test)]
 mod tests {
-    use titan_bin::aggregate_executor::{HashAggregateExecutor, StreamAggregateExecutor};
+    use titan_bin::aggregate_executor::HashAggregateExecutor;
     use titan_bin::executor::Executor;
-    use titan_bin::parser::{Expression, LiteralValue};
+    use titan_bin::parser::Expression;
     use titan_bin::planner::AggregateExpr;
     use titan_bin::types::Column;
-    use std::collections::HashMap;
 
     // Mock executor for testing
     struct MockExecutor {

@@ -213,11 +213,11 @@ pub struct ArcPageGuard<'a> {
 }
 
 impl<'a> ArcPageGuard<'a> {
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<Page> {
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Page> {
         self.bpm.frames[self.frame_idx].read()
     }
 
-    pub fn write(&self) -> parking_lot::RwLockWriteGuard<Page> {
+    pub fn write(&self) -> parking_lot::RwLockWriteGuard<'_, Page> {
         let mut meta = self.bpm.frame_metadata[self.frame_idx].lock().unwrap();
         meta.is_dirty = true;
         drop(meta);
@@ -257,7 +257,7 @@ impl ArcBufferPoolManager {
         }
     }
 
-    pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<ArcPageGuard> {
+    pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<ArcPageGuard<'_>> {
         // Fast path: check if page is already in buffer
         {
             let page_table = self.page_table.read();
@@ -282,7 +282,7 @@ impl ArcBufferPoolManager {
         self.load_page(page_id)
     }
 
-    fn load_page(self: &Arc<Self>, page_id: PageId) -> io::Result<ArcPageGuard> {
+    fn load_page(self: &Arc<Self>, page_id: PageId) -> io::Result<ArcPageGuard<'_>> {
         let mut arc_state = self.arc_state.lock().unwrap();
         let evicted_page_id = arc_state.on_miss(page_id);
         drop(arc_state);
@@ -402,7 +402,7 @@ impl ArcBufferPoolManager {
         Ok(())
     }
 
-    pub fn new_page(self: &Arc<Self>) -> io::Result<ArcPageGuard> {
+    pub fn new_page(self: &Arc<Self>) -> io::Result<ArcPageGuard<'_>> {
         // Allocate a new page on disk
         let new_page_id = self.pager.lock().unwrap().allocate_page()?;
         

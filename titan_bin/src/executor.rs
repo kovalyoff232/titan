@@ -892,7 +892,6 @@ struct HashJoinExecutor<'a> {
     current_left_row: Option<Row>,
     current_matches: Vec<Row>,
     left_table_name: Option<String>,
-    right_table_name: Option<String>,
 }
 
 impl<'a> HashJoinExecutor<'a> {
@@ -944,7 +943,6 @@ impl<'a> HashJoinExecutor<'a> {
             current_left_row: None,
             current_matches: Vec::new(),
             left_table_name,
-            right_table_name,
         })
     }
 }
@@ -991,7 +989,6 @@ impl<'a> Executor for HashJoinExecutor<'a> {
 // SortExecutor
 struct SortExecutor<'a> {
     input: Box<dyn Executor + 'a>,
-    order_by: Vec<Expression>,
     sorted_rows: Vec<Row>,
     cursor: usize,
 }
@@ -1052,7 +1049,6 @@ impl<'a> SortExecutor<'a> {
 
         Ok(Self {
             input,
-            order_by,
             sorted_rows: rows,
             cursor: 0,
         })
@@ -2031,7 +2027,6 @@ struct DeleteExecutor<'a> {
     wm: &'a Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &'a Snapshot,
-    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
     schema: Vec<Column>,
     indexes: Vec<IntIndexInfo>,
     output_schema: Vec<Column>,
@@ -2077,7 +2072,6 @@ impl<'a> DeleteExecutor<'a> {
             wm,
             tx_id,
             snapshot,
-            system_catalog,
             schema,
             indexes,
             output_schema,
@@ -2185,201 +2179,6 @@ impl<'a> Executor for DeleteExecutor<'a> {
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-}
-
-struct UpdateExecutor<'a> {
-    stmt: &'a UpdateStatement,
-    bpm: &'a Arc<BufferPoolManager>,
-    tm: &'a Arc<TransactionManager>,
-    lm: &'a Arc<LockManager>,
-    wm: &'a Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &'a Snapshot,
-    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
-    schema: Vec<Column>,
-    output_schema: Vec<Column>,
-    current_page_id: PageId,
-    current_item_id: u16,
-    rows_affected: u32,
-    done: bool,
-}
-
-impl<'a> UpdateExecutor<'a> {
-    fn new(
-        stmt: &'a UpdateStatement,
-        bpm: &'a Arc<BufferPoolManager>,
-        tm: &'a Arc<TransactionManager>,
-        lm: &'a Arc<LockManager>,
-        wm: &'a Arc<Mutex<WalManager>>,
-        tx_id: u32,
-        snapshot: &'a Snapshot,
-        system_catalog: &'a Arc<Mutex<SystemCatalog>>,
-    ) -> Result<Self, ExecutionError> {
-        let (table_oid, first_page_id) = system_catalog
-            .lock()
-            .unwrap()
-            .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
-            .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
-
-        let schema = system_catalog
-            .lock()
-            .unwrap()
-            .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-
-        let output_schema = vec![Column {
-            name: "rows_updated".to_string(),
-            type_id: 23, // INT
-        }];
-
-        Ok(Self {
-            stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-            schema,
-            output_schema,
-            current_page_id: first_page_id,
-            current_item_id: 0,
-            rows_affected: 0,
-            done: false,
-        })
-    }
-}
-
-impl<'a> Executor for UpdateExecutor<'a> {
-    fn schema(&self) -> &Vec<Column> {
-        &self.output_schema
-    }
-
-    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
-        if self.done {
-            return Ok(None);
-        }
-
-        loop {
-            if self.current_page_id == INVALID_PAGE_ID {
-                self.done = true;
-                return Ok(Some(vec![self.rows_affected.to_string()]));
-            }
-
-            let page_guard = self.bpm.acquire_page(self.current_page_id)?;
-
-            if self.current_item_id >= page_guard.read().get_tuple_count() {
-                self.current_page_id = page_guard.read().read_header().next_page_id;
-                self.current_item_id = 0;
-                continue;
-            }
-
-            let item_id = self.current_item_id;
-            self.current_item_id += 1;
-
-            let old_parsed = {
-                let page = page_guard.read();
-                if !page.is_visible(self.snapshot, self.tx_id, item_id) {
-                    continue;
-                }
-                if let Some(tuple_data) = page.get_tuple(item_id) {
-                    parse_tuple(tuple_data, &self.schema)
-                } else {
-                    continue;
-                }
-            };
-
-            if self.stmt.where_clause.as_ref().map_or(true, |p| {
-                evaluate_expr_for_row(p, &old_parsed).unwrap_or(false)
-            }) {
-                self.lm.lock(
-                    self.tx_id,
-                    LockableResource::Tuple((self.current_page_id, item_id)),
-                    LockMode::Exclusive,
-                )?;
-
-                let mut page = page_guard.write();
-
-                if !page.is_visible(self.snapshot, self.tx_id, item_id)
-                    || page
-                        .get_item_id_data(item_id)
-                        .map(|d| page.read_tuple_header(d.offset).xmax != 0)
-                        .unwrap_or(true)
-                {
-                    self.lm.unlock_all(self.tx_id);
-                    return Err(ExecutionError::SerializationFailure);
-                }
-
-                let mut new_parsed = old_parsed.clone();
-                for (col_name, expr) in &self.stmt.assignments {
-                    new_parsed.insert(
-                        col_name.clone(),
-                        evaluate_expr_for_row_to_val(expr, &old_parsed)?,
-                    );
-                }
-
-                let mut new_data = Vec::new();
-                for col in &self.schema {
-                    if let Some(val) = new_parsed.get(&col.name) {
-                        match val {
-                            LiteralValue::Number(n) => {
-                                new_data.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes())
-                            }
-                            LiteralValue::String(s) => {
-                                new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                                new_data.extend_from_slice(s.as_bytes());
-                            }
-                            LiteralValue::Bool(b) => new_data.push(if *b { 1 } else { 0 }),
-                            LiteralValue::Date(s) => {
-                                let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-                                let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-                                let days = date.signed_duration_since(epoch).num_days() as i32;
-                                new_data.extend_from_slice(&days.to_be_bytes());
-                            }
-                            LiteralValue::Null => {
-                                // For NULL values, we could either skip or write a special marker
-                                // For now, let's write 4 zero bytes to represent NULL
-                                new_data.extend_from_slice(&0i32.to_be_bytes());
-                            }
-                        }
-                    }
-                }
-
-                let before_page = page.data.to_vec();
-                let item_id_data = page.get_item_id_data(item_id).unwrap();
-                let mut header = page.read_tuple_header(item_id_data.offset);
-                header.xmax = self.tx_id;
-                page.write_tuple_header(item_id_data.offset, &header);
-
-                if let Some(new_item_id) = page.add_tuple(&new_data, self.tx_id, 0) {
-                    let after_page = page.data.to_vec();
-                    self.rows_affected += 1;
-                    let prev_lsn = self.tm.get_last_lsn(self.tx_id).unwrap_or(0);
-                    let lsn = self.wm.lock().unwrap().log(
-                        self.tx_id,
-                        prev_lsn,
-                        &WalRecord::UpdateTuple {
-                            tx_id: self.tx_id,
-                            page_id: self.current_page_id,
-                            item_id: new_item_id,
-                            before_page,
-                            after_page,
-                        },
-                    )?;
-                    self.tm.set_last_lsn(self.tx_id, lsn);
-                    let mut page_header = page.read_header();
-                    page_header.lsn = lsn;
-                    page.write_header(&page_header);
-                } else {
-                    let mut header = page.read_tuple_header(item_id_data.offset);
-                    header.xmax = 0;
-                    page.write_tuple_header(item_id_data.offset, &header);
-                    self.lm.unlock_all(self.tx_id);
-                    return Err(ExecutionError::SerializationFailure);
                 }
             }
         }

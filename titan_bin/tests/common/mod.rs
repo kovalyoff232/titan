@@ -11,7 +11,7 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(6000);
 /// is killed when the client goes out of scope.
 pub struct TestClient {
     pub client: Client,
-    pub addr: String,
+    pub _addr: String,
     _server_process: Child, // The underscore prevents warnings about it being unused
     _dir: TempDir,          // Ensures the temp directory is cleaned up
 }
@@ -83,7 +83,7 @@ pub fn setup_server_and_client(test_name: &str) -> TestClient {
     let client = Client::connect(&client_addr, NoTls).unwrap();
     TestClient {
         client,
-        addr: client_addr,
+        _addr: client_addr,
         _server_process: server_process,
         _dir: dir,
     }

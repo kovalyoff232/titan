@@ -263,8 +263,6 @@ struct PlanInfo {
     plan: Arc<PhysicalPlan>,
     cost: f64,
     cardinality: f64,
-    // Represents the set of tables included in this plan
-    relation_set: u32,
 }
 
 // Key is a bitmask representing the set of relations in the plan
@@ -300,7 +298,6 @@ fn create_physical_plan(
             plan: Arc::new(seq_scan_plan),
             cost: seq_scan_cost,
             cardinality: base_cardinality,
-            relation_set: relation_mask,
         });
 
         // IndexScan
@@ -324,7 +321,6 @@ fn create_physical_plan(
                                  plan: Arc::new(index_scan_plan),
                                  cost: index_cost,
                                  cardinality: index_cardinality,
-                                 relation_set: relation_mask,
                              });
                          }
                      }
@@ -366,7 +362,6 @@ fn create_physical_plan(
                                     plan: Arc::new(hj_plan),
                                     cost: hj_cost,
                                     cardinality: hj_card,
-                                    relation_set: subset_mask,
                                 });
 
                                 // NestedLoopJoin
@@ -385,7 +380,6 @@ fn create_physical_plan(
                                     plan: Arc::new(nlj_plan),
                                     cost: nlj_cost,
                                     cardinality: nlj_card,
-                                    relation_set: subset_mask,
                                 });
                             }
                         }
@@ -522,6 +516,7 @@ const RANDOM_PAGE_COST: f64 = 1.1;
 const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_OPERATOR_COST: f64 = 0.0025;
 
+#[allow(dead_code)]
 fn estimate_cardinality(
     plan: &PhysicalPlan,
     stats: &HashMap<String, Arc<TableStats>>,
@@ -801,6 +796,7 @@ fn get_filter_from_logical_plan(plan: &LogicalPlan) -> Option<&Expression> {
 }
 
 // Helper functions to extract info from plan/expressions
+#[allow(dead_code)]
 fn get_table_name(plan: &LogicalPlan) -> Option<String> {
     match plan {
         LogicalPlan::Scan { table_name, .. } => Some(table_name.clone()),
@@ -816,6 +812,7 @@ fn get_col_name(expr: &Expression) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn get_col_idx(
     table_name: &str,
     col_name: &str,

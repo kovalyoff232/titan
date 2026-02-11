@@ -218,7 +218,7 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
 
 /// CTE executor that handles Common Table Expressions
 pub struct CteExecutor<'a> {
-    cte_context: Arc<CteContext>,
+    _cte_context: Arc<CteContext>,
     main_query: Box<dyn Executor + 'a>,
     schema: Vec<Column>,
 }
@@ -230,7 +230,7 @@ impl<'a> CteExecutor<'a> {
     ) -> Self {
         let schema = main_query.schema().clone();
         Self {
-            cte_context,
+            _cte_context: cte_context,
             main_query,
             schema,
         }

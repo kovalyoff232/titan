@@ -35,11 +35,11 @@ pub struct PageGuard<'a> {
 }
 
 impl<'a> PageGuard<'a> {
-    pub fn read(&self) -> std::sync::RwLockReadGuard<Page> {
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Page> {
         self.frame.page.read().unwrap()
     }
 
-    pub fn write(&self) -> std::sync::RwLockWriteGuard<Page> {
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, Page> {
         *self.frame.is_dirty.lock().unwrap() = true;
         self.frame.page.write().unwrap()
     }
@@ -73,7 +73,7 @@ impl BufferPoolManager {
         }
     }
 
-    pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<PageGuard> {
+    pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<PageGuard<'_>> {
         // 1. Check if page is already in buffer pool.
         if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
             let frame = self.frames[frame_index].clone();
@@ -117,7 +117,7 @@ impl BufferPoolManager {
         })
     }
 
-    pub fn new_page(self: &Arc<Self>) -> io::Result<PageGuard> {
+    pub fn new_page(self: &Arc<Self>) -> io::Result<PageGuard<'_>> {
         // 1. Find a free frame or evict one.
         let frame_index = self
             .find_victim_frame()

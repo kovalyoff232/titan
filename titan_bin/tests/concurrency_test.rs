@@ -17,7 +17,7 @@ fn test_concurrent_updates_conflict() {
     println!("[MAIN] Таблица 'accounts' создана и заполнена.");
 
     // --- Транзакции ---
-    let addr_clone1 = test_client.addr.to_string();
+    let addr_clone1 = test_client._addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Поток запущен.");
         let mut client1 = Client::connect(&addr_clone1, NoTls).unwrap();
@@ -44,7 +44,7 @@ fn test_concurrent_updates_conflict() {
         println!("[TX1] Транзакция завершена.");
     });
 
-    let addr_clone2 = test_client.addr.to_string();
+    let addr_clone2 = test_client._addr.to_string();
     let handle2 = thread::spawn(move || {
         println!("[TX2] Поток запущен.");
         thread::sleep(Duration::from_millis(100));
@@ -94,7 +94,7 @@ fn test_deadlock_detection() {
     println!("[MAIN] Table 'deadlock_test' created and populated.");
 
     // --- Transactions ---
-    let addr_clone1 = test_client.addr.to_string();
+    let addr_clone1 = test_client._addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Thread started.");
         let mut client1 = Client::connect(&addr_clone1, NoTls).unwrap();
@@ -125,7 +125,7 @@ fn test_deadlock_detection() {
         result
     });
 
-    let addr_clone2 = test_client.addr.to_string();
+    let addr_clone2 = test_client._addr.to_string();
     let handle2 = thread::spawn(move || {
         println!("[TX2] Thread started.");
         // Give TX1 time to lock resource 1

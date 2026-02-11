@@ -273,12 +273,12 @@ pub mod window_exec {
     /// Window function executor
     pub struct WindowExecutor {
         function: WindowFunction,
-        spec: WindowSpec,
+        _spec: WindowSpec,
     }
 
     impl WindowExecutor {
         pub fn new(function: WindowFunction, spec: WindowSpec) -> Self {
-            Self { function, spec }
+            Self { function, _spec: spec }
         }
 
         /// Execute window function over a partition
