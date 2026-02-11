@@ -501,7 +501,7 @@ impl Drop for WalManager {
 #[cfg(test)]
 mod tests {
     use super::{WalManager, WalRecord, WalRecordHeader};
-    use crate::PageId;
+    use crate::{Page, PageId, pager::Pager};
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
@@ -514,6 +514,24 @@ mod tests {
             before_page: vec![1, 2, 3, 4],
             after_page: vec![5, 6, 7, 8],
         }
+    }
+
+    fn page_image(page_id: PageId, fill: u8) -> Vec<u8> {
+        let mut page = Page::new(page_id);
+        let payload_start = std::mem::size_of::<crate::page::PageHeaderData>();
+        for byte in page.data[payload_start..].iter_mut() {
+            *byte = fill;
+        }
+        page.data.to_vec()
+    }
+
+    fn page_image_with_lsn(page_id: PageId, image: Vec<u8>, lsn: u64) -> Vec<u8> {
+        let mut page = Page::new(page_id);
+        page.data.copy_from_slice(&image);
+        let mut header = page.read_header();
+        header.lsn = lsn;
+        page.write_header(&header);
+        page.data.to_vec()
     }
 
     #[test]
@@ -557,5 +575,102 @@ mod tests {
         let mut wal = WalManager::open(&wal_path).unwrap();
         let err = wal.read_record(lsn).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_recover_is_idempotent_for_committed_update() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("recover_idempotent.wal");
+        let db_path = dir.path().join("recover_idempotent.db");
+
+        let before_page = page_image(0, 0x11);
+        let after_page = page_image(0, 0x22);
+        let update_lsn = {
+            let mut wal = WalManager::open(&wal_path).unwrap();
+            let _ = wal.log(1, 0, &WalRecord::Commit { tx_id: 1 }).unwrap();
+            let record = WalRecord::UpdateTuple {
+                tx_id: 7,
+                page_id: 0,
+                item_id: 0,
+                before_page: before_page.clone(),
+                after_page: after_page.clone(),
+            };
+            let lsn = wal.log(7, 0, &record).unwrap();
+            wal.log(7, lsn, &WalRecord::Commit { tx_id: 7 }).unwrap();
+            lsn
+        };
+
+        let expected_after = page_image_with_lsn(0, after_page.clone(), update_lsn);
+
+        let (first_highest_tx, first_page_data) = {
+            let mut pager = Pager::open(&db_path).unwrap();
+            let highest_tx = WalManager::recover(&wal_path, &mut pager).unwrap();
+            let page = pager.read_page(0).unwrap();
+            (highest_tx, page.data.to_vec())
+        };
+
+        let (second_highest_tx, second_page_data) = {
+            let mut pager = Pager::open(&db_path).unwrap();
+            let highest_tx = WalManager::recover(&wal_path, &mut pager).unwrap();
+            let page = pager.read_page(0).unwrap();
+            (highest_tx, page.data.to_vec())
+        };
+
+        assert_eq!(first_highest_tx, 7);
+        assert_eq!(second_highest_tx, 7);
+        assert_eq!(first_page_data, expected_after);
+        assert_eq!(second_page_data, expected_after);
+    }
+
+    #[test]
+    fn test_recover_ignores_truncated_tail_after_valid_records() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("recover_truncated_tail.wal");
+        let db_path = dir.path().join("recover_truncated_tail.db");
+
+        let before_page = page_image(2, 0x31);
+        let after_page = page_image(2, 0x42);
+        let update_lsn = {
+            let mut wal = WalManager::open(&wal_path).unwrap();
+            let _ = wal.log(1, 0, &WalRecord::Commit { tx_id: 1 }).unwrap();
+            let record = WalRecord::UpdateTuple {
+                tx_id: 9,
+                page_id: 2,
+                item_id: 0,
+                before_page: before_page.clone(),
+                after_page: after_page.clone(),
+            };
+            let lsn = wal.log(9, 0, &record).unwrap();
+            wal.log(9, lsn, &WalRecord::Commit { tx_id: 9 }).unwrap();
+            lsn
+        };
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        let dangling_header = WalRecordHeader {
+            total_len: std::mem::size_of::<WalRecordHeader>() as u32 + 64,
+            tx_id: 1234,
+            prev_lsn: 0,
+            crc: 0,
+        };
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&dangling_header as *const WalRecordHeader).cast::<u8>(),
+                std::mem::size_of::<WalRecordHeader>(),
+            )
+        };
+        file.write_all(header_bytes).unwrap();
+        file.flush().unwrap();
+
+        let expected_after = page_image_with_lsn(2, after_page.clone(), update_lsn);
+        let mut pager = Pager::open(&db_path).unwrap();
+        let highest_tx = WalManager::recover(&wal_path, &mut pager).unwrap();
+        let page = pager.read_page(2).unwrap();
+
+        assert_eq!(highest_tx, 9);
+        assert_eq!(page.data.to_vec(), expected_after);
     }
 }

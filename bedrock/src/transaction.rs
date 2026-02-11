@@ -3,6 +3,7 @@ use crate::failpoint;
 use crate::page::TransactionId;
 use crate::wal::{Lsn, WalManager, WalRecord};
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +36,16 @@ struct TransactionManagerState {
 
     last_lsns: Mutex<HashMap<TransactionId, Lsn>>,
 
+    tx_statuses: Mutex<HashMap<TransactionId, TransactionStatus>>,
+
     next_oid: AtomicU32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionStatus {
+    Active,
+    Committing,
+    Aborting,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +63,7 @@ impl TransactionManager {
             next_transaction_id: AtomicU32::new(initial_tx_id),
             active_transactions: Mutex::new(HashSet::new()),
             last_lsns: Mutex::new(HashMap::new()),
+            tx_statuses: Mutex::new(HashMap::new()),
             next_oid: AtomicU32::new(100),
         };
         Self {
@@ -66,6 +77,38 @@ impl TransactionManager {
         oid
     }
 
+    fn set_status(&self, tx_id: TransactionId, status: TransactionStatus) {
+        self.state.tx_statuses.lock().unwrap().insert(tx_id, status);
+    }
+
+    fn transition_status(
+        &self,
+        tx_id: TransactionId,
+        allowed: &[TransactionStatus],
+        next: TransactionStatus,
+    ) -> io::Result<()> {
+        let mut statuses = self.state.tx_statuses.lock().unwrap();
+        let Some(current) = statuses.get(&tx_id).copied() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("transaction {tx_id} not found"),
+            ));
+        };
+
+        if !allowed.contains(&current) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid transaction state transition for tx {tx_id}: {:?} -> {:?}",
+                    current, next
+                ),
+            ));
+        }
+
+        statuses.insert(tx_id, next);
+        Ok(())
+    }
+
     pub fn begin(&self) -> TransactionId {
         let tx_id = self
             .state
@@ -73,6 +116,11 @@ impl TransactionManager {
             .fetch_add(1, Ordering::SeqCst);
         self.state.active_transactions.lock().unwrap().insert(tx_id);
         self.state.last_lsns.lock().unwrap().insert(tx_id, 0);
+        self.state
+            .tx_statuses
+            .lock()
+            .unwrap()
+            .insert(tx_id, TransactionStatus::Active);
         println!(
             "[TM::begin] Started tx_id: {}. Active transactions: {:?}",
             tx_id,
@@ -88,6 +136,7 @@ impl TransactionManager {
             .unwrap()
             .remove(&tx_id);
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
+        self.state.tx_statuses.lock().unwrap().remove(&tx_id);
         println!(
             "[TM::commit] Committed tx_id: {}. Active transactions: {:?}",
             tx_id,
@@ -96,7 +145,16 @@ impl TransactionManager {
     }
 
     pub fn commit(&self, tx_id: TransactionId) {
-        self.finalize_commit(tx_id);
+        if self
+            .transition_status(
+                tx_id,
+                &[TransactionStatus::Active],
+                TransactionStatus::Committing,
+            )
+            .is_ok()
+        {
+            self.finalize_commit(tx_id);
+        }
     }
 
     pub fn commit_with_wal(
@@ -105,12 +163,35 @@ impl TransactionManager {
         wal: &mut WalManager,
     ) -> std::io::Result<()> {
         failpoint::maybe_fail("tm.commit.before_wal")?;
-        let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Commit { tx_id })?;
-        self.set_last_lsn(tx_id, lsn);
-        failpoint::maybe_fail("tm.commit.after_wal")?;
-        self.finalize_commit(tx_id);
-        Ok(())
+        self.transition_status(
+            tx_id,
+            &[TransactionStatus::Active],
+            TransactionStatus::Committing,
+        )?;
+
+        let commit_result: io::Result<()> = (|| {
+            let prev_lsn = self.get_last_lsn(tx_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("transaction {tx_id} has no WAL chain"),
+                )
+            })?;
+            let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Commit { tx_id })?;
+            self.set_last_lsn(tx_id, lsn);
+            failpoint::maybe_fail("tm.commit.after_wal")?;
+            Ok(())
+        })();
+
+        match commit_result {
+            Ok(()) => {
+                self.finalize_commit(tx_id);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_status(tx_id, TransactionStatus::Active);
+                Err(e)
+            }
+        }
     }
 
     pub fn get_last_lsn(&self, tx_id: TransactionId) -> Option<Lsn> {
@@ -136,8 +217,18 @@ impl TransactionManager {
         bpm: &Arc<BufferPoolManager>,
     ) -> std::io::Result<()> {
         println!("[TM::abort] Aborting tx_id: {}", tx_id);
+        self.transition_status(
+            tx_id,
+            &[TransactionStatus::Active, TransactionStatus::Committing],
+            TransactionStatus::Aborting,
+        )?;
 
-        let mut current_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+        let mut current_lsn = self.get_last_lsn(tx_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("transaction {tx_id} has no WAL chain"),
+            )
+        })?;
 
         while current_lsn > 0 {
             let (record, prev_lsn) = wal.read_record(current_lsn)?;
@@ -201,9 +292,22 @@ impl TransactionManager {
             current_lsn = prev_lsn;
         }
 
-        failpoint::maybe_fail("tm.abort.before_abort_record")?;
-        let last_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
-        wal.log(tx_id, last_lsn, &WalRecord::Abort { tx_id })?;
+        let abort_record_result: io::Result<()> = (|| {
+            failpoint::maybe_fail("tm.abort.before_abort_record")?;
+            let last_lsn = self.get_last_lsn(tx_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("transaction {tx_id} has no WAL chain"),
+                )
+            })?;
+            wal.log(tx_id, last_lsn, &WalRecord::Abort { tx_id })?;
+            Ok(())
+        })();
+
+        if let Err(e) = abort_record_result {
+            self.set_status(tx_id, TransactionStatus::Active);
+            return Err(e);
+        }
 
         self.state
             .active_transactions
@@ -211,6 +315,7 @@ impl TransactionManager {
             .unwrap()
             .remove(&tx_id);
         self.state.last_lsns.lock().unwrap().remove(&tx_id);
+        self.state.tx_statuses.lock().unwrap().remove(&tx_id);
 
         println!(
             "[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}",
@@ -354,5 +459,31 @@ mod tests {
 
         assert!(res.is_err());
         assert!(tm.is_active(tx_id));
+    }
+
+    #[test]
+    fn test_commit_unknown_transaction_fails() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("commit_unknown.wal");
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+
+        let err = tm.commit_with_wal(42, &mut wal).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_abort_unknown_transaction_fails() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("abort_unknown.wal");
+        let db_path = dir.path().join("abort_unknown.db");
+
+        let pager = Pager::open(&db_path).unwrap();
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+
+        let err = tm.abort(55, &mut wal, &bpm).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
