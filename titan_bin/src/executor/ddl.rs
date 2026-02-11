@@ -10,7 +10,22 @@ use bedrock::lock_manager::{LockManager, LockMode, LockableResource};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn lock_system_catalog<'a>(
+    system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
+    system_catalog
+        .lock()
+        .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))
+}
+
+fn lock_wal<'a>(
+    wm: &'a Arc<Mutex<WalManager>>,
+) -> Result<MutexGuard<'a, WalManager>, ExecutionError> {
+    wm.lock()
+        .map_err(|_| ExecutionError::GenericError("wal lock poisoned".to_string()))
+}
 
 pub(super) fn execute_create_table(
     stmt: &CreateTableStatement,
@@ -37,7 +52,7 @@ pub(super) fn execute_create_table(
     let after_page = pg_class_page.data.to_vec();
 
     let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-    let lsn = wm.lock().unwrap().log(
+    let lsn = lock_wal(wm)?.log(
         tx_id,
         prev_lsn,
         &WalRecord::InsertTuple {
@@ -79,7 +94,7 @@ pub(super) fn execute_create_table(
         let after_page = pg_attr_page.data.to_vec();
 
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
+        let lsn = lock_wal(wm)?.log(
             tx_id,
             prev_lsn,
             &WalRecord::InsertTuple {
@@ -108,9 +123,7 @@ pub(super) fn execute_create_index(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, table_page_id) = system_catalog
-        .lock()
-        .unwrap()
+    let (table_oid, table_page_id) = lock_system_catalog(system_catalog)?
         .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
@@ -135,10 +148,12 @@ pub(super) fn execute_create_index(
         tuple_data.push(stmt.index_name.len() as u8);
         tuple_data.extend_from_slice(stmt.index_name.as_bytes());
         let before_page = page.data.to_vec();
-        let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
+        let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or_else(|| {
+            ExecutionError::GenericError("Failed to insert index entry into pg_class".to_string())
+        })?;
         let after_page = page.data.to_vec();
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = wm.lock().unwrap().log(
+        let lsn = lock_wal(wm)?.log(
             tx_id,
             prev_lsn,
             &WalRecord::InsertTuple {
@@ -156,9 +171,7 @@ pub(super) fn execute_create_index(
     }
 
     if table_page_id != INVALID_PAGE_ID {
-        let schema = system_catalog
-            .lock()
-            .unwrap()
+        let schema = lock_system_catalog(system_catalog)?
             .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
         let rows_with_ids = scan_table(bpm, lm, table_page_id, &schema, tx_id, snapshot, false)?;
         for (page_id, item_id, parsed_tuple) in rows_with_ids {
