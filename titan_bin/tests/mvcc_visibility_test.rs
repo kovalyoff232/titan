@@ -26,7 +26,6 @@ fn own_write_is_visible_before_commit_and_hidden_after_rollback() {
 
 #[test]
 #[serial]
-#[ignore]
 fn concurrent_uncommitted_insert_is_invisible_until_commit() {
     let mut test_client = common::setup_server_and_client("mvcc_uncommitted_insert_test");
     test_client.simple_query("CREATE TABLE mvcc_t2 (id INT, v INT);");
@@ -51,14 +50,10 @@ fn concurrent_uncommitted_insert_is_invisible_until_commit() {
 
     inserted_rx.recv().unwrap();
 
-    let addr_for_reader = test_client._addr.to_string();
-    let mut reader = Client::connect(&addr_for_reader, NoTls).unwrap();
-    reader.simple_query("BEGIN;").unwrap();
-    let rows_while_uncommitted = reader
-        .simple_query("SELECT id FROM mvcc_t2 WHERE id = 1;")
-        .unwrap();
+    test_client.simple_query("BEGIN;");
+    let rows_while_uncommitted = test_client.simple_query("SELECT id FROM mvcc_t2 WHERE id = 1;");
     assert!(rows_while_uncommitted.is_empty());
-    reader.simple_query("COMMIT;").unwrap();
+    test_client.simple_query("COMMIT;");
 
     commit_tx.send(()).unwrap();
     committed_rx.recv().unwrap();
@@ -71,7 +66,6 @@ fn concurrent_uncommitted_insert_is_invisible_until_commit() {
 
 #[test]
 #[serial]
-#[ignore]
 fn uncommitted_delete_is_visible_to_others_and_committed_delete_is_hidden() {
     let mut test_client = common::setup_server_and_client("mvcc_delete_visibility_test");
     test_client.simple_query("CREATE TABLE mvcc_t3 (id INT, v INT);");
@@ -97,14 +91,11 @@ fn uncommitted_delete_is_visible_to_others_and_committed_delete_is_hidden() {
 
     deleted_rx.recv().unwrap();
 
-    let addr_for_reader = test_client._addr.to_string();
-    let mut reader = Client::connect(&addr_for_reader, NoTls).unwrap();
-    reader.simple_query("BEGIN;").unwrap();
-    let rows_while_delete_uncommitted = reader
-        .simple_query("SELECT id FROM mvcc_t3 WHERE id = 1;")
-        .unwrap();
+    test_client.simple_query("BEGIN;");
+    let rows_while_delete_uncommitted =
+        test_client.simple_query("SELECT id FROM mvcc_t3 WHERE id = 1;");
     assert_eq!(rows_while_delete_uncommitted.len(), 1);
-    reader.simple_query("COMMIT;").unwrap();
+    test_client.simple_query("COMMIT;");
 
     commit_tx.send(()).unwrap();
     committed_rx.recv().unwrap();
