@@ -11,6 +11,10 @@ use std::thread;
 use std::time::Duration;
 
 pub type Lsn = u64;
+const WAL_HEADER_LEN: usize = std::mem::size_of::<u32>()
+    + std::mem::size_of::<u32>()
+    + std::mem::size_of::<u64>()
+    + std::mem::size_of::<u32>();
 
 fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -28,6 +32,39 @@ pub struct WalRecordHeader {
     pub prev_lsn: Lsn,
 
     pub crc: u32,
+}
+
+impl WalRecordHeader {
+    fn to_bytes(self) -> [u8; WAL_HEADER_LEN] {
+        let mut bytes = [0u8; WAL_HEADER_LEN];
+        bytes[0..4].copy_from_slice(&self.total_len.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.tx_id.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.prev_lsn.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.crc.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8; WAL_HEADER_LEN]) -> Self {
+        let mut total_len_buf = [0u8; 4];
+        total_len_buf.copy_from_slice(&bytes[0..4]);
+        let mut tx_id_buf = [0u8; 4];
+        tx_id_buf.copy_from_slice(&bytes[4..8]);
+        let mut prev_lsn_buf = [0u8; 8];
+        prev_lsn_buf.copy_from_slice(&bytes[8..16]);
+        let mut crc_buf = [0u8; 4];
+        crc_buf.copy_from_slice(&bytes[16..20]);
+
+        let total_len = u32::from_le_bytes(total_len_buf);
+        let tx_id = u32::from_le_bytes(tx_id_buf);
+        let prev_lsn = u64::from_le_bytes(prev_lsn_buf);
+        let crc = u32::from_le_bytes(crc_buf);
+        Self {
+            total_len,
+            tx_id,
+            prev_lsn,
+            crc,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -159,7 +196,7 @@ impl WalManager {
             )
         })?;
 
-        let header_len = std::mem::size_of::<WalRecordHeader>() as u32;
+        let header_len = WAL_HEADER_LEN as u32;
         let total_len = header_len + record_bytes.len() as u32;
 
         let lsn = self.next_lsn.fetch_add(total_len as u64, Ordering::SeqCst);
@@ -177,9 +214,7 @@ impl WalManager {
 
         let mut file = lock_mutex_recover(&self.file);
         file.seek(SeekFrom::Start(lsn))?;
-        file.write_all(unsafe {
-            std::slice::from_raw_parts(&header as *const _ as *const u8, header_len as usize)
-        })?;
+        file.write_all(&header.to_bytes())?;
         file.write_all(&record_bytes)?;
 
         Ok(lsn)
@@ -197,14 +232,13 @@ impl WalManager {
         }
 
         file.seek(SeekFrom::Start(lsn))?;
-        let mut header_buf = [0u8; std::mem::size_of::<WalRecordHeader>()];
+        let mut header_buf = [0u8; WAL_HEADER_LEN];
         if file.read_exact(&mut header_buf).is_err() {
             return Ok((None, 0));
         }
-        let header: WalRecordHeader = unsafe { std::mem::transmute(header_buf) };
+        let header = WalRecordHeader::from_bytes(&header_buf);
 
-        let header_len = std::mem::size_of::<WalRecordHeader>();
-        if header.total_len < header_len as u32 {
+        if header.total_len < WAL_HEADER_LEN as u32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "WAL record has invalid length",
@@ -219,7 +253,7 @@ impl WalManager {
             ));
         }
 
-        let record_len = header.total_len as usize - header_len;
+        let record_len = header.total_len as usize - WAL_HEADER_LEN;
         let mut record_buf = vec![0; record_len];
         file.read_exact(&mut record_buf)?;
 
@@ -308,15 +342,16 @@ impl WalManager {
             record: WalRecord,
         }
 
-        let header_len = std::mem::size_of::<WalRecordHeader>();
+        let header_len = WAL_HEADER_LEN;
         let mut entries = Vec::new();
         let mut pos = 0usize;
 
         while pos + header_len <= buf.len() {
             let header_slice = &buf[pos..pos + header_len];
-            let header: WalRecordHeader = unsafe {
-                std::ptr::read_unaligned(header_slice.as_ptr() as *const WalRecordHeader)
-            };
+            let header_arr: [u8; WAL_HEADER_LEN] = header_slice.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL header size mismatch")
+            })?;
+            let header = WalRecordHeader::from_bytes(&header_arr);
 
             if header.total_len < header_len as u32 {
                 return Err(io::Error::new(
@@ -545,7 +580,7 @@ impl Drop for WalManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalManager, WalRecord, WalRecordHeader};
+    use super::{WAL_HEADER_LEN, WalManager, WalRecord, WalRecordHeader};
     use crate::{Page, PageId, failpoint, pager::Pager};
     use std::collections::HashMap;
     use std::fs::OpenOptions;
@@ -604,7 +639,7 @@ mod tests {
             wal.log(7, 0, &sample_record(11)).unwrap()
         };
 
-        let header_len = std::mem::size_of::<WalRecordHeader>() as u64;
+        let header_len = WAL_HEADER_LEN as u64;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -635,18 +670,12 @@ mod tests {
             .open(&wal_path)
             .unwrap();
         let header = WalRecordHeader {
-            total_len: (std::mem::size_of::<WalRecordHeader>() as u32) - 1,
+            total_len: (WAL_HEADER_LEN as u32) - 1,
             tx_id: 1,
             prev_lsn: 0,
             crc: 0,
         };
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&header as *const WalRecordHeader).cast::<u8>(),
-                std::mem::size_of::<WalRecordHeader>(),
-            )
-        };
-        file.write_all(header_bytes).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
         file.flush().unwrap();
 
         let mut wal = WalManager::open(&wal_path).unwrap();
@@ -779,18 +808,12 @@ mod tests {
             .open(&wal_path)
             .unwrap();
         let dangling_header = WalRecordHeader {
-            total_len: std::mem::size_of::<WalRecordHeader>() as u32 + 64,
+            total_len: WAL_HEADER_LEN as u32 + 64,
             tx_id: 1234,
             prev_lsn: 0,
             crc: 0,
         };
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&dangling_header as *const WalRecordHeader).cast::<u8>(),
-                std::mem::size_of::<WalRecordHeader>(),
-            )
-        };
-        file.write_all(header_bytes).unwrap();
+        file.write_all(&dangling_header.to_bytes()).unwrap();
         file.flush().unwrap();
 
         let expected_after = page_image_with_lsn(2, after_page.clone(), update_lsn);
