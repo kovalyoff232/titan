@@ -119,7 +119,7 @@ fn estimate_range_selectivity(
         .collect();
 
     let num_buckets = bounds_str.len() - 1;
-    if num_buckets <= 0 {
+    if num_buckets == 0 {
         return 0.33;
     }
 

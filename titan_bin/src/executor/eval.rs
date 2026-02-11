@@ -3,7 +3,7 @@ use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use chrono::prelude::*;
 use std::collections::HashMap;
 
-pub(super) fn evaluate_expr_for_row(
+pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<bool, ExecutionError> {
@@ -15,7 +15,7 @@ pub(super) fn evaluate_expr_for_row(
     }
 }
 
-pub(super) fn evaluate_expr_for_row_to_val(
+pub(crate) fn evaluate_expr_for_row_to_val(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
 ) -> Result<LiteralValue, ExecutionError> {

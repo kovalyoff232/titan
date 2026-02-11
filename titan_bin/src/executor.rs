@@ -1,7 +1,7 @@
 use crate::catalog::SystemCatalog;
 use crate::errors::ExecutionError;
 use crate::optimizer::{self, PhysicalPlan};
-use crate::parser::{Expression, SelectStatement, Statement};
+use crate::parser::{SelectStatement, Statement};
 use crate::planner;
 use crate::types::{Column, ExecuteResult, ResultSet};
 use bedrock::buffer_pool::BufferPoolManager;
@@ -23,6 +23,7 @@ mod pipeline;
 mod scan;
 use ddl::{execute_create_index, execute_create_table};
 use dml::{execute_delete, execute_insert, execute_update};
+pub(crate) use eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 pub use helpers::parse_tuple;
 use join::{HashJoinExecutor, NestedLoopJoinExecutor};
 use maintenance::{execute_analyze, execute_vacuum};
