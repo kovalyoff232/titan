@@ -69,7 +69,7 @@ pub(crate) fn evaluate_expr_for_row_to_val(
             let qname = format!("{}.{}", table, col);
             row.get(&qname)
                 .cloned()
-                .ok_or_else(|| ExecutionError::ColumnNotFound(qname))
+                .ok_or(ExecutionError::ColumnNotFound(qname))
         }
         Expression::Binary { left, op, right } => {
             let lval = evaluate_expr_for_row_to_val(left, row)?;

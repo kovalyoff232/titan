@@ -18,6 +18,12 @@ pub struct SystemCatalog {
     schema_cache: Mutex<HashMap<String, Arc<Vec<Column>>>>,
 }
 
+impl Default for SystemCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn read_u32(data: &[u8], start: usize) -> Option<u32> {
     data.get(start..start + 4)
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -115,7 +121,7 @@ impl SystemCatalog {
                             {
                                 if best_candidate
                                     .as_ref()
-                                    .map_or(true, |(xmin, _, _)| header.xmin > *xmin)
+                                    .is_none_or(|(xmin, _, _)| header.xmin > *xmin)
                                 {
                                     best_candidate = Some((header.xmin, table_oid, table_page_id));
                                     println!(

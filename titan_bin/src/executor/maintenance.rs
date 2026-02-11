@@ -139,7 +139,6 @@ fn analyze_table_and_update_stats(
     while current_page_id != bedrock::page::INVALID_PAGE_ID {
         let page_guard = bpm.acquire_page(current_page_id)?;
         let mut page = page_guard.write();
-        let mut modified = false;
 
         for item_id in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, item_id) {
@@ -153,7 +152,6 @@ fn analyze_table_and_update_stats(
                                 if header.xmax == 0 {
                                     header.xmax = tx_id;
                                     page.write_tuple_header(offset, &header);
-                                    modified = true;
                                 }
                             }
                         }
@@ -161,7 +159,6 @@ fn analyze_table_and_update_stats(
                 }
             }
         }
-        if modified {}
         current_page_id = page.read_header().next_page_id;
     }
 
