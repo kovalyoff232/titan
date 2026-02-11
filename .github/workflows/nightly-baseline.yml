@@ -1,0 +1,80 @@
+name: Nightly Baseline
+
+on:
+  schedule:
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: titan_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d titan_bench"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Wait for PostgreSQL
+        timeout-minutes: 2
+        run: |
+          for i in {1..30}; do
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres -d titan_bench && exit 0
+            sleep 2
+          done
+          exit 1
+        env:
+          PGPASSWORD: postgres
+
+      - name: Build benchmark binaries
+        timeout-minutes: 15
+        run: cargo build -p titan_bin --bin titan_bin --bin baseline_runner
+
+      - name: Run baseline (Titan vs PostgreSQL)
+        timeout-minutes: 18
+        run: |
+          cargo run --quiet -p titan_bin --bin baseline_runner -- \
+            --target both \
+            --rows 1000 \
+            --iterations 30 \
+            --warmup 3 \
+            --postgres-dsn "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=titan_bench" \
+            --out-json target/benchmarks/nightly-baseline.json
+
+      - name: Upload baseline artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-baseline
+          retention-days: 30
+          path: |
+            target/benchmarks/nightly-baseline.json
+            target/benchmarks/nightly-baseline.csv

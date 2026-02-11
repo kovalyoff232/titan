@@ -66,7 +66,7 @@ fn setup_test_db() -> (
         .unwrap();
     }
 
-    tm.commit(tx_id);
+    tm.commit(tx_id).unwrap();
 
     (bpm, tm, lm, wal, system_catalog)
 }
@@ -90,7 +90,7 @@ fn benchmark_simple_select(c: &mut Criterion) {
                 tx_id,
                 &snapshot,
             );
-            tm.commit(tx_id);
+            tm.commit(tx_id).unwrap();
             result
         })
     });
@@ -114,7 +114,7 @@ fn benchmark_aggregate(c: &mut Criterion) {
                 tx_id,
                 &snapshot,
             );
-            tm.commit(tx_id);
+            tm.commit(tx_id).unwrap();
             result
         })
     });

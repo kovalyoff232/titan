@@ -58,6 +58,8 @@ jobs:
           -BuildTimeoutSec 360 `
           -RunTimeoutSec 360
 
-    - name: Run tests
-      timeout-minutes: 20
-      run: cargo test --workspace --verbose
+    - name: Run tests (per-target timeout)
+      timeout-minutes: 25
+      run: |
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-tests-with-timeout.ps1 `
+          -TimeoutSec 300

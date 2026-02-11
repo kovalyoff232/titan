@@ -150,17 +150,14 @@ impl TransactionManager {
         );
     }
 
-    pub fn commit(&self, tx_id: TransactionId) {
-        if self
-            .transition_status(
-                tx_id,
-                &[TransactionStatus::Active],
-                TransactionStatus::Committing,
-            )
-            .is_ok()
-        {
-            self.finalize_commit(tx_id);
-        }
+    pub fn commit(&self, tx_id: TransactionId) -> io::Result<()> {
+        self.transition_status(
+            tx_id,
+            &[TransactionStatus::Active],
+            TransactionStatus::Committing,
+        )?;
+        self.finalize_commit(tx_id);
+        Ok(())
     }
 
     pub fn commit_with_wal(
@@ -384,7 +381,7 @@ mod tests {
         assert!(snapshot2.active_transactions.contains(&1));
         assert_eq!(snapshot2.active_transactions.len(), 2);
 
-        tm.commit(tx1);
+        tm.commit(tx1).unwrap();
 
         let snapshot3 = tm.create_snapshot(tx2);
         assert_eq!(snapshot3.xmin, 1);
@@ -481,6 +478,16 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_rejects_finished_transaction() {
+        let tm = TransactionManager::new(1);
+        let tx_id = tm.begin();
+        tm.commit(tx_id).unwrap();
+
+        let err = tm.commit(tx_id).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_abort_unknown_transaction_fails() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("abort_unknown.wal");
@@ -492,6 +499,23 @@ mod tests {
         let tm = TransactionManager::new(1);
 
         let err = tm.abort(55, &mut wal, &bpm).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_abort_rejects_finished_transaction() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("abort_finished.wal");
+        let db_path = dir.path().join("abort_finished.db");
+
+        let pager = Pager::open(&db_path).unwrap();
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let mut wal = WalManager::open(&wal_path).unwrap();
+        let tm = TransactionManager::new(1);
+        let tx_id = tm.begin();
+
+        tm.commit_with_wal(tx_id, &mut wal).unwrap();
+        let err = tm.abort(tx_id, &mut wal, &bpm).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
