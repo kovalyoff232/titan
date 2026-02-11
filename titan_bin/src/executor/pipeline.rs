@@ -1,0 +1,205 @@
+use super::eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
+use super::helpers::row_vec_to_map;
+use super::{Executor, Row};
+use crate::errors::ExecutionError;
+use crate::parser::{Expression, SelectItem};
+use crate::types::Column;
+use chrono::NaiveDate;
+use std::collections::HashMap;
+
+pub(super) struct FilterExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    predicate: Expression,
+}
+
+impl<'a> FilterExecutor<'a> {
+    pub(super) fn new(input: Box<dyn Executor + 'a>, predicate: Expression) -> Self {
+        Self { input, predicate }
+    }
+}
+
+impl<'a> Executor for FilterExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        self.input.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        loop {
+            match self.input.next()? {
+                Some(row) => {
+                    let row_map = row_vec_to_map(&row, self.schema(), None);
+                    if evaluate_expr_for_row(&self.predicate, &row_map)? {
+                        return Ok(Some(row));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+pub(super) struct ProjectionExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    expressions: Vec<SelectItem>,
+    projected_schema: Vec<Column>,
+}
+
+impl<'a> ProjectionExecutor<'a> {
+    pub(super) fn new(input: Box<dyn Executor + 'a>, expressions: Vec<SelectItem>) -> Self {
+        let mut projected_schema = Vec::new();
+        if expressions
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+        {
+            projected_schema = input.schema().clone();
+        } else {
+            for (i, item) in expressions.iter().enumerate() {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+                    SelectItem::UnnamedExpr(expr) => match expr {
+                        Expression::Column(name) => name.clone(),
+                        Expression::QualifiedColumn(_, col) => col.clone(),
+                        _ => format!("?column?_{}", i),
+                    },
+                    SelectItem::Wildcard => "*".to_string(),
+                    SelectItem::QualifiedWildcard(table_name) => format!("{}.*", table_name),
+                };
+                projected_schema.push(Column { name, type_id: 25 });
+            }
+        }
+        Self {
+            input,
+            expressions,
+            projected_schema,
+        }
+    }
+}
+
+impl<'a> Executor for ProjectionExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        &self.projected_schema
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        let next_row = self.input.next()?;
+        if next_row.is_none() {
+            return Ok(None);
+        }
+        let row = next_row.unwrap();
+
+        if self
+            .expressions
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard))
+        {
+            return Ok(Some(row));
+        }
+
+        let mut row_map = HashMap::new();
+        if self.input.schema().len() == row.len() {
+            row_map = row_vec_to_map(&row, self.input.schema(), None);
+        } else {
+            let left_len = self
+                .input
+                .schema()
+                .iter()
+                .filter(|c| c.name.starts_with("users."))
+                .count();
+            let (left_row, right_row) = row.split_at(left_len);
+            let (left_schema, right_schema) = self.input.schema().split_at(left_len);
+            row_map.extend(row_vec_to_map(left_row, left_schema, Some("users")));
+            row_map.extend(row_vec_to_map(right_row, right_schema, Some("orders")));
+        }
+        let mut projected_row = Vec::new();
+        for item in &self.expressions {
+            if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+                let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
+                projected_row.push(val.to_string());
+            }
+        }
+        Ok(Some(projected_row))
+    }
+}
+
+pub(super) struct SortExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    sorted_rows: Vec<Row>,
+    cursor: usize,
+}
+
+impl<'a> SortExecutor<'a> {
+    pub(super) fn new(
+        mut input: Box<dyn Executor + 'a>,
+        order_by: Vec<Expression>,
+    ) -> Result<Self, ExecutionError> {
+        let mut rows = Vec::new();
+        while let Some(row) = input.next()? {
+            rows.push(row);
+        }
+
+        if order_by.len() != 1 {
+            return Err(ExecutionError::GenericError(
+                "ORDER BY only supports a single column".to_string(),
+            ));
+        }
+        let sort_expr = &order_by[0];
+
+        let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
+            input
+                .schema()
+                .iter()
+                .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
+                .map(|i| (i, input.schema()[i].type_id))
+                .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
+        } else {
+            return Err(ExecutionError::GenericError(
+                "ORDER BY only supports column names".to_string(),
+            ));
+        };
+
+        rows.sort_by(|a, b| {
+            let val_a = &a[sort_col_idx];
+            let val_b = &b[sort_col_idx];
+            match sort_col_type {
+                23 => {
+                    let num_a = val_a.parse::<i32>().unwrap_or(0);
+                    let num_b = val_b.parse::<i32>().unwrap_or(0);
+                    num_a.cmp(&num_b)
+                }
+                25 => val_a.cmp(val_b),
+                1082 => {
+                    let date_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d").unwrap();
+                    let date_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d").unwrap();
+                    date_a.cmp(&date_b)
+                }
+                16 => {
+                    let bool_a = val_a == "t";
+                    let bool_b = val_b == "t";
+                    bool_a.cmp(&bool_b)
+                }
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        Ok(Self {
+            input,
+            sorted_rows: rows,
+            cursor: 0,
+        })
+    }
+}
+
+impl<'a> Executor for SortExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        self.input.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        if self.cursor >= self.sorted_rows.len() {
+            return Ok(None);
+        }
+        let row = self.sorted_rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(row))
+    }
+}

@@ -1,5 +1,6 @@
+use super::eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 use super::helpers::row_vec_to_map;
-use super::{Executor, Row, evaluate_expr_for_row, evaluate_expr_for_row_to_val};
+use super::{Executor, Row};
 use crate::errors::ExecutionError;
 use crate::parser::{Expression, LiteralValue};
 use crate::types::Column;

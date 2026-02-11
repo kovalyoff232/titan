@@ -1,4 +1,6 @@
-use super::{Executor, Row, evaluate_expr_for_row, parse_tuple};
+use super::eval::evaluate_expr_for_row;
+use super::helpers::parse_tuple;
+use super::{Executor, Row};
 use crate::errors::ExecutionError;
 use crate::parser::{Expression, LiteralValue};
 use crate::types::Column;

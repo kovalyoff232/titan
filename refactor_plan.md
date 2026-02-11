@@ -21,8 +21,8 @@
 
 ## Phase 2: Executor Decomposition (Priority)
 - [x] Move utility helper functions/types into `executor/*`.
-- [ ] Split executors by domain: `scan`, `join`, `dml`, `ddl`, `eval`.
-- [ ] Keep a stable public facade at `executor::execute`.
+- [x] Split executors by domain: `scan`, `join`, `dml`, `ddl`, `eval`.
+- [x] Keep a stable public facade at `executor::execute`.
 - [ ] Reduce long parameter lists via local contexts (no logic changes).
 
 ## Phase 3: Optimizer Decomposition
@@ -39,9 +39,9 @@
 - [x] Plan documented.
 - [x] Phase 1 started with baseline artifacts.
 - [x] Phase 2 started with the first safe extraction from `executor.rs`.
-- [x] `executor` domain split started: `scan` and `join` moved to dedicated submodules.
+- [x] `executor` decomposition completed across `scan/join/pipeline/ddl/dml/eval/maintenance`.
 
 ## Next Execution Order
-1. Continue `executor` split: move `dml` flow (`insert`, `update`, `delete`) to submodules.
-2. Keep `executor::execute` as the single stable facade.
+1. Reduce long parameter lists in hot paths with lightweight context structs.
+2. Split `optimizer` helper layers (stats/selectivity/cost/util) into submodules.
 3. Add smoke scenarios and PR checklist to complete Phase 1 guardrails.
