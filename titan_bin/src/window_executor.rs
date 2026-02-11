@@ -373,12 +373,8 @@ impl<'a> SetOperationExecutor<'a> {
             *left_count += 1;
 
             if let Some(&right_count) = right_counts.get(&key) {
-                if self.all || *left_count == 1 {
-                    if self.all && *left_count <= right_count {
-                        result.push(row);
-                    } else if !self.all && *left_count == 1 {
-                        result.push(row);
-                    }
+                if (self.all && *left_count <= right_count) || (!self.all && *left_count == 1) {
+                    result.push(row);
                 }
             }
         }
@@ -409,10 +405,8 @@ impl<'a> SetOperationExecutor<'a> {
                 if *left_count > right_count {
                     result.push(row);
                 }
-            } else {
-                if right_count == 0 && *left_count == 1 {
-                    result.push(row);
-                }
+            } else if right_count == 0 && *left_count == 1 {
+                result.push(row);
             }
         }
 

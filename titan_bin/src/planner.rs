@@ -257,7 +257,7 @@ fn extract_window_functions(
                     }
                     .to_string();
 
-                    let frame = over.frame.as_ref().map(|f| convert_window_frame(f));
+                    let frame = over.frame.as_ref().map(convert_window_frame);
 
                     window_functions.push(WindowFunctionPlan {
                         function: function_name,
