@@ -33,7 +33,9 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &[Column]) -> HashMap<String, Lite
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
-                let val = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
+                let val = i32::from_be_bytes(bytes);
                 parsed_tuple.insert(col.name.clone(), LiteralValue::Number(val.to_string()));
                 offset += 4;
             }
@@ -41,8 +43,9 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &[Column]) -> HashMap<String, Lite
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
-                let len =
-                    u32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap()) as usize;
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
+                let len = u32::from_be_bytes(bytes) as usize;
                 offset += 4;
                 if offset + len > tuple_data.len() {
                     break;
@@ -55,9 +58,13 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &[Column]) -> HashMap<String, Lite
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
-                let days = i32::from_be_bytes(tuple_data[offset..offset + 4].try_into().unwrap());
-                let date = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()
-                    + chrono::Duration::days(days as i64);
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
+                let days = i32::from_be_bytes(bytes);
+                let Some(epoch) = NaiveDate::from_ymd_opt(2000, 1, 1) else {
+                    break;
+                };
+                let date = epoch + chrono::Duration::days(days as i64);
                 parsed_tuple.insert(
                     col.name.clone(),
                     LiteralValue::Date(date.format("%Y-%m-%d").to_string()),
@@ -77,7 +84,9 @@ pub(crate) fn row_vec_to_map(
 ) -> HashMap<String, LiteralValue> {
     let mut map = HashMap::new();
     for (i, col) in columns.iter().enumerate() {
-        let val_str = &row_vec[i];
+        let Some(val_str) = row_vec.get(i) else {
+            break;
+        };
         let literal = match col.type_id {
             16 => LiteralValue::Bool(val_str == "t"),
             23 => LiteralValue::Number(val_str.clone()),
@@ -118,7 +127,9 @@ pub(crate) fn load_convention_int_indexes(
     schema: &[Column],
 ) -> Result<Vec<IntIndexInfo>, ExecutionError> {
     let mut indexes = Vec::new();
-    let mut catalog = system_catalog.lock().unwrap();
+    let mut catalog = system_catalog
+        .lock()
+        .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))?;
 
     for column in schema {
         if column.type_id != 23 {
@@ -162,4 +173,39 @@ pub(crate) fn update_index_root_if_needed(
         index.root_page_id = new_root_page_id;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_tuple, row_vec_to_map};
+    use crate::types::Column;
+
+    #[test]
+    fn parse_tuple_handles_truncated_int_without_panicking() {
+        let schema = vec![Column {
+            name: "id".to_string(),
+            type_id: 23,
+        }];
+        let parsed = parse_tuple(&[0x00, 0x01], &schema);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn row_vec_to_map_ignores_missing_cells_without_panicking() {
+        let columns = vec![
+            Column {
+                name: "id".to_string(),
+                type_id: 23,
+            },
+            Column {
+                name: "name".to_string(),
+                type_id: 25,
+            },
+        ];
+        let row = vec!["1".to_string()];
+        let map = row_vec_to_map(&row, &columns, None);
+
+        assert_eq!(map.get("id").map(|v| v.to_string()), Some("1".to_string()));
+        assert!(!map.contains_key("name"));
+    }
 }
