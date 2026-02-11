@@ -14,6 +14,7 @@ pub struct TestClient {
 impl Drop for TestClient {
     fn drop(&mut self) {
         let _ = self._server_process.kill();
+        let _ = self._server_process.wait();
     }
 }
 
@@ -86,6 +87,7 @@ pub fn setup_server_and_client(test_name: &str) -> TestClient {
         }
 
         let _ = server_process.kill();
+        let _ = server_process.wait();
     }
 
     panic!("Failed to connect to test server after multiple port attempts");
