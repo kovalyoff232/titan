@@ -2,7 +2,7 @@ use crate::TupleId;
 use crate::page::TransactionId;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockMode {
@@ -81,6 +81,18 @@ pub enum LockError {
     Deadlock,
 }
 
+fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_condvar_recover<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    condvar
+        .wait(guard)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl LockManager {
     pub fn new() -> Self {
         Self::default()
@@ -94,7 +106,7 @@ impl LockManager {
     ) -> Result<(), LockError> {
         let wait_queue = self.table.entry(resource).or_default().clone();
 
-        let mut guard = wait_queue.queue.lock().unwrap();
+        let mut guard = lock_mutex_recover(&wait_queue.queue);
 
         if (mode == LockMode::Shared
             && (guard.sharing.contains(&tx_id) || guard.exclusive == Some(tx_id)))
@@ -108,7 +120,7 @@ impl LockManager {
 
         loop {
             if self.try_acquire(&mut guard, tx_id, mode) {
-                self.waits_for.lock().unwrap().remove(&tx_id);
+                lock_mutex_recover(&self.waits_for).remove(&tx_id);
                 return Ok(());
             }
 
@@ -117,7 +129,7 @@ impl LockManager {
                 return Err(e);
             }
 
-            guard = wait_queue.cvar.wait(guard).unwrap();
+            guard = wait_condvar_recover(&wait_queue.cvar, guard);
         }
     }
 
@@ -126,7 +138,7 @@ impl LockManager {
         queue: &LockQueue,
         waiting_tx_id: TransactionId,
     ) -> Result<(), LockError> {
-        let mut waits_for_map = self.waits_for.lock().unwrap();
+        let mut waits_for_map = lock_mutex_recover(&self.waits_for);
         waits_for_map.remove(&waiting_tx_id);
 
         if let Some(my_request) = queue.queue.iter().find(|req| req.tx_id == waiting_tx_id) {
@@ -225,11 +237,11 @@ impl LockManager {
     }
 
     pub fn unlock_all(&self, tx_id: TransactionId) {
-        self.waits_for.lock().unwrap().remove(&tx_id);
+        lock_mutex_recover(&self.waits_for).remove(&tx_id);
 
         for entry in self.table.iter() {
             let wait_queue = entry.value();
-            let mut queue = wait_queue.queue.lock().unwrap();
+            let mut queue = lock_mutex_recover(&wait_queue.queue);
             let mut changed = false;
             if queue.exclusive == Some(tx_id) {
                 queue.exclusive = None;
