@@ -135,22 +135,40 @@ impl<'a> HashAggregateExecutor<'a> {
                         }
                         "SUM" => {
                             if let LiteralValue::Number(n) = &val {
-                                agg_state.sum += n.parse::<f64>().unwrap_or(0.0);
+                                agg_state.sum += n.parse::<f64>().map_err(|_| {
+                                    ExecutionError::GenericError(format!(
+                                        "Invalid numeric literal for SUM: {}",
+                                        n
+                                    ))
+                                })?;
                             }
                         }
                         "AVG" => {
                             if let LiteralValue::Number(n) = &val {
-                                agg_state.sum += n.parse::<f64>().unwrap_or(0.0);
+                                agg_state.sum += n.parse::<f64>().map_err(|_| {
+                                    ExecutionError::GenericError(format!(
+                                        "Invalid numeric literal for AVG: {}",
+                                        n
+                                    ))
+                                })?;
                                 agg_state.count += 1;
                             }
                         }
                         "MIN" => {
-                            if agg_state.min.is_none() || val < *agg_state.min.as_ref().unwrap() {
+                            let should_update = match agg_state.min.as_ref() {
+                                None => true,
+                                Some(current) => val < *current,
+                            };
+                            if should_update {
                                 agg_state.min = Some(val);
                             }
                         }
                         "MAX" => {
-                            if agg_state.max.is_none() || val > *agg_state.max.as_ref().unwrap() {
+                            let should_update = match agg_state.max.as_ref() {
+                                None => true,
+                                Some(current) => val > *current,
+                            };
+                            if should_update {
                                 agg_state.max = Some(val);
                             }
                         }
@@ -333,5 +351,61 @@ impl<'a> Executor for StreamAggregateExecutor<'a> {
         Err(ExecutionError::GenericError(
             "StreamAggregateExecutor not fully implemented yet".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockExecutor {
+        schema: Vec<Column>,
+        rows: std::vec::IntoIter<Row>,
+    }
+
+    impl MockExecutor {
+        fn new(schema: Vec<Column>, rows: Vec<Row>) -> Self {
+            Self {
+                schema,
+                rows: rows.into_iter(),
+            }
+        }
+    }
+
+    impl Executor for MockExecutor {
+        fn schema(&self) -> &Vec<Column> {
+            &self.schema
+        }
+
+        fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+            Ok(self.rows.next())
+        }
+    }
+
+    #[test]
+    fn sum_with_invalid_number_returns_error() {
+        let input = MockExecutor::new(
+            vec![Column {
+                name: "value".to_string(),
+                type_id: 23,
+            }],
+            vec![vec!["not-a-number".to_string()]],
+        );
+        let mut exec = HashAggregateExecutor::new(
+            Box::new(input),
+            vec![],
+            vec![AggregateExpr {
+                function: "SUM".to_string(),
+                args: vec![Expression::Column("value".to_string())],
+                alias: None,
+            }],
+            None,
+        );
+
+        let result = exec.next();
+        assert!(matches!(
+            result,
+            Err(ExecutionError::GenericError(msg)) if msg.contains("Invalid numeric literal for SUM")
+        ));
     }
 }
