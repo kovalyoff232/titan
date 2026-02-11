@@ -418,12 +418,11 @@ pub mod window_exec {
         }
 
         fn compute_last_value(&self, partition: &WindowPartition) -> Vec<LiteralValue> {
-            if partition.rows.is_empty() {
-                vec![]
-            } else {
-                let last = partition.rows.last().unwrap()[0].clone();
-                vec![last; partition.rows.len()]
-            }
+            let Some(last_row) = partition.rows.last() else {
+                return vec![];
+            };
+            let last = last_row.first().cloned().unwrap_or(LiteralValue::Null);
+            vec![last; partition.rows.len()]
         }
 
         fn compute_nth_value(&self, partition: &WindowPartition, n: i64) -> Vec<LiteralValue> {
@@ -488,5 +487,11 @@ impl CteContext {
 
     pub fn get_cte(&self, name: &str) -> Option<&CteTable> {
         self.tables.get(name)
+    }
+}
+
+impl Default for CteContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
