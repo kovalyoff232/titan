@@ -318,7 +318,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .then_ignore(just('\''))
         .collect::<String>();
 
-    let string = string_literal.clone().map(LiteralValue::String);
+    let string = string_literal.map(LiteralValue::String);
 
     let boolean = text::keyword("TRUE")
         .to(true)
@@ -338,12 +338,11 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .padded();
 
     let qualified_column = ident
-        .clone()
         .then_ignore(just('.'))
-        .then(ident.clone())
+        .then(ident)
         .map(|(table, column)| Expression::QualifiedColumn(table, column));
 
-    let column = ident.clone().map(Expression::Column);
+    let column = ident.map(Expression::Column);
 
     let expr = recursive(|expr| {
         let atom = literal.or(qualified_column).or(column).or(expr
@@ -409,7 +408,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 right: Box::new(right),
             });
 
-        let disjunction = conjunction
+        conjunction
             .clone()
             .then(
                 text::keyword("OR")
@@ -422,13 +421,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            });
-
-        disjunction
+            })
     });
 
     let qualified_wildcard = ident
-        .clone()
         .then_ignore(just('.'))
         .then_ignore(just('*'))
         .map(SelectItem::QualifiedWildcard);
@@ -436,22 +432,16 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
     let select_item = wildcard.or(qualified_wildcard).or(expr
         .clone()
-        .then(
-            text::keyword("AS")
-                .padded()
-                .ignore_then(ident.clone())
-                .or_not(),
-        )
+        .then(text::keyword("AS").padded().ignore_then(ident).or_not())
         .map(|(expr, alias)| match alias {
             Some(alias) => SelectItem::ExprWithAlias { expr, alias },
             None => SelectItem::UnnamedExpr(expr),
         }));
 
     let table_reference = recursive(|table_ref| {
-        let table = ident.clone().map(|name| TableReference::Table { name });
+        let table = ident.map(|name| TableReference::Table { name });
 
-        let join = table
-            .clone()
+        table
             .then(
                 text::keyword("JOIN")
                     .padded()
@@ -464,9 +454,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 left: Box::new(left),
                 right: Box::new(right),
                 on_condition,
-            });
-
-        join
+            })
     });
 
     let select = text::keyword("SELECT")
@@ -530,14 +518,13 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .padded();
 
     let column_def = ident
-        .clone()
         .then(data_type)
         .map(|(name, data_type)| ColumnDef { name, data_type });
 
     let create_table = text::keyword("CREATE")
         .padded()
         .ignore_then(text::keyword("TABLE").padded())
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             column_def
                 .separated_by(just(',').padded())
@@ -555,10 +542,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let create_index = text::keyword("CREATE")
         .padded()
         .ignore_then(text::keyword("INDEX").padded())
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then_ignore(text::keyword("ON").padded())
-        .then(ident.clone())
-        .then(ident.clone().delimited_by(just('('), just(')')))
+        .then(ident)
+        .then(ident.delimited_by(just('('), just(')')))
         .map(|((index_name, table_name), column_name)| {
             Statement::CreateIndex(CreateIndexStatement {
                 index_name,
@@ -570,7 +557,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let insert = text::keyword("INSERT")
         .padded()
         .ignore_then(text::keyword("INTO").padded())
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then_ignore(text::keyword("VALUES").padded())
         .then(
             expr.clone()
@@ -583,11 +570,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
     let update = text::keyword("UPDATE")
         .padded()
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then_ignore(text::keyword("SET").padded())
         .then(
             ident
-                .clone()
                 .then_ignore(just('=').padded())
                 .then(expr.clone())
                 .separated_by(just(',').padded())
@@ -611,7 +597,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let delete = text::keyword("DELETE")
         .padded()
         .ignore_then(text::keyword("FROM").padded())
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then(
             text::keyword("WHERE")
                 .padded()
@@ -645,12 +631,12 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
     let vacuum = text::keyword("VACUUM")
         .padded()
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .map(Statement::Vacuum);
 
     let analyze = text::keyword("ANALYZE")
         .padded()
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .map(Statement::Analyze);
 
     let statement = recursive(|statement| {
