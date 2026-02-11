@@ -1,5 +1,3 @@
-//! Tests for aggregate functions
-
 #[cfg(test)]
 mod tests {
     use titan_bin::aggregate_executor::HashAggregateExecutor;
@@ -8,7 +6,6 @@ mod tests {
     use titan_bin::planner::AggregateExpr;
     use titan_bin::types::Column;
 
-    // Mock executor for testing
     struct MockExecutor {
         rows: Vec<Vec<String>>,
         schema: Vec<Column>,
@@ -17,7 +14,11 @@ mod tests {
 
     impl MockExecutor {
         fn new(rows: Vec<Vec<String>>, schema: Vec<Column>) -> Self {
-            Self { rows, schema, cursor: 0 }
+            Self {
+                rows,
+                schema,
+                cursor: 0,
+            }
         }
     }
 
@@ -40,9 +41,18 @@ mod tests {
     #[test]
     fn test_count_aggregate() {
         let schema = vec![
-            Column { name: "id".to_string(), type_id: 23 },
-            Column { name: "name".to_string(), type_id: 25 },
-            Column { name: "age".to_string(), type_id: 23 },
+            Column {
+                name: "id".to_string(),
+                type_id: 23,
+            },
+            Column {
+                name: "name".to_string(),
+                type_id: 25,
+            },
+            Column {
+                name: "age".to_string(),
+                type_id: 23,
+            },
         ];
 
         let rows = vec![
@@ -52,35 +62,36 @@ mod tests {
         ];
 
         let mock_executor = Box::new(MockExecutor::new(rows, schema));
-        
-        // COUNT(*) without GROUP BY
-        let aggregates = vec![
-            AggregateExpr {
-                function: "COUNT".to_string(),
-                args: vec![],
-                alias: Some("count".to_string()),
-            }
-        ];
 
-        let mut agg_executor = HashAggregateExecutor::new(
-            mock_executor,
-            vec![],
-            aggregates,
-            None
-        );
+        let aggregates = vec![AggregateExpr {
+            function: "COUNT".to_string(),
+            args: vec![],
+            alias: Some("count".to_string()),
+        }];
+
+        let mut agg_executor = HashAggregateExecutor::new(mock_executor, vec![], aggregates, None);
 
         let result = agg_executor.next().unwrap();
         assert!(result.is_some());
         let row = result.unwrap();
-        assert_eq!(row[0], "3"); // COUNT(*) should be 3
+        assert_eq!(row[0], "3");
     }
 
     #[test]
     fn test_group_by_with_count() {
         let schema = vec![
-            Column { name: "id".to_string(), type_id: 23 },
-            Column { name: "name".to_string(), type_id: 25 },
-            Column { name: "age".to_string(), type_id: 23 },
+            Column {
+                name: "id".to_string(),
+                type_id: 23,
+            },
+            Column {
+                name: "name".to_string(),
+                type_id: 25,
+            },
+            Column {
+                name: "age".to_string(),
+                type_id: 23,
+            },
         ];
 
         let rows = vec![
@@ -91,37 +102,29 @@ mod tests {
         ];
 
         let mock_executor = Box::new(MockExecutor::new(rows, schema));
-        
-        // GROUP BY age, COUNT(*)
-        let group_by = vec![Expression::Column("age".to_string())];
-        let aggregates = vec![
-            AggregateExpr {
-                function: "COUNT".to_string(),
-                args: vec![],
-                alias: Some("count".to_string()),
-            }
-        ];
 
-        let mut agg_executor = HashAggregateExecutor::new(
-            mock_executor,
-            group_by,
-            aggregates,
-            None
-        );
+        let group_by = vec![Expression::Column("age".to_string())];
+        let aggregates = vec![AggregateExpr {
+            function: "COUNT".to_string(),
+            args: vec![],
+            alias: Some("count".to_string()),
+        }];
+
+        let mut agg_executor =
+            HashAggregateExecutor::new(mock_executor, group_by, aggregates, None);
 
         let mut results = Vec::new();
         while let Some(row) = agg_executor.next().unwrap() {
             results.push(row);
         }
 
-        assert_eq!(results.len(), 2); // Two distinct age groups (25 and 30)
-        
-        // Check that we have the correct counts
+        assert_eq!(results.len(), 2);
+
         for row in &results {
             if row[0] == "30" {
-                assert_eq!(row[1], "2"); // Two people aged 30
+                assert_eq!(row[1], "2");
             } else if row[0] == "25" {
-                assert_eq!(row[1], "2"); // Two people aged 25
+                assert_eq!(row[1], "2");
             }
         }
     }
@@ -129,8 +132,14 @@ mod tests {
     #[test]
     fn test_sum_and_avg() {
         let schema = vec![
-            Column { name: "product".to_string(), type_id: 25 },
-            Column { name: "sales".to_string(), type_id: 23 },
+            Column {
+                name: "product".to_string(),
+                type_id: 25,
+            },
+            Column {
+                name: "sales".to_string(),
+                type_id: 23,
+            },
         ];
 
         let rows = vec![
@@ -141,8 +150,7 @@ mod tests {
         ];
 
         let mock_executor = Box::new(MockExecutor::new(rows, schema));
-        
-        // GROUP BY product, SUM(sales), AVG(sales)
+
         let group_by = vec![Expression::Column("product".to_string())];
         let aggregates = vec![
             AggregateExpr {
@@ -157,32 +165,27 @@ mod tests {
             },
         ];
 
-        let mut agg_executor = HashAggregateExecutor::new(
-            mock_executor,
-            group_by,
-            aggregates,
-            None
-        );
+        let mut agg_executor =
+            HashAggregateExecutor::new(mock_executor, group_by, aggregates, None);
 
         let mut results = Vec::new();
         while let Some(row) = agg_executor.next().unwrap() {
             results.push(row);
         }
 
-        assert_eq!(results.len(), 2); // Two products
-        
-        // Debug output to see what we actually get
+        assert_eq!(results.len(), 2);
+
         for row in &results {
             println!("Row: {:?}", row);
         }
-        
+
         for row in &results {
             if row[0] == "A" {
-                assert_eq!(row[1], "300", "SUM for A failed: got {}", row[1]); // SUM for A
-                assert_eq!(row[2], "150", "AVG for A failed: got {}", row[2]); // AVG for A
+                assert_eq!(row[1], "300", "SUM for A failed: got {}", row[1]);
+                assert_eq!(row[2], "150", "AVG for A failed: got {}", row[2]);
             } else if row[0] == "B" {
-                assert_eq!(row[1], "400", "SUM for B failed: got {}", row[1]); // SUM for B
-                assert_eq!(row[2], "200", "AVG for B failed: got {}", row[2]); // AVG for B
+                assert_eq!(row[1], "400", "SUM for B failed: got {}", row[1]);
+                assert_eq!(row[2], "200", "AVG for B failed: got {}", row[2]);
             }
         }
     }

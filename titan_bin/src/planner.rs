@@ -1,12 +1,10 @@
-//! The query planner.
-//!
-//! This module is responsible for converting the AST from the parser into a logical plan.
-
-use crate::errors::ExecutionError;
-use crate::parser::{Expression, SelectItem, SelectStatement, TableReference, CommonTableExpression};
-use bedrock::buffer_pool::BufferPoolManager;
-use bedrock::transaction::{Snapshot};
 use crate::catalog::SystemCatalog;
+use crate::errors::ExecutionError;
+use crate::parser::{
+    CommonTableExpression, Expression, SelectItem, SelectStatement, TableReference,
+};
+use bedrock::buffer_pool::BufferPoolManager;
+use bedrock::transaction::Snapshot;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -24,7 +22,6 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         condition: Expression,
-        // For now, we only support INNER joins.
     },
     Sort {
         input: Box<LogicalPlan>,
@@ -106,9 +103,7 @@ pub fn create_logical_plan(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
-    // Build initial plan from FROM clause
     let from_plan = if stmt.from.is_empty() {
-        // Handle queries without FROM clause (e.g., SELECT 1)
         LogicalPlan::Scan {
             table_name: "dummy".to_string(),
             alias: None,
@@ -116,20 +111,20 @@ pub fn create_logical_plan(
         }
     } else {
         match &stmt.from[0] {
-            TableReference::Table { name } => {
-                LogicalPlan::Scan {
-                    table_name: name.clone(),
-                    alias: None,
-                    filter: stmt.where_clause.clone(),
-                }
-            }
+            TableReference::Table { name } => LogicalPlan::Scan {
+                table_name: name.clone(),
+                alias: None,
+                filter: stmt.where_clause.clone(),
+            },
             TableReference::Join {
                 left,
                 right,
                 on_condition,
             } => {
-                let left_plan = build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
-                let right_plan = build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
+                let left_plan =
+                    build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
+                let right_plan =
+                    build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
                 LogicalPlan::Join {
                     left: Box::new(left_plan),
                     right: Box::new(right_plan),
@@ -141,15 +136,10 @@ pub fn create_logical_plan(
 
     let mut plan = from_plan;
 
-    // Handle WHERE clause (if not already applied in scan)
     if let Some(_where_clause) = &stmt.where_clause {
-        if !matches!(plan, LogicalPlan::Scan { .. }) {
-            // WHERE clause wasn't applied in scan, add as separate filter
-            // This would be optimized later to push down filters
-        }
+        if !matches!(plan, LogicalPlan::Scan { .. }) {}
     }
 
-    // Handle GROUP BY and aggregations
     if let Some(group_by) = &stmt.group_by {
         let aggregates = extract_aggregates(&stmt.select_list)?;
         plan = LogicalPlan::Aggregate {
@@ -160,7 +150,6 @@ pub fn create_logical_plan(
         };
     }
 
-    // Handle window functions
     let window_functions = extract_window_functions(&stmt.select_list)?;
     if !window_functions.is_empty() {
         plan = LogicalPlan::Window {
@@ -169,7 +158,6 @@ pub fn create_logical_plan(
         };
     }
 
-    // Handle ORDER BY
     if let Some(order_by) = &stmt.order_by {
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
@@ -177,13 +165,11 @@ pub fn create_logical_plan(
         };
     }
 
-    // Handle projection
     plan = LogicalPlan::Projection {
         input: Box::new(plan),
         expressions: stmt.select_list.clone(),
     };
 
-    // Handle CTEs
     if let Some(cte_list) = &stmt.with_clause {
         plan = LogicalPlan::WithCte {
             cte_list: cte_list.clone(),
@@ -202,23 +188,20 @@ fn build_plan_from_table_ref(
     _system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
-        TableReference::Table { name } => {
-            Ok(LogicalPlan::Scan {
-                table_name: name.clone(),
-                alias: None,
-                filter: None,
-            })
-        }
+        TableReference::Table { name } => Ok(LogicalPlan::Scan {
+            table_name: name.clone(),
+            alias: None,
+            filter: None,
+        }),
         _ => Err(ExecutionError::PlanningError(
             "Nested joins not supported yet".to_string(),
         )),
     }
 }
 
-/// Extract aggregate functions from select list
 fn extract_aggregates(select_list: &[SelectItem]) -> Result<Vec<AggregateExpr>, ExecutionError> {
     let mut aggregates = Vec::new();
-    
+
     for item in select_list {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
@@ -239,20 +222,26 @@ fn extract_aggregates(select_list: &[SelectItem]) -> Result<Vec<AggregateExpr>, 
             _ => {}
         }
     }
-    
+
     Ok(aggregates)
 }
 
-/// Extract window functions from select list
-fn extract_window_functions(select_list: &[SelectItem]) -> Result<Vec<WindowFunctionPlan>, ExecutionError> {
+fn extract_window_functions(
+    select_list: &[SelectItem],
+) -> Result<Vec<WindowFunctionPlan>, ExecutionError> {
     use crate::parser::WindowFunctionType;
-    
+
     let mut window_functions = Vec::new();
-    
+
     for item in select_list {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if let Expression::WindowFunction { function, args, over } = expr {
+                if let Expression::WindowFunction {
+                    function,
+                    args,
+                    over,
+                } = expr
+                {
                     let function_name = match function {
                         WindowFunctionType::RowNumber => "ROW_NUMBER",
                         WindowFunctionType::Rank => "RANK",
@@ -265,10 +254,11 @@ fn extract_window_functions(select_list: &[SelectItem]) -> Result<Vec<WindowFunc
                         WindowFunctionType::FirstValue => "FIRST_VALUE",
                         WindowFunctionType::LastValue => "LAST_VALUE",
                         WindowFunctionType::NthValue(_) => "NTH_VALUE",
-                    }.to_string();
-                    
+                    }
+                    .to_string();
+
                     let frame = over.frame.as_ref().map(|f| convert_window_frame(f));
-                    
+
                     window_functions.push(WindowFunctionPlan {
                         function: function_name,
                         args: args.clone(),
@@ -286,21 +276,28 @@ fn extract_window_functions(select_list: &[SelectItem]) -> Result<Vec<WindowFunc
             _ => {}
         }
     }
-    
+
     Ok(window_functions)
 }
 
-/// Check if a function name is an aggregate function
 fn is_aggregate_function(name: &str) -> bool {
-    matches!(name.to_uppercase().as_str(), 
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | 
-        "STDDEV" | "VARIANCE" | "ARRAY_AGG" | "STRING_AGG")
+    matches!(
+        name.to_uppercase().as_str(),
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "STDDEV"
+            | "VARIANCE"
+            | "ARRAY_AGG"
+            | "STRING_AGG"
+    )
 }
 
-/// Convert parser WindowFrame to planner WindowFramePlan
 fn convert_window_frame(frame: &crate::parser::WindowFrame) -> WindowFramePlan {
     use crate::parser::WindowFrame;
-    
+
     match frame {
         WindowFrame::Rows(start, end) => {
             WindowFramePlan::Rows(convert_frame_bound(start), convert_frame_bound(end))
@@ -309,16 +306,14 @@ fn convert_window_frame(frame: &crate::parser::WindowFrame) -> WindowFramePlan {
             WindowFramePlan::Range(convert_frame_bound(start), convert_frame_bound(end))
         }
         WindowFrame::Groups(start, end) => {
-            // For now, treat GROUPS like ROWS
             WindowFramePlan::Rows(convert_frame_bound(start), convert_frame_bound(end))
         }
     }
 }
 
-/// Convert parser FrameBound to planner FrameBoundPlan
 fn convert_frame_bound(bound: &crate::parser::FrameBound) -> FrameBoundPlan {
     use crate::parser::FrameBound;
-    
+
     match bound {
         FrameBound::UnboundedPreceding => FrameBoundPlan::UnboundedPreceding,
         FrameBound::CurrentRow => FrameBoundPlan::CurrentRow,

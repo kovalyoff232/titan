@@ -1,6 +1,4 @@
-//! The Write-Ahead Log manager.
-
-use crate::{pager::Pager, PageId};
+use crate::{PageId, pager::Pager};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,31 +10,30 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// A Log Sequence Number.
 pub type Lsn = u64;
 
-/// Header for every WAL record.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct WalRecordHeader {
-    /// The total length of the record, including the header.
     pub total_len: u32,
-    /// The ID of the transaction that this record belongs to.
+
     pub tx_id: u32,
-    /// The LSN of the previous record for this transaction.
+
     pub prev_lsn: Lsn,
-    /// The CRC checksum of the record.
+
     pub crc: u32,
 }
 
-/// A single record in the WAL.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WalRecord {
-    /// Indicates the commit of a transaction.
-    Commit { tx_id: u32 },
-    /// Indicates the abort of a transaction.
-    Abort { tx_id: u32 },
-    /// A new tuple was inserted.
+    Commit {
+        tx_id: u32,
+    },
+
+    Abort {
+        tx_id: u32,
+    },
+
     InsertTuple {
         tx_id: u32,
         page_id: PageId,
@@ -44,7 +41,7 @@ pub enum WalRecord {
         before_page: Vec<u8>,
         after_page: Vec<u8>,
     },
-    /// A tuple was marked as deleted.
+
     DeleteTuple {
         tx_id: u32,
         page_id: PageId,
@@ -52,7 +49,7 @@ pub enum WalRecord {
         before_page: Vec<u8>,
         after_page: Vec<u8>,
     },
-    /// A tuple was updated.
+
     UpdateTuple {
         tx_id: u32,
         page_id: PageId,
@@ -60,24 +57,24 @@ pub enum WalRecord {
         before_page: Vec<u8>,
         after_page: Vec<u8>,
     },
-    /// A B-Tree page was updated.
+
     BTreePage {
         tx_id: u32,
         page_id: PageId,
         data: Vec<u8>,
     },
-    /// A checkpoint record.
+
     Checkpoint {
         active_tx_table: HashMap<u32, Lsn>,
         dirty_page_table: HashMap<PageId, Lsn>,
     },
-    /// Sets the next_page_id pointer of a page.
+
     SetNextPageId {
         tx_id: u32,
         page_id: PageId,
         next_page_id: PageId,
     },
-    /// A Compensation Log Record (CLR) for undoing a change.
+
     CompensationLogRecord {
         tx_id: u32,
         page_id: PageId,
@@ -88,7 +85,6 @@ pub enum WalRecord {
 }
 
 impl WalRecord {
-    /// Returns the transaction ID of the record.
     pub fn tx_id(&self) -> u32 {
         match self {
             WalRecord::Commit { tx_id } => *tx_id,
@@ -99,12 +95,11 @@ impl WalRecord {
             WalRecord::BTreePage { tx_id, .. } => *tx_id,
             WalRecord::SetNextPageId { tx_id, .. } => *tx_id,
             WalRecord::CompensationLogRecord { tx_id, .. } => *tx_id,
-            WalRecord::Checkpoint { .. } => 0, // Checkpoints don't belong to a tx
+            WalRecord::Checkpoint { .. } => 0,
         }
     }
 }
 
-/// The WAL manager.
 pub struct WalManager {
     file: Arc<Mutex<File>>,
     path: PathBuf,
@@ -115,7 +110,6 @@ pub struct WalManager {
 }
 
 impl WalManager {
-    /// Opens the WAL file and initializes the manager.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -151,7 +145,6 @@ impl WalManager {
         })
     }
 
-    /// Logs a record to the WAL and returns the LSN of the record.
     pub fn log(&mut self, tx_id: u32, prev_lsn: Lsn, record: &WalRecord) -> io::Result<Lsn> {
         let record_bytes = bincode::serialize(record).unwrap();
 
@@ -181,12 +174,10 @@ impl WalManager {
         Ok(lsn)
     }
 
-    /// Deserializes a WAL record from a byte buffer.
     pub fn deserialize_record(buf: &[u8]) -> Option<WalRecord> {
         bincode::deserialize(buf).ok()
     }
 
-    /// Reads a WAL record from the given LSN.
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
         let mut file = self.file.lock().unwrap();
         if lsn >= file.metadata()?.len() {
@@ -262,8 +253,6 @@ impl WalManager {
         Ok(())
     }
 
-    /// Recovers the database from the WAL using the ARIES algorithm.
-    /// Returns the highest transaction ID found in the WAL.
     pub fn recover<P: AsRef<Path>>(wal_path: P, pager: &mut Pager) -> io::Result<u32> {
         let mut wal_file = OpenOptions::new()
             .read(true)
@@ -304,7 +293,6 @@ impl WalManager {
 
             let total_len = header.total_len as usize;
             if pos + total_len > buf.len() {
-                // Torn tail record (crash during append): ignore incomplete tail.
                 break;
             }
 
@@ -341,7 +329,6 @@ impl WalManager {
         let mut active_tx_table: HashMap<u32, Lsn> = HashMap::new();
         let mut dirty_page_table: HashMap<PageId, Lsn> = HashMap::new();
 
-        // Start from the latest checkpoint payload if one exists.
         let mut start_idx = 0usize;
         for (idx, entry) in entries.iter().enumerate().rev() {
             if let WalRecord::Checkpoint {
@@ -363,7 +350,6 @@ impl WalManager {
 
             let tx_id = entry.record.tx_id();
             if tx_id != 0 {
-                // Track last LSN per active transaction (needed for UNDO chains).
                 active_tx_table.insert(tx_id, entry.lsn);
             }
 
@@ -382,7 +368,6 @@ impl WalManager {
             }
         }
 
-        // REDO pass.
         let redo_start_lsn = dirty_page_table.values().min().copied().unwrap_or(0);
         for entry in entries.iter().filter(|e| e.lsn >= redo_start_lsn) {
             match &entry.record {
@@ -440,7 +425,6 @@ impl WalManager {
             }
         }
 
-        // UNDO pass for loser transactions.
         let mut lsn_to_index: HashMap<Lsn, usize> = HashMap::new();
         for (idx, entry) in entries.iter().enumerate() {
             lsn_to_index.insert(entry.lsn, idx);
@@ -507,7 +491,7 @@ impl Drop for WalManager {
         if let Some(handle) = self.sync_thread_handle.take() {
             handle.join().unwrap();
         }
-        // Final sync on drop
+
         if let Ok(file) = self.file.lock() {
             let _ = file.sync_all();
         }

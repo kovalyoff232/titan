@@ -1,71 +1,56 @@
-//! The layout of a page on disk.
-use crate::{transaction::Snapshot, PageId, PAGE_SIZE};
+use crate::{PAGE_SIZE, PageId, transaction::Snapshot};
 
-/// A unique identifier for a transaction.
 pub type TransactionId = u32;
-/// A unique identifier for a command within a transaction.
+
 pub type CommandId = u32;
 
-/// A constant for an invalid page ID.
 pub const INVALID_PAGE_ID: PageId = 0;
 
-/// The header of a page on disk.
-/// This structure is laid out in memory exactly as it is on disk.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PageHeaderData {
-    /// Log Sequence Number of the latest log record modifying this page.
     pub lsn: u64,
-    /// Checksum of the page content.
+
     pub checksum: u16,
-    /// Flags for the page.
+
     pub flags: u16,
-    /// Offset to the end of the free space.
+
     pub lower_offset: u16,
-    /// Offset to the start of the free space.
+
     pub upper_offset: u16,
-    /// Page ID of the next page in the table's page chain.
+
     pub next_page_id: PageId,
 }
 
-/// An item identifier (or tuple pointer) on a page.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ItemIdData {
-    /// Offset to the start of the tuple.
     pub offset: u16,
-    /// Length of the tuple.
+
     pub length: u16,
 }
 
-/// The header of a heap tuple.
-/// This structure is laid out in memory exactly as it is on disk.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct HeapTupleHeaderData {
-    /// ID of the transaction that created this tuple.
     pub xmin: TransactionId,
-    /// ID of the transaction that deleted this tuple.
+
     pub xmax: TransactionId,
-    /// Command ID of the creator/deleter.
+
     pub cmin_cmax: CommandId,
-    /// Bitmask of flags.
+
     pub infomask: u16,
 }
 
-/// A page is a fixed-size block of data that is read from and written to disk.
-/// The contents of the page are managed by the `Page` struct.
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Page {
-    /// The ID of the page.
     pub id: PageId,
-    /// The raw data of the page.
+
     pub data: [u8; PAGE_SIZE],
 }
 
 impl Page {
-    /// Initializes a new page with a valid header.
     pub fn new(id: PageId) -> Self {
         let mut page = Page {
             id,
@@ -75,7 +60,6 @@ impl Page {
         page
     }
 
-    /// Initializes the page header.
     pub fn initialize(&mut self) {
         let mut header = self.read_header();
         header.lsn = 0;
@@ -87,22 +71,16 @@ impl Page {
         self.write_header(&header);
     }
 
-    /// Reads the page header.
     pub fn read_header(&self) -> PageHeaderData {
         unsafe { std::ptr::read_unaligned(self.data.as_ptr() as *const PageHeaderData) }
     }
 
-    /// Writes the page header.
     pub fn write_header(&mut self, header: &PageHeaderData) {
         unsafe {
             std::ptr::write_unaligned(self.data.as_mut_ptr() as *mut PageHeaderData, *header);
         }
     }
 
-    
-
-    /// Adds a new tuple to the page.
-    /// Returns the item id of the new tuple, or None if there is not enough space.
     pub fn add_tuple(
         &mut self,
         tuple: &[u8],
@@ -140,7 +118,7 @@ impl Page {
         let mut tuple_header = self.read_tuple_header(tuple_offset);
         tuple_header.xmin = xmin;
         tuple_header.xmax = xmax;
-        tuple_header.cmin_cmax = 0; // Make sure all fields are initialized
+        tuple_header.cmin_cmax = 0;
         tuple_header.infomask = 0;
         self.write_tuple_header(tuple_offset, &tuple_header);
 
@@ -161,7 +139,6 @@ impl Page {
         Some(item_id_index)
     }
 
-    /// Returns the tuple data for the given item id.
     pub fn get_tuple(&self, item_id: u16) -> Option<&[u8]> {
         let item_id_data = self.get_item_id_data(item_id)?;
         let tuple_header_len = std::mem::size_of::<HeapTupleHeaderData>() as u16;
@@ -169,13 +146,11 @@ impl Page {
         Some(self.tuple(item_id_data.offset + tuple_header_len, data_len as usize))
     }
 
-    /// Returns the raw tuple data (header + data) for the given item id.
     pub fn get_raw_tuple(&self, item_id: u16) -> Option<&[u8]> {
         let item_id_data = self.get_item_id_data(item_id)?;
         Some(self.tuple(item_id_data.offset, item_id_data.length as usize))
     }
 
-    /// Returns the mutable tuple data for the given item id.
     pub fn get_tuple_mut(&mut self, item_id: u16) -> Option<&mut [u8]> {
         let item_id_data = self.get_item_id_data(item_id)?;
         let tuple_header_len = std::mem::size_of::<HeapTupleHeaderData>() as u16;
@@ -183,19 +158,16 @@ impl Page {
         Some(self.tuple_mut(item_id_data.offset + tuple_header_len, data_len as usize))
     }
 
-    /// Returns the mutable raw tuple data (header + data) for the given item id.
     pub fn get_raw_tuple_mut(&mut self, item_id: u16) -> Option<&mut [u8]> {
         let item_id_data = self.get_item_id_data(item_id)?;
         Some(self.tuple_mut(item_id_data.offset, item_id_data.length as usize))
     }
 
-    /// Returns a mutable reference to the tuple header for the given item id.
     pub fn get_tuple_header_mut(&mut self, item_id: u16) -> Option<HeapTupleHeaderData> {
         let item_id_data = self.get_item_id_data(item_id)?;
         Some(self.read_tuple_header(item_id_data.offset))
     }
 
-    /// Helper to safely get ItemIdData
     pub fn get_item_id_data(&self, item_id: u16) -> Option<ItemIdData> {
         let header_size = std::mem::size_of::<PageHeaderData>() as u16;
         let item_id_size = std::mem::size_of::<ItemIdData>() as u16;
@@ -217,7 +189,6 @@ impl Page {
         Some(item_id_data)
     }
 
-    /// Returns true if the tuple is visible to the given snapshot.
     pub fn is_visible(
         &self,
         snapshot: &Snapshot,
@@ -243,7 +214,6 @@ impl Page {
         false
     }
 
-    /// Returns the number of tuples on the page.
     pub fn get_tuple_count(&self) -> u16 {
         let header_size = std::mem::size_of::<PageHeaderData>() as u16;
         let item_id_size = std::mem::size_of::<ItemIdData>() as u16;
@@ -256,22 +226,34 @@ impl Page {
     }
 
     fn read_item_id(&self, offset: u16) -> ItemIdData {
-        unsafe { std::ptr::read_unaligned(self.data.as_ptr().offset(offset as isize) as *const ItemIdData) }
+        unsafe {
+            std::ptr::read_unaligned(self.data.as_ptr().offset(offset as isize) as *const ItemIdData)
+        }
     }
 
     fn write_item_id(&mut self, offset: u16, item_id: &ItemIdData) {
         unsafe {
-            std::ptr::write_unaligned(self.data.as_mut_ptr().offset(offset as isize) as *mut ItemIdData, *item_id);
+            std::ptr::write_unaligned(
+                self.data.as_mut_ptr().offset(offset as isize) as *mut ItemIdData,
+                *item_id,
+            );
         }
     }
 
     pub fn read_tuple_header(&self, offset: u16) -> HeapTupleHeaderData {
-        unsafe { std::ptr::read_unaligned(self.data.as_ptr().offset(offset as isize) as *const HeapTupleHeaderData) }
+        unsafe {
+            std::ptr::read_unaligned(
+                self.data.as_ptr().offset(offset as isize) as *const HeapTupleHeaderData
+            )
+        }
     }
 
     pub fn write_tuple_header(&mut self, offset: u16, header: &HeapTupleHeaderData) {
         unsafe {
-            std::ptr::write_unaligned(self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData, *header);
+            std::ptr::write_unaligned(
+                self.data.as_mut_ptr().offset(offset as isize) as *mut HeapTupleHeaderData,
+                *header,
+            );
         }
     }
 

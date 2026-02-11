@@ -1,18 +1,15 @@
-//! The Pager is responsible for reading and writing pages to the database file.
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::{Page, PageId, PAGE_SIZE};
+use crate::{PAGE_SIZE, Page, PageId};
 
-/// The Pager is responsible for reading and writing pages to the database file.
 pub struct Pager {
     file: File,
     pub num_pages: u32,
 }
 
 impl Pager {
-    /// Opens the database file, creating it and its parent directories if they don't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path_ref = path.as_ref();
         println!("[Pager::open] Opening database file at: {path_ref:?}");
@@ -28,22 +25,16 @@ impl Pager {
 
         let file_size = file.metadata()?.len();
         let num_pages = (file_size / PAGE_SIZE as u64) as u32;
-        println!(
-            "[Pager::open] File size: {file_size}, initial num_pages: {num_pages}"
-        );
+        println!("[Pager::open] File size: {file_size}, initial num_pages: {num_pages}");
 
         Ok(Self { file, num_pages })
     }
 
-    /// Reads a page from the database file. If the page is beyond the end of the file,
-    /// it returns a new, empty page.
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
         println!("[Pager::read_page] Reading page_id: {page_id}");
-        let mut page = Page::new(page_id); // It already initializes the header
+        let mut page = Page::new(page_id);
         if page_id >= self.num_pages {
-            println!(
-                "[Pager::read_page] Page {page_id} is new, returning initialized page."
-            );
+            println!("[Pager::read_page] Page {page_id} is new, returning initialized page.");
             return Ok(page);
         }
 
@@ -52,8 +43,6 @@ impl Pager {
 
         let bytes_read = self.file.read(&mut page.data)?;
         if bytes_read == 0 {
-            // This case can happen if the file was extended but not written to yet.
-            // The page is already initialized by Page::new, so we are good.
             println!(
                 "[Pager::read_page] Read 0 bytes for page {page_id}, using fresh initialized page."
             );
@@ -71,7 +60,6 @@ impl Pager {
         Ok(page)
     }
 
-    /// Writes a page to the database file.
     pub fn write_page(&mut self, page: &Page) -> io::Result<()> {
         println!("[Pager::write_page] Writing page_id: {}", page.id);
         let offset = page.id as u64 * PAGE_SIZE as u64;
@@ -88,7 +76,6 @@ impl Pager {
         Ok(())
     }
 
-    /// Allocates a new page in the database file and returns its PageId.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         let page_id = self.num_pages;
         self.num_pages += 1;
@@ -99,9 +86,7 @@ impl Pager {
         Ok(page_id)
     }
 
-    pub fn deallocate_page(&mut self, _page_id: PageId) {
-        // For now, we don't do anything. A more sophisticated pager would add this to a free list.
-    }
+    pub fn deallocate_page(&mut self, _page_id: PageId) {}
 }
 
 #[cfg(test)]
@@ -125,7 +110,6 @@ mod tests {
         page.write_header(&header);
         pager.write_page(&page).unwrap();
 
-        // Re-open the pager and check if the page is there
         drop(pager);
         let mut pager = Pager::open(temp_path.to_str().unwrap()).unwrap();
         let page = pager.read_page(page_id).unwrap();

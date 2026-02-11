@@ -3,29 +3,24 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::thread;
 use std::time::Duration;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(6000);
 
-/// A wrapper around the postgres::Client that ensures the server process
-/// is killed when the client goes out of scope.
 pub struct TestClient {
     pub client: Client,
     pub _addr: String,
-    _server_process: Child, // The underscore prevents warnings about it being unused
-    _dir: TempDir,          // Ensures the temp directory is cleaned up
+    _server_process: Child,
+    _dir: TempDir,
 }
 
 impl Drop for TestClient {
     fn drop(&mut self) {
-        // Best effort to kill the server process.
         let _ = self._server_process.kill();
     }
 }
 
 impl TestClient {
-    /// Executes a simple query and returns the results as a vector of rows,
-    /// where each row is a vector of column strings.
     pub fn simple_query(&mut self, query: &str) -> Vec<Vec<String>> {
         let rows = self.client.simple_query(query).unwrap();
         rows.into_iter()
@@ -62,7 +57,6 @@ pub fn setup_server_and_client(test_name: &str) -> TestClient {
     let db_path = dir.path().join(format!("{}.db", test_name));
     let wal_path = dir.path().join(format!("{}.wal", test_name));
 
-    // Ensure the parent directory for the WAL file exists.
     std::fs::create_dir_all(wal_path.parent().unwrap()).unwrap();
 
     let db_path_str = db_path.to_str().unwrap().to_string();
@@ -77,7 +71,6 @@ pub fn setup_server_and_client(test_name: &str) -> TestClient {
         .spawn()
         .expect("Failed to start server");
 
-    // Give the server a moment to start up
     thread::sleep(Duration::from_millis(500));
 
     let client = Client::connect(&client_addr, NoTls).unwrap();

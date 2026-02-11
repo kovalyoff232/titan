@@ -1,5 +1,3 @@
-//! Manages the buffer pool, a collection of in-memory frames that cache disk pages.
-
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
@@ -9,7 +7,6 @@ use crate::{Page, PageId};
 
 const BUFFER_POOL_SIZE: usize = 100;
 
-/// A single frame in the buffer pool.
 #[derive(Debug)]
 struct Frame {
     page: RwLock<Page>,
@@ -18,7 +15,6 @@ struct Frame {
     recently_used: Mutex<bool>,
 }
 
-/// The buffer pool manager.
 pub struct BufferPoolManager {
     pub pager: Mutex<Pager>,
     frames: Vec<Arc<Frame>>,
@@ -27,7 +23,6 @@ pub struct BufferPoolManager {
     clock_hand: Mutex<usize>,
 }
 
-/// An RAII guard for a page.
 pub struct PageGuard<'a> {
     bpm: &'a Arc<BufferPoolManager>,
     page_id: PageId,
@@ -74,7 +69,6 @@ impl BufferPoolManager {
     }
 
     pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<PageGuard<'_>> {
-        // 1. Check if page is already in buffer pool.
         if let Some(&frame_index) = self.page_table.read().unwrap().get(&page_id) {
             let frame = self.frames[frame_index].clone();
             self.pin_frame(&frame);
@@ -85,19 +79,15 @@ impl BufferPoolManager {
             });
         }
 
-        // 2. If not, find a free frame or evict one.
         let frame_index = self
             .find_victim_frame()
             .ok_or_else(|| io::Error::other("all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
-        // 3. Evict the old page if the frame is dirty.
         self.evict_if_dirty(frame_index)?;
 
-        // 4. Read the new page from disk.
         let new_page = self.pager.lock().unwrap().read_page(page_id)?;
 
-        // 5. Update frame content and metadata.
         {
             let mut page = frame.page.write().unwrap();
             *page = new_page;
@@ -105,7 +95,6 @@ impl BufferPoolManager {
             self.pin_frame(&frame);
         }
 
-        // 6. Update the page table.
         self.page_table
             .write()
             .unwrap()
@@ -118,19 +107,15 @@ impl BufferPoolManager {
     }
 
     pub fn new_page(self: &Arc<Self>) -> io::Result<PageGuard<'_>> {
-        // 1. Find a free frame or evict one.
         let frame_index = self
             .find_victim_frame()
             .ok_or_else(|| io::Error::other("all pages are pinned"))?;
         let frame = self.frames[frame_index].clone();
 
-        // 2. Evict the old page if the frame is dirty.
         self.evict_if_dirty(frame_index)?;
 
-        // 3. Allocate a new page on disk.
         let new_page_id = self.pager.lock().unwrap().allocate_page()?;
 
-        // 4. Update frame content and metadata.
         {
             let mut page = frame.page.write().unwrap();
             *page = Page::new(new_page_id);
@@ -138,7 +123,6 @@ impl BufferPoolManager {
             self.pin_frame(&frame);
         }
 
-        // 5. Update the page table.
         self.page_table
             .write()
             .unwrap()
@@ -163,7 +147,7 @@ impl BufferPoolManager {
             let mut is_dirty = frame.is_dirty.lock().unwrap();
             if *is_dirty {
                 let page_to_write = frame.page.read().unwrap().clone();
-                drop(page_table); // Drop lock before I/O
+                drop(page_table);
                 self.pager.lock().unwrap().write_page(&page_to_write)?;
                 *is_dirty = false;
                 self.page_table.write().unwrap().remove(&old_page_id);
@@ -227,7 +211,7 @@ impl BufferPoolManager {
         }
 
         let mut clock_hand = self.clock_hand.lock().unwrap();
-        // Two full passes: first pass can clear second-chance bits, second can pick a victim.
+
         for _ in 0..(frame_count * 2) {
             let frame_index = *clock_hand;
             *clock_hand = (*clock_hand + 1) % frame_count;
@@ -245,7 +229,6 @@ impl BufferPoolManager {
             }
         }
 
-        // All frames are pinned.
         None
     }
 }

@@ -14,8 +14,6 @@ fn test_optimizer_chooses_hash_join_for_equi_join() {
     client.simple_query("INSERT INTO t2 VALUES (101, 1);");
     client.simple_query("COMMIT;");
 
-    // This query should use HashJoin because of the equality condition.
-    // We don't have a way to EXPLAIN the plan yet, so we just check for correctness.
     let result = client.simple_query("SELECT t1.data FROM t1 JOIN t2 ON t1.id = t2.t1_id;");
 
     assert_eq!(result.len(), 1);
@@ -37,7 +35,6 @@ fn test_optimizer_chooses_nested_loop_join_for_non_equi_join() {
     client.simple_query("INSERT INTO t4 VALUES (102, 25);");
     client.simple_query("COMMIT;");
 
-    // This query should use NestedLoopJoin.
     let result = client.simple_query("SELECT t3.id, t4.id FROM t3 JOIN t4 ON t3.val < t4.val;");
 
     let mut sorted_result: Vec<String> = result.into_iter().map(|row| row.join(", ")).collect();
@@ -89,7 +86,6 @@ fn test_optimizer_chooses_index_scan() {
     client.simple_query("CREATE INDEX idx_id ON t5(id);");
     client.simple_query("COMMIT;");
 
-    // Keep this dataset moderate so the test stays bounded in debug builds.
     for i in 0..200 {
         client.simple_query(&format!("INSERT INTO t5 VALUES ({}, 'text{}');", i, i));
     }

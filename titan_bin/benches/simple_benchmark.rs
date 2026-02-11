@@ -3,7 +3,7 @@ use bedrock::lock_manager::LockManager;
 use bedrock::pager::Pager;
 use bedrock::transaction::TransactionManager;
 use bedrock::wal::WalManager;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use titan_bin::catalog::SystemCatalog;
@@ -28,11 +28,9 @@ fn setup_test_db() -> (
     let wal = Arc::new(Mutex::new(WalManager::open(wal_path).unwrap()));
     let system_catalog = Arc::new(Mutex::new(SystemCatalog::new()));
 
-    // Initialize with test data
     let tx_id = tm.begin();
     let snapshot = tm.create_snapshot(tx_id);
 
-    // Create a simple test table
     let create_stmt =
         parser::sql_parser("CREATE TABLE test_table (id INT, name TEXT, value INT);").unwrap();
     executor::execute(
@@ -47,7 +45,6 @@ fn setup_test_db() -> (
     )
     .unwrap();
 
-    // Insert some test data
     for i in 0..100 {
         let insert_stmt = parser::sql_parser(&format!(
             "INSERT INTO test_table VALUES ({}, 'name{}', {});",

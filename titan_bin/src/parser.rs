@@ -1,8 +1,6 @@
 use chumsky::prelude::*;
 use std::fmt;
 
-// --- AST ---
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
     Select(SelectStatement),
@@ -157,7 +155,6 @@ pub enum BinaryOperator {
     Or,
 }
 
-// Window Functions support
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WindowSpec {
     pub partition_by: Vec<Expression>,
@@ -196,14 +193,19 @@ pub enum WindowFunctionType {
     PercentRank,
     CumeDist,
     Ntile(i32),
-    Lag { offset: i64, default: Option<Box<Expression>> },
-    Lead { offset: i64, default: Option<Box<Expression>> },
+    Lag {
+        offset: i64,
+        default: Option<Box<Expression>>,
+    },
+    Lead {
+        offset: i64,
+        default: Option<Box<Expression>>,
+    },
     FirstValue,
     LastValue,
     NthValue(i64),
 }
 
-// Common Table Expressions (CTEs)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommonTableExpression {
     pub name: String,
@@ -220,7 +222,9 @@ impl fmt::Display for Expression {
             Expression::QualifiedColumn(table, col) => write!(f, "{}.{}", table, col),
             Expression::Binary { left, op, right } => write!(f, "({} {} {})", left, op, right),
             Expression::Unary { op, expr } => write!(f, "({} {})", op, expr),
-            Expression::WindowFunction { function, .. } => write!(f, "{}() OVER (...)", 
+            Expression::WindowFunction { function, .. } => write!(
+                f,
+                "{}() OVER (...)",
                 match function {
                     WindowFunctionType::RowNumber => "ROW_NUMBER",
                     WindowFunctionType::Rank => "RANK",
@@ -233,7 +237,8 @@ impl fmt::Display for Expression {
                     WindowFunctionType::FirstValue => "FIRST_VALUE",
                     WindowFunctionType::LastValue => "LAST_VALUE",
                     WindowFunctionType::NthValue(_) => "NTH_VALUE",
-                }),
+                }
+            ),
             Expression::Function { name, args } => {
                 write!(f, "{}(", name)?;
                 for (i, arg) in args.iter().enumerate() {
@@ -243,7 +248,7 @@ impl fmt::Display for Expression {
                     write!(f, "{}", arg)?;
                 }
                 write!(f, ")")
-            },
+            }
             Expression::Case { .. } => write!(f, "CASE ... END"),
             Expression::Subquery(_) => write!(f, "(SELECT ...)"),
         }
@@ -287,8 +292,6 @@ impl fmt::Display for BinaryOperator {
     }
 }
 
-// --- Parser ---
-
 pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let ident =
         text::ident()
@@ -297,12 +300,11 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 "SELECT" | "FROM" | "CREATE" | "TABLE" | "INSERT" | "INTO" | "VALUES" | "AS"
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
-                | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE" | "EXPLAIN" | "NOT" | "OR" => {
-                    Err(Simple::custom(
-                        span,
-                        format!("keyword `{}` cannot be used as an identifier", ident),
-                    ))
-                }
+                | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
+                | "EXPLAIN" | "NOT" | "OR" => Err(Simple::custom(
+                    span,
+                    format!("keyword `{}` cannot be used as an identifier", ident),
+                )),
                 _ => Ok(ident),
             });
 
@@ -344,10 +346,9 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let column = ident.clone().map(Expression::Column);
 
     let expr = recursive(|expr| {
-        let atom = literal
-            .or(qualified_column)
-            .or(column)
-            .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()));
+        let atom = literal.or(qualified_column).or(column).or(expr
+            .clone()
+            .delimited_by(just('(').padded(), just(')').padded()));
 
         let unary = text::keyword("NOT")
             .padded()

@@ -89,7 +89,6 @@ fn test_boolean_type() {
     client.simple_query("INSERT INTO test_bool VALUES (3, TRUE);");
     client.simple_query("COMMIT;");
 
-    // Test selecting all
     let all_rows = client.simple_query("SELECT id, is_active FROM test_bool ORDER BY id;");
     println!("All rows: {:?}", all_rows);
     assert_eq!(all_rows.len(), 3);
@@ -97,13 +96,11 @@ fn test_boolean_type() {
     assert_eq!(all_rows[1], vec!["2", "f"]);
     assert_eq!(all_rows[2], vec!["3", "t"]);
 
-    // Test filtering by TRUE
     let true_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = TRUE;");
     assert_eq!(true_rows.len(), 2);
     assert!(true_rows.contains(&vec!["1".to_string()]));
     assert!(true_rows.contains(&vec!["3".to_string()]));
 
-    // Test filtering by FALSE
     let false_rows = client.simple_query("SELECT id FROM test_bool WHERE is_active = FALSE;");
     assert_eq!(false_rows.len(), 1);
     assert_eq!(false_rows[0][0], "2");
@@ -122,14 +119,12 @@ fn test_date_type() {
     client.simple_query("INSERT INTO events VALUES (3, DATE '2024-01-15');");
     client.simple_query("COMMIT;");
 
-    // Test selecting all
     let all_rows = client.simple_query("SELECT id, event_date FROM events ORDER BY id;");
     assert_eq!(all_rows.len(), 3);
     assert_eq!(all_rows[0], vec!["1", "2024-01-15"]);
     assert_eq!(all_rows[1], vec!["2", "2025-07-06"]);
     assert_eq!(all_rows[2], vec!["3", "2024-01-15"]);
 
-    // Test filtering by date
     let filtered_rows =
         client.simple_query("SELECT id FROM events WHERE event_date = DATE '2024-01-15';");
     assert_eq!(filtered_rows.len(), 2);

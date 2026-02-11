@@ -1,15 +1,11 @@
-//! The query optimizer.
-//!
-//! This module is responsible for converting a logical plan into an efficient physical plan.
-
-use crate::catalog::{SystemCatalog};
+use crate::catalog::SystemCatalog;
 use crate::errors::ExecutionError;
-use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
-use crate::planner::{LogicalPlan};
-use bedrock::buffer_pool::BufferPoolManager;
-use bedrock::transaction::{Snapshot, TransactionManager};
 use crate::executor::parse_tuple;
+use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
+use crate::planner::LogicalPlan;
+use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::page::INVALID_PAGE_ID;
+use bedrock::transaction::{Snapshot, TransactionManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -96,7 +92,6 @@ pub enum PhysicalPlan {
     },
 }
 
-
 pub fn optimize(
     plan: LogicalPlan,
     bpm: &Arc<BufferPoolManager>,
@@ -136,24 +131,21 @@ fn get_table_names(plan: &LogicalPlan) -> HashSet<String> {
         LogicalPlan::Scan { table_name, .. } => {
             tables.insert(table_name.clone());
         }
-        LogicalPlan::Projection { input, .. } 
+        LogicalPlan::Projection { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Limit { input, .. } => {
             tables.extend(get_table_names(input));
         }
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SetOperation { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOperation { left, right, .. } => {
             tables.extend(get_table_names(left));
             tables.extend(get_table_names(right));
         }
         LogicalPlan::CteRef { name } => {
-            // CTE reference is like a virtual table
             tables.insert(format!("cte_{}", name));
         }
         LogicalPlan::WithCte { input, .. } => {
-            // TODO: Also extract tables from CTE definitions
             tables.extend(get_table_names(input));
         }
     }
@@ -182,7 +174,6 @@ fn load_statistics_for_table(
         .ok_or_else(|| ExecutionError::TableNotFound("pg_statistic".to_string()))?;
 
     if pg_stat_first_page_id == INVALID_PAGE_ID {
-        // No statistics available yet
         return Ok(());
     }
 
@@ -219,13 +210,11 @@ fn load_statistics_for_table(
 
                         match kind {
                             1 => {
-                                // n_distinct
                                 if let Some(LiteralValue::Number(n)) = parsed.get("stadistinct") {
                                     col_stats.n_distinct = n.parse().unwrap_or(0.0);
                                 }
                             }
                             2 => {
-                                // MCV
                                 if let Some(LiteralValue::String(s)) = parsed.get("stavalues") {
                                     col_stats.most_common_vals = s
                                         .split(',')
@@ -234,7 +223,6 @@ fn load_statistics_for_table(
                                 }
                             }
                             3 => {
-                                // Histogram
                                 if let Some(LiteralValue::String(s)) = parsed.get("stanumbers") {
                                     col_stats.histogram_bounds = s
                                         .split(',')
@@ -265,7 +253,6 @@ struct PlanInfo {
     cardinality: f64,
 }
 
-// Key is a bitmask representing the set of relations in the plan
 type PlanCache = HashMap<u32, Vec<PlanInfo>>;
 
 fn create_physical_plan(
@@ -280,7 +267,6 @@ fn create_physical_plan(
     let table_names = get_table_names(&plan);
     let tables: Vec<_> = table_names.iter().collect();
 
-    // --- 1. Generate base access plans ---
     for (i, table_name) in tables.iter().enumerate() {
         let relation_mask = 1 << i;
         let mut plans_for_rel = Vec::new();
@@ -288,10 +274,9 @@ fn create_physical_plan(
         let table_stats = stats.get(*table_name);
         let base_cardinality = table_stats.map_or(1.0, |s| s.total_rows);
 
-        // SeqScan
         let seq_scan_plan = PhysicalPlan::TableScan {
             table_name: table_name.to_string(),
-            filter: None, // Filters are applied later
+            filter: None,
         };
         let seq_scan_cost = cost_seq_scan(table_stats, base_cardinality);
         plans_for_rel.push(PlanInfo {
@@ -300,45 +285,56 @@ fn create_physical_plan(
             cardinality: base_cardinality,
         });
 
-        // IndexScan
-        if let LogicalPlan::Scan { filter: Some(predicate), .. } = &plan {
-             if let Expression::Binary { left, op: BinaryOperator::Eq, right } = predicate {
-                 if let (Expression::Column(col_name), Expression::Literal(LiteralValue::Number(val_str))) = (&**left, &**right) {
-                     // Check if an index exists on this column
-                     let schema = system_catalog.lock().unwrap().get_schema(table_name).unwrap();
-                     if let Some(col_idx) = schema.iter().position(|c| c.name == *col_name) {
-                         // In a real system, we'd check pg_index. For now, assume index exists if it's the first column.
-                         if col_idx == 0 {
-                             let index_scan_plan = PhysicalPlan::IndexScan {
-                                 table_name: table_name.to_string(),
-                                 index_name: format!("idx_{}", col_name), // Convention
-                                 key: val_str.parse().unwrap_or(0),
-                             };
-                             // Simplified cost and cardinality for index scan
-                             let index_cardinality = 1.0; // Equality on a unique index
-                             let index_cost = cost_index_scan(table_stats, index_cardinality);
-                             plans_for_rel.push(PlanInfo {
-                                 plan: Arc::new(index_scan_plan),
-                                 cost: index_cost,
-                                 cardinality: index_cardinality,
-                             });
-                         }
-                     }
-                 }
-             }
-        }
+        if let LogicalPlan::Scan {
+            filter: Some(predicate),
+            ..
+        } = &plan
+        {
+            if let Expression::Binary {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = predicate
+            {
+                if let (
+                    Expression::Column(col_name),
+                    Expression::Literal(LiteralValue::Number(val_str)),
+                ) = (&**left, &**right)
+                {
+                    let schema = system_catalog
+                        .lock()
+                        .unwrap()
+                        .get_schema(table_name)
+                        .unwrap();
+                    if let Some(col_idx) = schema.iter().position(|c| c.name == *col_name) {
+                        if col_idx == 0 {
+                            let index_scan_plan = PhysicalPlan::IndexScan {
+                                table_name: table_name.to_string(),
+                                index_name: format!("idx_{}", col_name),
+                                key: val_str.parse().unwrap_or(0),
+                            };
 
+                            let index_cardinality = 1.0;
+                            let index_cost = cost_index_scan(table_stats, index_cardinality);
+                            plans_for_rel.push(PlanInfo {
+                                plan: Arc::new(index_scan_plan),
+                                cost: index_cost,
+                                cardinality: index_cardinality,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         cache.insert(relation_mask, plans_for_rel);
     }
 
-    // --- 2. Iteratively build join plans ---
     let num_tables = tables.len();
     for i in 2..=num_tables {
-        // Iterate over all subsets of size i
         for subset_mask in (0..(1 << num_tables)).filter(|m: &u32| m.count_ones() == i as u32) {
             let mut best_plans_for_subset = Vec::new();
-            // Find a split of the subset
+
             for sub_subset_mask in (1..subset_mask).filter(|m| (subset_mask & m) == *m) {
                 let other_sub_mask = subset_mask ^ sub_subset_mask;
                 if cache.contains_key(&sub_subset_mask) && cache.contains_key(&other_sub_mask) {
@@ -347,16 +343,24 @@ fn create_physical_plan(
 
                     for p1 in plans1 {
                         for p2 in plans2 {
-                            if let Some((left_key, right_key)) = find_join_condition(&plan, p1, p2) {
-                                // HashJoin
+                            if let Some((left_key, right_key)) = find_join_condition(&plan, p1, p2)
+                            {
                                 let hj_plan = PhysicalPlan::HashJoin {
                                     left: Box::new((*p1.plan).clone()),
                                     right: Box::new((*p2.plan).clone()),
                                     left_key: left_key.clone(),
                                     right_key: right_key.clone(),
                                 };
-                                // Use the more accurate join cardinality estimation
-                                let hj_card = estimate_join_cardinality(p1, p2, &left_key, &right_key, stats, system_catalog).unwrap_or(1.0);
+
+                                let hj_card = estimate_join_cardinality(
+                                    p1,
+                                    p2,
+                                    &left_key,
+                                    &right_key,
+                                    stats,
+                                    system_catalog,
+                                )
+                                .unwrap_or(1.0);
                                 let hj_cost = cost_hash_join(p1, p2);
                                 best_plans_for_subset.push(PlanInfo {
                                     plan: Arc::new(hj_plan),
@@ -364,7 +368,6 @@ fn create_physical_plan(
                                     cardinality: hj_card,
                                 });
 
-                                // NestedLoopJoin
                                 let nlj_plan = PhysicalPlan::NestedLoopJoin {
                                     left: Box::new((*p1.plan).clone()),
                                     right: Box::new((*p2.plan).clone()),
@@ -374,7 +377,7 @@ fn create_physical_plan(
                                         right: Box::new(right_key.clone()),
                                     },
                                 };
-                                let nlj_card = p1.cardinality * p2.cardinality; // Simplified
+                                let nlj_card = p1.cardinality * p2.cardinality;
                                 let nlj_cost = p1.cost + p1.cardinality * p2.cost;
                                 best_plans_for_subset.push(PlanInfo {
                                     plan: Arc::new(nlj_plan),
@@ -387,33 +390,35 @@ fn create_physical_plan(
                 }
             }
             if !best_plans_for_subset.is_empty() {
-                 best_plans_for_subset.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
-                 cache.insert(subset_mask, best_plans_for_subset);
+                best_plans_for_subset.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
+                cache.insert(subset_mask, best_plans_for_subset);
             }
         }
     }
 
-    // --- 3. Find the best final plan ---
     let final_mask = (1 << num_tables) - 1;
     let best_plan_info = cache.get(&final_mask).and_then(|v| v.get(0));
 
     if let Some(info) = best_plan_info {
-        // --- 4. Add other operators like Projection, Filter, Sort ---
         let mut final_plan_info = info.clone();
         let mut final_plan = (*final_plan_info.plan).clone();
 
-        // Apply filters that were not pushed down
         if let Some(filter_predicate) = get_filter_from_logical_plan(&plan) {
             final_plan = PhysicalPlan::Filter {
                 input: Box::new(final_plan),
                 predicate: filter_predicate.clone(),
             };
             final_plan_info.cost += cost_filter(&final_plan_info);
-            final_plan_info.cardinality *= estimate_filter_selectivity_for_plan(&filter_predicate, &final_plan, stats, system_catalog);
+            final_plan_info.cardinality *= estimate_filter_selectivity_for_plan(
+                &filter_predicate,
+                &final_plan,
+                stats,
+                system_catalog,
+            );
         }
 
         if let LogicalPlan::Projection { expressions, .. } = &plan {
-             final_plan = PhysicalPlan::Projection {
+            final_plan = PhysicalPlan::Projection {
                 input: Box::new(final_plan),
                 expressions: expressions.clone(),
             };
@@ -428,24 +433,33 @@ fn create_physical_plan(
         }
         final_plan
     } else {
-        // Fallback to the old simple planner if CBO fails
         create_simple_physical_plan(plan)
     }
 }
 
-// Fallback for non-CBO cases or when CBO fails
 fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
     use crate::planner::LogicalPlan;
     match plan {
-        LogicalPlan::Scan { table_name, filter, .. } => PhysicalPlan::TableScan { table_name, filter },
+        LogicalPlan::Scan {
+            table_name, filter, ..
+        } => PhysicalPlan::TableScan { table_name, filter },
         LogicalPlan::Projection { input, expressions } => PhysicalPlan::Projection {
             input: Box::new(create_simple_physical_plan(*input)),
             expressions,
         },
-        LogicalPlan::Join { left, right, condition } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+        } => {
             let left_physical = create_simple_physical_plan(*left);
             let right_physical = create_simple_physical_plan(*right);
-             if let Expression::Binary { left: left_key, op: BinaryOperator::Eq, right: right_key } = &condition {
+            if let Expression::Binary {
+                left: left_key,
+                op: BinaryOperator::Eq,
+                right: right_key,
+            } = &condition
+            {
                 return PhysicalPlan::HashJoin {
                     left: Box::new(left_physical),
                     right: Box::new(right_physical),
@@ -463,23 +477,26 @@ fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
             input: Box::new(create_simple_physical_plan(*input)),
             order_by,
         },
-        LogicalPlan::Aggregate { input, group_by, aggregates, having } => {
-            // Choose between Hash and Stream aggregate based on whether input is sorted
-            PhysicalPlan::HashAggregate {
-                input: Box::new(create_simple_physical_plan(*input)),
-                group_by,
-                aggregates,
-                having,
-            }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            having,
+        } => PhysicalPlan::HashAggregate {
+            input: Box::new(create_simple_physical_plan(*input)),
+            group_by,
+            aggregates,
+            having,
         },
-        LogicalPlan::Window { input, window_functions } => PhysicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            window_functions,
+        } => PhysicalPlan::Window {
             input: Box::new(create_simple_physical_plan(*input)),
             window_functions,
         },
         LogicalPlan::CteRef { name } => PhysicalPlan::CTEScan { name },
         LogicalPlan::WithCte { cte_list, input } => {
-            // For simplicity, materialize all CTEs
-            // TODO: Implement recursive CTE handling
             let mut result = create_simple_physical_plan(*input);
             for cte in cte_list.iter().rev() {
                 result = PhysicalPlan::MaterializeCTE {
@@ -488,21 +505,28 @@ fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
                 };
             }
             result
-        },
-        LogicalPlan::SetOperation { op: _, all: _, left, right } => {
-            // For now, implement set operations using hash join
-            // TODO: Implement proper SetOperation physical operator
+        }
+        LogicalPlan::SetOperation {
+            op: _,
+            all: _,
+            left,
+            right,
+        } => {
             let left_physical = create_simple_physical_plan(*left);
             let right_physical = create_simple_physical_plan(*right);
-            // This is a simplification - real implementation would handle UNION/INTERSECT/EXCEPT
+
             PhysicalPlan::HashJoin {
                 left: Box::new(left_physical),
                 right: Box::new(right_physical),
                 left_key: Expression::Literal(LiteralValue::Number("1".to_string())),
                 right_key: Expression::Literal(LiteralValue::Number("1".to_string())),
             }
-        },
-        LogicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
+        }
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => PhysicalPlan::Limit {
             input: Box::new(create_simple_physical_plan(*input)),
             limit,
             offset,
@@ -510,7 +534,6 @@ fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
     }
 }
 
-// --- Cost Constants ---
 const SEQ_PAGE_COST: f64 = 1.0;
 const RANDOM_PAGE_COST: f64 = 1.1;
 const CPU_TUPLE_COST: f64 = 0.01;
@@ -526,7 +549,7 @@ fn estimate_cardinality(
         PhysicalPlan::TableScan { table_name, filter } => {
             let table_stats = match stats.get(table_name) {
                 Some(s) => s,
-                None => return 1.0, // Default if no stats
+                None => return 1.0,
             };
             let base_card = table_stats.total_rows;
             if let Some(f) = filter {
@@ -537,18 +560,26 @@ fn estimate_cardinality(
         }
         PhysicalPlan::Filter { input, predicate } => {
             let input_card = estimate_cardinality(input, stats, system_catalog);
-            // This is tricky, as the filter is on the output of a subplan.
-            // For now, we assume the filter applies to a single base table within the subplan.
-            // A more advanced CBO would track column origins.
-            // Let's assume the first table found is the one being filtered.
+
             if let Some(table_name) = find_first_table(input) {
-                 if let Some(table_stats) = stats.get(&table_name) {
-                    return input_card * estimate_filter_selectivity(predicate, &table_name, table_stats, system_catalog);
-                 }
+                if let Some(table_stats) = stats.get(&table_name) {
+                    return input_card
+                        * estimate_filter_selectivity(
+                            predicate,
+                            &table_name,
+                            table_stats,
+                            system_catalog,
+                        );
+                }
             }
-            input_card * 0.5 // Fallback
+            input_card * 0.5
         }
-        PhysicalPlan::HashJoin { left, right, left_key, right_key } => {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
             let left_card = estimate_cardinality(left, stats, system_catalog);
             let right_card = estimate_cardinality(right, stats, system_catalog);
 
@@ -560,43 +591,64 @@ fn estimate_cardinality(
             let left_stats = stats.get(&left_table).unwrap();
             let right_stats = stats.get(&right_table).unwrap();
 
-            let left_schema = system_catalog.lock().unwrap().get_schema(&left_table).unwrap();
-            let right_schema = system_catalog.lock().unwrap().get_schema(&right_table).unwrap();
+            let left_schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_schema(&left_table)
+                .unwrap();
+            let right_schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_schema(&right_table)
+                .unwrap();
 
             let left_col_idx = left_schema.iter().position(|c| c.name == left_col).unwrap();
-            let right_col_idx = right_schema.iter().position(|c| c.name == right_col).unwrap();
+            let right_col_idx = right_schema
+                .iter()
+                .position(|c| c.name == right_col)
+                .unwrap();
 
-            let left_n_distinct = left_stats.column_stats.get(&left_col_idx).map_or(1.0, |cs| cs.n_distinct);
-            let right_n_distinct = right_stats.column_stats.get(&right_col_idx).map_or(1.0, |cs| cs.n_distinct);
+            let left_n_distinct = left_stats
+                .column_stats
+                .get(&left_col_idx)
+                .map_or(1.0, |cs| cs.n_distinct);
+            let right_n_distinct = right_stats
+                .column_stats
+                .get(&right_col_idx)
+                .map_or(1.0, |cs| cs.n_distinct);
 
             (left_card * right_card) / (left_n_distinct).max(right_n_distinct)
         }
-        PhysicalPlan::Projection { input, .. } => estimate_cardinality(input, stats, system_catalog),
+        PhysicalPlan::Projection { input, .. } => {
+            estimate_cardinality(input, stats, system_catalog)
+        }
         PhysicalPlan::Sort { input, .. } => estimate_cardinality(input, stats, system_catalog),
         PhysicalPlan::NestedLoopJoin { left, right, .. } => {
-            // Simplified for now, same as hash join
             let left_card = estimate_cardinality(left, stats, system_catalog);
             let right_card = estimate_cardinality(right, stats, system_catalog);
-            left_card * right_card * 0.1 // Generic small selectivity for non-equi joins
+            left_card * right_card * 0.1
         }
         _ => 1.0,
     }
 }
 
 fn estimate_filter_selectivity_for_plan(
-   predicate: &Expression,
-   plan: &PhysicalPlan,
-   stats: &HashMap<String, Arc<TableStats>>,
-   system_catalog: &Arc<Mutex<SystemCatalog>>,
+    predicate: &Expression,
+    plan: &PhysicalPlan,
+    stats: &HashMap<String, Arc<TableStats>>,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> f64 {
-     // A more advanced CBO would track column origins.
-     // For now, we assume the filter applies to the first base table found.
-     if let Some(table_name) = find_first_table(plan) {
-           if let Some(table_stats) = stats.get(&table_name) {
-               return estimate_filter_selectivity(predicate, &table_name, table_stats, system_catalog);
-           }
-     }
-     0.5 // Fallback
+    if let Some(table_name) = find_first_table(plan) {
+        if let Some(table_stats) = stats.get(&table_name) {
+            return estimate_filter_selectivity(
+                predicate,
+                &table_name,
+                table_stats,
+                system_catalog,
+            );
+        }
+    }
+    0.5
 }
 
 fn estimate_filter_selectivity(
@@ -607,14 +659,14 @@ fn estimate_filter_selectivity(
 ) -> f64 {
     match filter {
         Expression::Binary { left, op, right } => {
-            // AND
             if *op == BinaryOperator::And {
-                return estimate_filter_selectivity(left, table_name, table_stats, system_catalog) *
-                       estimate_filter_selectivity(right, table_name, table_stats, system_catalog);
+                return estimate_filter_selectivity(left, table_name, table_stats, system_catalog)
+                    * estimate_filter_selectivity(right, table_name, table_stats, system_catalog);
             }
             if *op == BinaryOperator::Or {
                 let s1 = estimate_filter_selectivity(left, table_name, table_stats, system_catalog);
-                let s2 = estimate_filter_selectivity(right, table_name, table_stats, system_catalog);
+                let s2 =
+                    estimate_filter_selectivity(right, table_name, table_stats, system_catalog);
                 return s1 + s2 - (s1 * s2);
             }
 
@@ -622,48 +674,47 @@ fn estimate_filter_selectivity(
                 if let Expression::Literal(lit) = &**right {
                     (name, lit)
                 } else {
-                    return 0.33; // Non-literal comparison, guess
+                    return 0.33;
                 }
             } else {
                 return 0.33;
             };
 
-            let schema = system_catalog.lock().unwrap().get_schema(table_name).unwrap();
+            let schema = system_catalog
+                .lock()
+                .unwrap()
+                .get_schema(table_name)
+                .unwrap();
             let col_idx = schema.iter().position(|c| c.name == *col_name);
 
             if col_idx.is_none() {
-                return 0.5; // Column not found
+                return 0.5;
             }
             let col_idx = col_idx.unwrap();
 
             let col_stats = table_stats.column_stats.get(&col_idx);
 
             if col_stats.is_none() {
-                return 0.5; // No stats for column
+                return 0.5;
             }
             let col_stats = col_stats.unwrap();
-
 
             match op {
                 BinaryOperator::Eq => {
                     if col_stats.most_common_vals.contains(literal) {
-                        // FIXME: This is an approximation. A more accurate estimation would be to store
-                        // frequencies of MCVs. The spec says `1 / (number of MCVs)` which is ambiguous.
-                        // Using 1/n_distinct is a more standard approach when frequency is unknown.
                         1.0 / col_stats.n_distinct.max(1.0)
                     } else {
-                        // Value is not in MCV, assume uniform distribution over remaining values.
                         let mcv_count = col_stats.most_common_vals.len() as f64;
                         let non_mcv_distinct_count = (col_stats.n_distinct - mcv_count).max(1.0);
-                        // A more accurate model would estimate the total frequency of non-MCV values.
-                        // For now, we stick to the 1/n_distinct principle for non-MCV values.
+
                         1.0 / non_mcv_distinct_count
                     }
                 }
-                BinaryOperator::Lt | BinaryOperator::Gt | BinaryOperator::LtEq | BinaryOperator::GtEq => {
-                    estimate_range_selectivity(col_stats, literal, op)
-                }
-                _ => 0.33, // Fallback for other operators like NotEq
+                BinaryOperator::Lt
+                | BinaryOperator::Gt
+                | BinaryOperator::LtEq
+                | BinaryOperator::GtEq => estimate_range_selectivity(col_stats, literal, op),
+                _ => 0.33,
             }
         }
         Expression::Unary { op, expr } => {
@@ -673,50 +724,50 @@ fn estimate_filter_selectivity(
                 0.5
             }
         }
-        _ => 0.5, // Default for other expressions
+        _ => 0.5,
     }
 }
 
 fn estimate_range_selectivity(
-   col_stats: &ColumnStats,
-   literal: &LiteralValue,
-   op: &BinaryOperator,
+    col_stats: &ColumnStats,
+    literal: &LiteralValue,
+    op: &BinaryOperator,
 ) -> f64 {
-   if col_stats.histogram_bounds.is_empty() {
-       return 0.33; // Default selectivity if no histogram
-   }
+    if col_stats.histogram_bounds.is_empty() {
+        return 0.33;
+    }
 
-   // A real implementation would parse literal and histogram bounds to the same numeric type.
-   // For now, we assume they are strings that can be compared.
-   let literal_str = literal.to_string();
-   let bounds_str: Vec<String> = col_stats.histogram_bounds.iter().map(|v| v.to_string()).collect();
+    let literal_str = literal.to_string();
+    let bounds_str: Vec<String> = col_stats
+        .histogram_bounds
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
 
-   let num_buckets = bounds_str.len() -1;
-   if num_buckets <= 0 {
-       return 0.33;
-   }
+    let num_buckets = bounds_str.len() - 1;
+    if num_buckets <= 0 {
+        return 0.33;
+    }
 
-   // Find which bucket the literal falls into
-   let bucket_idx = bounds_str.iter().position(|b| *b > literal_str).unwrap_or(num_buckets);
+    let bucket_idx = bounds_str
+        .iter()
+        .position(|b| *b > literal_str)
+        .unwrap_or(num_buckets);
 
-   match op {
-       BinaryOperator::Lt | BinaryOperator::LtEq => {
-           // Selectivity is the proportion of buckets to the left
-           (bucket_idx as f64) / (num_buckets as f64)
-       }
-       BinaryOperator::Gt | BinaryOperator::GtEq => {
-           // Selectivity is the proportion of buckets to the right
-           ((num_buckets - bucket_idx) as f64) / (num_buckets as f64)
-       }
-       _ => 0.33,
-   }
+    match op {
+        BinaryOperator::Lt | BinaryOperator::LtEq => (bucket_idx as f64) / (num_buckets as f64),
+        BinaryOperator::Gt | BinaryOperator::GtEq => {
+            ((num_buckets - bucket_idx) as f64) / (num_buckets as f64)
+        }
+        _ => 0.33,
+    }
 }
 
 fn find_first_table(plan: &PhysicalPlan) -> Option<String> {
     match plan {
         PhysicalPlan::TableScan { table_name, .. } => Some(table_name.clone()),
         PhysicalPlan::IndexScan { table_name, .. } => Some(table_name.clone()),
-        PhysicalPlan::Filter { input, .. } 
+        PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
@@ -738,11 +789,17 @@ fn find_join_condition(
 ) -> Option<(Expression, Expression)> {
     use crate::planner::LogicalPlan;
     match plan {
-        LogicalPlan::Join { left, right, condition } => {
-            if let Expression::Binary { left: cond_left, op: BinaryOperator::Eq, right: cond_right } = condition {
-                // This is a simplified check. A real CBO needs to check if the
-                // tables in the condition match the tables in the sub-plans p1 and p2.
-                // The current implementation is flawed as it doesn't properly map expressions to sub-plans.
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+        } => {
+            if let Expression::Binary {
+                left: cond_left,
+                op: BinaryOperator::Eq,
+                right: cond_right,
+            } = condition
+            {
                 let p1_table = find_first_table(&p1.plan);
                 let p2_table = find_first_table(&p2.plan);
                 let cond_left_table = get_table_name_from_expr(cond_left);
@@ -755,7 +812,7 @@ fn find_join_condition(
                     return Some((*(cond_right.clone()), *(cond_left.clone())));
                 }
             }
-            // If the current join condition doesn't match, check nested joins.
+
             find_join_condition(left, p1, p2).or_else(|| find_join_condition(right, p1, p2))
         }
         LogicalPlan::Projection { input, .. }
@@ -779,23 +836,22 @@ fn get_table_name_from_expr(expr: &Expression) -> Option<String> {
 }
 
 fn get_filter_from_logical_plan(plan: &LogicalPlan) -> Option<&Expression> {
-   use crate::planner::LogicalPlan;
-   match plan {
-       LogicalPlan::Scan { filter, .. } => filter.as_ref(),
-       LogicalPlan::Projection { input, .. }
-       | LogicalPlan::Sort { input, .. }
-       | LogicalPlan::Aggregate { input, .. }
-       | LogicalPlan::Window { input, .. }
-       | LogicalPlan::Limit { input, .. } => get_filter_from_logical_plan(input),
-       LogicalPlan::WithCte { input, .. } => get_filter_from_logical_plan(input),
-       // In a real system, filters can also be part of the join condition
-       LogicalPlan::Join { .. }
-       | LogicalPlan::SetOperation { .. }
-       | LogicalPlan::CteRef { .. } => None,
-   }
+    use crate::planner::LogicalPlan;
+    match plan {
+        LogicalPlan::Scan { filter, .. } => filter.as_ref(),
+        LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Limit { input, .. } => get_filter_from_logical_plan(input),
+        LogicalPlan::WithCte { input, .. } => get_filter_from_logical_plan(input),
+
+        LogicalPlan::Join { .. }
+        | LogicalPlan::SetOperation { .. }
+        | LogicalPlan::CteRef { .. } => None,
+    }
 }
 
-// Helper functions to extract info from plan/expressions
 #[allow(dead_code)]
 fn get_table_name(plan: &LogicalPlan) -> Option<String> {
     match plan {
@@ -822,21 +878,23 @@ fn get_col_idx(
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Option<usize> {
     let mut catalog = system_catalog.lock().unwrap();
-    let (table_oid, _) = catalog.find_table(table_name, bpm, tx_id, snapshot).ok()??;
-    let schema = catalog.get_table_schema(bpm, table_oid, tx_id, snapshot).ok()?;
+    let (table_oid, _) = catalog
+        .find_table(table_name, bpm, tx_id, snapshot)
+        .ok()??;
+    let schema = catalog
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)
+        .ok()?;
     schema.iter().position(|c| c.name == col_name)
 }
 
 fn cost_seq_scan(_stats: Option<&Arc<TableStats>>, cardinality: f64) -> f64 {
-    // A rough estimation of pages. A better way would be to store this in pg_class.
-    let n_pages = (cardinality * 100.0 / 4096.0).max(1.0); // Assume 100 bytes per tuple
+    let n_pages = (cardinality * 100.0 / 4096.0).max(1.0);
     (n_pages * SEQ_PAGE_COST) + (cardinality * CPU_TUPLE_COST)
 }
 
 fn cost_index_scan(_stats: Option<&Arc<TableStats>>, selected_tuples: f64) -> f64 {
-    // FIXME: B-tree height and leaf pages should be fetched from statistics/metadata.
-    let b_tree_height = 3.0; // A reasonable guess for many tables
-    let n_index_leaf_pages = (selected_tuples / 100.0).max(1.0); // Guess: 100 entries per leaf page
+    let b_tree_height = 3.0;
+    let n_index_leaf_pages = (selected_tuples / 100.0).max(1.0);
     (b_tree_height * RANDOM_PAGE_COST)
         + (n_index_leaf_pages * SEQ_PAGE_COST)
         + (selected_tuples * CPU_TUPLE_COST)
@@ -851,7 +909,9 @@ fn cost_hash_join(left: &PlanInfo, right: &PlanInfo) -> f64 {
 
 fn cost_sort(input: &PlanInfo) -> f64 {
     let n_tuples = input.cardinality;
-    if n_tuples < 1.0 { return 0.0; }
+    if n_tuples < 1.0 {
+        return 0.0;
+    }
     let n_pages = (n_tuples * 100.0 / 4096.0).max(1.0);
     (n_pages * SEQ_PAGE_COST) + (n_tuples * n_tuples.log2() * CPU_OPERATOR_COST)
 }
@@ -890,8 +950,14 @@ fn estimate_join_cardinality(
     let left_col_idx = left_schema.iter().position(|c| c.name == left_col)?;
     let right_col_idx = right_schema.iter().position(|c| c.name == right_col)?;
 
-    let left_n_distinct = left_stats.column_stats.get(&left_col_idx).map_or(left_card, |cs| cs.n_distinct);
-    let right_n_distinct = right_stats.column_stats.get(&right_col_idx).map_or(right_card, |cs| cs.n_distinct);
+    let left_n_distinct = left_stats
+        .column_stats
+        .get(&left_col_idx)
+        .map_or(left_card, |cs| cs.n_distinct);
+    let right_n_distinct = right_stats
+        .column_stats
+        .get(&right_col_idx)
+        .map_or(right_card, |cs| cs.n_distinct);
 
     Some((left_card * right_card) / (left_n_distinct.max(right_n_distinct)).max(1.0))
 }

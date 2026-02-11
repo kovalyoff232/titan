@@ -1,23 +1,16 @@
-//! Manages the system catalogs, which store metadata about the database.
-//!
-//! The system catalogs are special tables that store information about tables, columns,
-//! and other database objects. This module provides functions for accessing and
-//! manipulating the system catalogs.
-
 use crate::errors::ExecutionError;
 use crate::optimizer::TableStats;
 use crate::types::Column;
 use bedrock::buffer_pool::BufferPoolManager;
 
+use bedrock::PageId;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::WalManager;
-use bedrock::PageId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// The object ID of the `pg_class` table, which stores information about tables.
 pub const PG_CLASS_TABLE_OID: PageId = 0;
-/// The object ID of the `pg_attribute` table, which stores information about columns.
+
 pub const PG_ATTRIBUTE_TABLE_OID: PageId = 1;
 
 pub struct SystemCatalog {
@@ -49,10 +42,6 @@ impl SystemCatalog {
         self.schema_cache.lock().unwrap().insert(table_name, schema);
     }
 
-    /// Finds a table by name in the `pg_class` catalog.
-    ///
-    /// This function searches the `pg_class` table for a table with the given name.
-    /// It returns the table's object ID and the page ID of its first page.
     pub fn find_table(
         &mut self,
         name: &str,
@@ -90,7 +79,6 @@ impl SystemCatalog {
                             let table_page_id =
                                 u32::from_be_bytes(tuple_data[4..8].try_into().unwrap());
 
-                            // We need the latest committed version that is visible to us.
                             if best_candidate.is_none() || header.xmin > best_candidate.unwrap().0 {
                                 best_candidate = Some((header.xmin, table_oid, table_page_id));
                                 println!(
@@ -170,7 +158,6 @@ pub fn update_pg_class_page_id(
     let mut delete_before_page: Option<Vec<u8>> = None;
     let mut delete_after_page: Option<Vec<u8>> = None;
 
-    // Find the old entry and mark it as deleted.
     for i in 0..pg_class_page.get_tuple_count() {
         if pg_class_page.is_visible(snapshot, tx_id, i) {
             let oid = {
@@ -193,7 +180,6 @@ pub fn update_pg_class_page_id(
         }
     }
 
-    // Add the new entry with the correct page_id.
     if let Some(mut tuple_data) = old_tuple_data {
         if let Some(old_id) = old_item_id {
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);

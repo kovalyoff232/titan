@@ -1,51 +1,40 @@
-//! Manages locks on database resources.
-
-use crate::page::TransactionId;
 use crate::TupleId;
+use crate::page::TransactionId;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// The mode of a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockMode {
-    /// A shared lock.
     Shared,
-    /// An exclusive lock.
+
     Exclusive,
 }
 
-/// A resource that can be locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockableResource {
-    /// A table.
     Table(u32),
-    /// A tuple.
+
     Tuple(TupleId),
 }
 
-/// A lock request.
 #[derive(Debug)]
 struct LockRequest {
-    /// The ID of the transaction that requested the lock.
     tx_id: TransactionId,
-    /// The mode of the lock.
+
     mode: LockMode,
 }
 
-/// A queue of lock requests for a resource.
 #[derive(Debug, Default)]
 struct LockQueue {
-    /// The queue of lock requests.
     queue: VecDeque<LockRequest>,
-    /// The set of transactions that hold a shared lock.
+
     sharing: HashSet<TransactionId>,
-    /// The transaction that holds an exclusive lock.
+
     exclusive: Option<TransactionId>,
 }
 
 impl LockQueue {
-    /// Returns a list of transaction IDs that are holding a lock that conflicts with the given request.
     fn get_conflicting_holders(&self, request: &LockRequest) -> Vec<TransactionId> {
         let mut holders = Vec::new();
         match request.mode {
@@ -73,38 +62,30 @@ impl LockQueue {
     }
 }
 
-/// A queue of waiting transactions.
 #[derive(Debug, Default)]
 struct WaitQueue {
-    /// The queue of lock requests.
     queue: Mutex<LockQueue>,
-    /// The condition variable to notify waiting transactions.
+
     cvar: Condvar,
 }
 
-/// The lock manager.
 #[derive(Debug, Default)]
 pub struct LockManager {
-    /// A map from a resource to its lock queue.
     table: DashMap<LockableResource, Arc<WaitQueue>>,
-    /// A map from a transaction to the transactions it is waiting for.
+
     waits_for: Mutex<HashMap<TransactionId, Vec<TransactionId>>>,
 }
 
-/// An error that can occur when acquiring a lock.
 #[derive(Debug)]
 pub enum LockError {
-    /// A deadlock was detected.
     Deadlock,
 }
 
 impl LockManager {
-    /// Creates a new lock manager.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Acquires a lock on a resource.
     pub fn lock(
         &self,
         tx_id: TransactionId,
@@ -115,7 +96,6 @@ impl LockManager {
 
         let mut guard = wait_queue.queue.lock().unwrap();
 
-        // If we already hold the lock in a compatible or stronger mode, we are good.
         if (mode == LockMode::Shared
             && (guard.sharing.contains(&tx_id) || guard.exclusive == Some(tx_id)))
             || (mode == LockMode::Exclusive && guard.exclusive == Some(tx_id))
@@ -128,15 +108,11 @@ impl LockManager {
 
         loop {
             if self.try_acquire(&mut guard, tx_id, mode) {
-                // Lock acquired, remove from waits-for graph
                 self.waits_for.lock().unwrap().remove(&tx_id);
                 return Ok(());
             }
 
-            // --- Deadlock Detection ---
             if let Err(e) = self.update_waits_for_graph(&guard, tx_id) {
-                // A deadlock was detected. This transaction is the victim.
-                // We need to remove our request from the queue and return the error.
                 guard.queue.retain(|req| req.tx_id != tx_id);
                 return Err(e);
             }
@@ -145,30 +121,25 @@ impl LockManager {
         }
     }
 
-    /// Updates the waits-for graph and checks for deadlocks.
     fn update_waits_for_graph(
         &self,
         queue: &LockQueue,
         waiting_tx_id: TransactionId,
     ) -> Result<(), LockError> {
         let mut waits_for_map = self.waits_for.lock().unwrap();
-        waits_for_map.remove(&waiting_tx_id); // Clear old dependencies for this tx
+        waits_for_map.remove(&waiting_tx_id);
 
-        // Find the request for the current transaction in the queue
         if let Some(my_request) = queue.queue.iter().find(|req| req.tx_id == waiting_tx_id) {
-            // Find who holds the lock that I am waiting for
             let holders = queue.get_conflicting_holders(my_request);
             if !holders.is_empty() {
                 waits_for_map.insert(waiting_tx_id, holders);
             }
         }
 
-        // Check for cycles
         let mut visited = HashSet::new();
         let mut recursion_stack = HashSet::new();
         for tx_id in waits_for_map.keys() {
             if self.has_cycle_util(*tx_id, &mut visited, &mut recursion_stack, &waits_for_map) {
-                // Cycle detected, abort the current transaction
                 waits_for_map.remove(&waiting_tx_id);
                 return Err(LockError::Deadlock);
             }
@@ -177,7 +148,6 @@ impl LockManager {
         Ok(())
     }
 
-    /// Checks for cycles in the waits-for graph.
     #[allow(clippy::only_used_in_recursion)]
     fn has_cycle_util(
         &self,
@@ -187,10 +157,10 @@ impl LockManager {
         waits_for: &HashMap<TransactionId, Vec<TransactionId>>,
     ) -> bool {
         if recursion_stack.contains(&tx_id) {
-            return true; // Cycle detected
+            return true;
         }
         if visited.contains(&tx_id) {
-            return false; // Already checked this node
+            return false;
         }
 
         visited.insert(tx_id);
@@ -208,13 +178,11 @@ impl LockManager {
         false
     }
 
-    /// Tries to acquire a lock.
     fn try_acquire(&self, queue: &mut LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
         if self.is_locked_for(queue, tx_id, mode) {
             return false;
         }
 
-        // Check if it's our turn in the queue
         if let Some(first) = queue.queue.front() {
             if first.tx_id != tx_id {
                 return false;
@@ -223,7 +191,6 @@ impl LockManager {
             return false;
         }
 
-        // Grant the lock
         queue.queue.pop_front();
         match mode {
             LockMode::Shared => {
@@ -236,7 +203,6 @@ impl LockManager {
         true
     }
 
-    /// Checks if a resource is locked for a transaction.
     fn is_locked_for(&self, queue: &LockQueue, tx_id: TransactionId, mode: LockMode) -> bool {
         match mode {
             LockMode::Shared => {
@@ -258,9 +224,7 @@ impl LockManager {
         false
     }
 
-    /// Releases all locks held by a transaction.
     pub fn unlock_all(&self, tx_id: TransactionId) {
-        // Also remove the transaction from the waits-for graph
         self.waits_for.lock().unwrap().remove(&tx_id);
 
         for entry in self.table.iter() {

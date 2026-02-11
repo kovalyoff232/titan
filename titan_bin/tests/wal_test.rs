@@ -11,7 +11,7 @@ fn test_wal_crc_check_ok() {
 
     let record = WalRecord::Commit { tx_id: 1 };
     let lsn = wal.log(1, 0, &record).unwrap();
-    
+
     drop(wal);
     let mut wal = WalManager::open(&wal_path).unwrap();
 
@@ -28,14 +28,16 @@ fn test_wal_crc_check_fail() {
     let record = WalRecord::Commit { tx_id: 1 };
     let lsn = wal.log(1, 0, &record).unwrap();
 
-    // Corrupt the record
     drop(wal);
     let mut file = OpenOptions::new().write(true).open(&wal_path).unwrap();
-    file.seek(std::io::SeekFrom::Start(lsn + 16)).unwrap(); // Seek to CRC
-    file.write_all(&[0, 0, 0, 0]).unwrap(); // Corrupt CRC
+    file.seek(std::io::SeekFrom::Start(lsn + 16)).unwrap();
+    file.write_all(&[0, 0, 0, 0]).unwrap();
 
     let mut wal = WalManager::open(&wal_path).unwrap();
     let result = wal.read_record(lsn);
     assert!(result.is_err());
-    assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        result.err().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }

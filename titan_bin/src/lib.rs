@@ -1,11 +1,3 @@
-//! The main library for the TitanDB binary.
-//!
-//! This library contains the core logic for the TitanDB server, including:
-//! - Handling TCP connections from clients.
-//! - Parsing and executing SQL queries.
-//! - Managing transactions, concurrency control, and recovery.
-//! - Initializing the database with system catalogs.
-
 use crate::types::{Column, ExecuteResult, ResultSet};
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::lock_manager::LockManager;
@@ -30,7 +22,6 @@ pub mod sql_extensions;
 pub mod types;
 pub mod window_executor;
 
-/// Writes a message to the given stream with the specified message type and data.
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
     stream.write_all(&[msg_type])?;
@@ -39,27 +30,24 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Resul
     Ok(())
 }
 
-/// Sends an error response to the client.
 fn send_error_response(stream: &mut TcpStream, message: &str, code: &str) -> io::Result<()> {
     let mut data = BytesMut::new();
-    data.put_u8(b'S'); // Severity
+    data.put_u8(b'S');
     data.put_slice(b"ERROR\0");
-    data.put_u8(b'C'); // Code
+    data.put_u8(b'C');
     data.put_slice(code.as_bytes());
     data.put_u8(b'\0');
-    data.put_u8(b'M'); // Message
+    data.put_u8(b'M');
     data.put_slice(message.as_bytes());
     data.put_u8(b'\0');
-    data.put_u8(b'\0'); // End of message
+    data.put_u8(b'\0');
     write_message(stream, b'E', &data)
 }
 
-/// Sends a "Ready for Query" message to the client.
 fn send_ready_for_query(stream: &mut TcpStream) -> io::Result<()> {
-    write_message(stream, b'Z', b"I") // 'I' for Idle
+    write_message(stream, b'Z', b"I")
 }
 
-/// Sends a "Command Complete" message to the client.
 fn send_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_slice(tag.as_bytes());
@@ -67,41 +55,34 @@ fn send_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
     write_message(stream, b'C', &data)
 }
 
-/// Sends a "Row Description" message to the client, describing the columns of a result set.
 fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_i16(columns.len() as i16);
     for (i, col) in columns.iter().enumerate() {
         data.put_slice(col.name.as_bytes());
         data.put_u8(b'\0');
-        data.put_i32(0); // Table OID (unknown)
-        data.put_i16(i as i16 + 1); // Column index
-        data.put_i32(col.type_id as i32); // Type OID
+        data.put_i32(0);
+        data.put_i16(i as i16 + 1);
+        data.put_i32(col.type_id as i32);
         let type_size = match col.type_id {
-            16 => 1,   // bool
-            23 => 4,   // int4
-            1082 => 4, // date
-            _ => -1,   // variable-length
+            16 => 1,
+            23 => 4,
+            1082 => 4,
+            _ => -1,
         };
         data.put_i16(type_size);
-        data.put_i32(-1); // Type modifier
-        data.put_i16(0); // Format code (text)
+        data.put_i32(-1);
+        data.put_i16(0);
     }
     write_message(stream, b'T', &data)
 }
 
-/// Sends a "Data Row" message to the client, containing the data for a single row.
 fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> io::Result<()> {
     let mut data = BytesMut::new();
     data.put_i16(row.len() as i16);
     for (i, val) in row.iter().enumerate() {
         let final_val = if columns[i].type_id == 16 {
-            // Bool
-            if val.to_lowercase() == "t" {
-                "t"
-            } else {
-                "f"
-            }
+            if val.to_lowercase() == "t" { "t" } else { "f" }
         } else {
             val.as_str()
         };
@@ -111,10 +92,6 @@ fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> 
     write_message(stream, b'D', &data)
 }
 
-/// Handles a single client connection.
-///
-/// This function reads queries from the client, executes them, and sends back the results.
-/// It also manages transactions for the client's session.
 fn handle_client(
     mut stream: TcpStream,
     bpm: Arc<BufferPoolManager>,
@@ -129,13 +106,11 @@ fn handle_client(
     );
     let mut buffer = BytesMut::with_capacity(1024);
 
-    // --- Startup Phase ---
     let mut startup_buf = [0; 1024];
     let _n = stream.read(&mut startup_buf)?;
 
     let request_code = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
     if request_code == 80877103 {
-        // SSLRequest
         println!("[handle_client] SSLRequest received, denying.");
         stream.write_all(b"N")?;
         let n = stream.read(&mut startup_buf)?;
@@ -147,7 +122,6 @@ fn handle_client(
     let protocol_version = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
     println!("[handle_client] Protocol version: {}", protocol_version);
     if protocol_version != 196608 {
-        // 3.0
         send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
         return Ok(());
     }
@@ -156,9 +130,8 @@ fn handle_client(
     write_message(&mut stream, b'R', &0i32.to_be_bytes())?;
     send_ready_for_query(&mut stream)?;
 
-    // --- Query Loop ---
     let mut in_transaction = false;
-    let mut in_explicit_transaction = false; // Track if we are in a BEGIN...COMMIT block
+    let mut in_explicit_transaction = false;
     let mut tx_id = 0;
 
     loop {
@@ -181,7 +154,6 @@ fn handle_client(
 
         match msg_type[0] {
             b'Q' => {
-                // Simple Query
                 let query_str = String::from_utf8_lossy(&buffer[..len - 1]).to_string();
                 println!("[handle_client] Received query: '{}'", query_str);
 
@@ -224,13 +196,12 @@ fn handle_client(
                         &snapshot,
                     );
 
-                    // Handle transaction control statements explicitly
                     match &stmt {
                         parser::Statement::Begin => {
                             in_explicit_transaction = true;
                             send_command_complete(&mut stream, "BEGIN")?;
                             last_result = None;
-                            continue; // Continue to next statement in the query string
+                            continue;
                         }
                         parser::Statement::Commit => {
                             tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
@@ -254,7 +225,6 @@ fn handle_client(
                         _ => {}
                     }
 
-                    // Handle the result of other statements
                     match result {
                         Ok(res) => {
                             last_result = Some(res);
@@ -270,7 +240,7 @@ fn handle_client(
                             in_transaction = false;
                             in_explicit_transaction = false;
                             last_result = None;
-                            break; // Abort processing further statements in the query string
+                            break;
                         }
                         Err(e) => {
                             println!("[handle_client] Execution failed: {:?}", e);
@@ -286,7 +256,7 @@ fn handle_client(
                                 in_explicit_transaction = false;
                             }
                             last_result = None;
-                            break; // Abort processing further statements
+                            break;
                         }
                     }
                 }
@@ -314,7 +284,6 @@ fn handle_client(
                     }
                 }
 
-                // Commit the transaction if it's an implicit one (not a BEGIN block)
                 if in_transaction && !in_explicit_transaction {
                     println!(
                         "[handle_client] Committing implicit transaction with tx_id: {}",
@@ -329,7 +298,6 @@ fn handle_client(
                 send_ready_for_query(&mut stream)?;
             }
             b'X' => {
-                // Terminate
                 println!("[handle_client] Terminate message received. Closing connection.");
                 if in_transaction {
                     tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
@@ -352,7 +320,7 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
         "[run_server] Starting server with db_path: {} and wal_path: {}",
         db_path, wal_path
     );
-    // --- Recovery Phase ---
+
     let mut pager_for_recovery = Pager::open(db_path)?;
     let db_is_new = pager_for_recovery.num_pages == 0;
     let highest_tx_id = WalManager::recover(wal_path, &mut pager_for_recovery)?;
@@ -361,7 +329,6 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
         highest_tx_id
     );
 
-    // --- Initialization after Recovery ---
     let pager = Pager::open(db_path)?;
     let bpm = Arc::new(BufferPoolManager::new(pager));
     let tm = Arc::new(TransactionManager::new(highest_tx_id + 1));
@@ -373,7 +340,7 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
         println!("[INIT] New database detected, initializing system tables.");
         initialize_db(&bpm, &tm, &lm, &wal, &system_catalog)
             .expect("Failed to initialize database");
-        // *** THE CRITICAL FIX ***
+
         println!("[INIT] Flushing all pages to disk after initialization.");
         bpm.flush_all_pages()
             .expect("Failed to flush pages after init");
@@ -412,7 +379,6 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
     Ok(())
 }
 
-/// Initializes the system catalogs for a new database.
 fn initialize_db(
     bpm: &Arc<BufferPoolManager>,
     tm: &Arc<TransactionManager>,
@@ -424,7 +390,6 @@ fn initialize_db(
     let tx_id = tm.begin();
     let snapshot = tm.create_snapshot(tx_id);
 
-    // Create pg_class
     println!("[initialize_db] Creating pg_class table.");
     let create_pg_class = parser::CreateTableStatement {
         table_name: "pg_class".to_string(),
@@ -451,7 +416,6 @@ fn initialize_db(
     )?;
     println!("[initialize_db] pg_class table created.");
 
-    // Create pg_attribute
     println!("[initialize_db] Creating pg_attribute table.");
     let create_pg_attribute = parser::CreateTableStatement {
         table_name: "pg_attribute".to_string(),
@@ -482,42 +446,34 @@ fn initialize_db(
     )?;
     println!("[initialize_db] pg_attribute table created.");
 
-    // Create pg_statistic
     println!("[initialize_db] Creating pg_statistic table.");
     let create_pg_statistic = parser::CreateTableStatement {
         table_name: "pg_statistic".to_string(),
         columns: vec![
-            // Table OID
             parser::ColumnDef {
                 name: "starelid".to_string(),
                 data_type: parser::DataType::Int,
             },
-            // Column number
             parser::ColumnDef {
                 name: "staattnum".to_string(),
                 data_type: parser::DataType::Int,
             },
-            // Number of distinct values
             parser::ColumnDef {
                 name: "stadistinct".to_string(),
                 data_type: parser::DataType::Int,
             },
-            // Kind of statistics
             parser::ColumnDef {
                 name: "stakind".to_string(),
                 data_type: parser::DataType::Int,
             },
-            // Operator used
             parser::ColumnDef {
                 name: "staop".to_string(),
                 data_type: parser::DataType::Int,
             },
-            // Histogram bounds
             parser::ColumnDef {
                 name: "stanumbers".to_string(),
                 data_type: parser::DataType::Text,
             },
-            // Most common values
             parser::ColumnDef {
                 name: "stavalues".to_string(),
                 data_type: parser::DataType::Text,

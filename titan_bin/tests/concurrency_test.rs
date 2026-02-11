@@ -8,7 +8,6 @@ mod common;
 #[test]
 #[serial]
 fn test_concurrent_updates_conflict() {
-    // --- Настройка ---
     let mut test_client = common::setup_server_and_client("concurrency_test");
 
     test_client.simple_query("CREATE TABLE accounts (id INT, balance INT);");
@@ -16,7 +15,6 @@ fn test_concurrent_updates_conflict() {
     test_client.simple_query("COMMIT;");
     println!("[MAIN] Таблица 'accounts' создана и заполнена.");
 
-    // --- Транзакции ---
     let addr_clone1 = test_client._addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Поток запущен.");
@@ -65,7 +63,6 @@ fn test_concurrent_updates_conflict() {
         println!("[TX2] Ожидаемо получили ошибку при обновлении. Откат.");
     });
 
-    // --- Проверка ---
     handle1.join().unwrap();
     handle2.join().unwrap();
 
@@ -84,7 +81,6 @@ fn test_concurrent_updates_conflict() {
 #[test]
 #[serial]
 fn test_deadlock_detection() {
-    // --- Setup ---
     let mut test_client = common::setup_server_and_client("deadlock_test");
 
     test_client.simple_query("CREATE TABLE deadlock_test (id INT);");
@@ -93,7 +89,6 @@ fn test_deadlock_detection() {
     test_client.simple_query("COMMIT;");
     println!("[MAIN] Table 'deadlock_test' created and populated.");
 
-    // --- Transactions ---
     let addr_clone1 = test_client._addr.to_string();
     let handle1 = thread::spawn(move || {
         println!("[TX1] Thread started.");
@@ -101,20 +96,16 @@ fn test_deadlock_detection() {
         client1.simple_query("BEGIN;").unwrap();
         println!("[TX1] Transaction started.");
 
-        // TX1 locks resource 1
         client1
             .simple_query("UPDATE deadlock_test SET id = 10 WHERE id = 1;")
             .unwrap();
         println!("[TX1] Locked resource 1.");
 
-        // Give TX2 time to lock resource 2
         thread::sleep(Duration::from_millis(200));
 
-        // TX1 tries to lock resource 2 (which TX2 holds)
         println!("[TX1] Attempting to lock resource 2...");
         let result = client1.simple_query("UPDATE deadlock_test SET id = 20 WHERE id = 2;");
 
-        // One of the transactions must fail. We check if this one failed.
         if result.is_err() {
             println!("[TX1] Failed as expected due to deadlock.");
             client1.simple_query("ROLLBACK;").unwrap();
@@ -128,23 +119,20 @@ fn test_deadlock_detection() {
     let addr_clone2 = test_client._addr.to_string();
     let handle2 = thread::spawn(move || {
         println!("[TX2] Thread started.");
-        // Give TX1 time to lock resource 1
+
         thread::sleep(Duration::from_millis(100));
 
         let mut client2 = Client::connect(&addr_clone2, NoTls).unwrap();
         client2.simple_query("BEGIN;").unwrap();
         println!("[TX2] Transaction started.");
 
-        // TX2 locks resource 2
         client2
             .simple_query("UPDATE deadlock_test SET id = 20 WHERE id = 2;")
             .unwrap();
         println!("[TX2] Locked resource 2.");
 
-        // Give TX1 time to wait for resource 2
         thread::sleep(Duration::from_millis(200));
 
-        // TX2 tries to lock resource 1 (which TX1 holds)
         println!("[TX2] Attempting to lock resource 1...");
         let result = client2.simple_query("UPDATE deadlock_test SET id = 10 WHERE id = 1;");
 
@@ -158,13 +146,11 @@ fn test_deadlock_detection() {
         result
     });
 
-    // --- Verification ---
     let res1 = handle1.join().unwrap();
     let res2 = handle2.join().unwrap();
 
     println!("[MAIN] Both threads finished.");
-    // Assert that at least one of the transactions failed.
-    // It's non-deterministic which one will be chosen as the victim.
+
     assert!(
         res1.is_err() || res2.is_err(),
         "One of the transactions should have failed due to deadlock"
@@ -175,7 +161,7 @@ fn test_deadlock_detection() {
     );
 
     println!("[MAIN] Verifying final state.");
-    // Check the final state of the table. It should either be the state from TX1 or TX2 committing.
+
     let final_rows = test_client.simple_query("SELECT * FROM deadlock_test;");
     let mut final_state: Vec<String> = final_rows.into_iter().flatten().collect();
     final_state.sort();

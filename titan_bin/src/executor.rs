@@ -1,11 +1,5 @@
-//! The query executor.
-//!
-//! This module is responsible for taking a physical query plan and executing it
-//! against the database. It handles all the details of data retrieval, modification,
-//! and expression evaluation.
-
 use crate::catalog::{
-    update_pg_class_page_id, SystemCatalog, PG_ATTRIBUTE_TABLE_OID, PG_CLASS_TABLE_OID,
+    PG_ATTRIBUTE_TABLE_OID, PG_CLASS_TABLE_OID, SystemCatalog, update_pg_class_page_id,
 };
 use crate::errors::ExecutionError;
 use crate::optimizer::{self, PhysicalPlan};
@@ -21,21 +15,17 @@ use bedrock::lock_manager::{LockManager, LockMode, LockableResource};
 use bedrock::page::INVALID_PAGE_ID;
 use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
-use bedrock::{btree, PageId};
+use bedrock::{PageId, btree};
 use chrono::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-// --- Type Aliases ---
 type Row = Vec<String>;
 
-// --- Executor Trait ---
 pub trait Executor {
     fn next(&mut self) -> Result<Option<Row>, ExecutionError>;
     fn schema(&self) -> &Vec<Column>;
 }
-
-// --- Helper Functions ---
 
 pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, LiteralValue> {
     let mut offset = 0;
@@ -47,7 +37,6 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, L
         }
         match col.type_id {
             16 => {
-                // BOOLEAN
                 if offset + 1 > tuple_data.len() {
                     break;
                 }
@@ -58,7 +47,6 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, L
                 offset += 1;
             }
             23 => {
-                // INT
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
@@ -67,7 +55,6 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, L
                 offset += 4;
             }
             25 => {
-                // TEXT
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
@@ -82,7 +69,6 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &Vec<Column>) -> HashMap<String, L
                 offset += len;
             }
             1082 => {
-                // DATE
                 if offset + 4 > tuple_data.len() {
                     break;
                 }
@@ -192,8 +178,6 @@ fn update_index_root_if_needed(
     Ok(())
 }
 
-// --- Orchestrator ---
-
 pub fn execute(
     stmt: &Statement,
     bpm: &Arc<BufferPoolManager>,
@@ -298,8 +282,6 @@ pub fn execute(
     }
 }
 
-// --- Executor Creation ---
-
 fn create_executor<'a>(
     plan: &'a PhysicalPlan,
     bpm: &'a Arc<BufferPoolManager>,
@@ -328,7 +310,7 @@ fn create_executor<'a>(
                 tx_id,
                 snapshot,
                 select_stmt.for_update,
-                None, // Filter is handled by FilterExecutor
+                None,
             ));
 
             if let Some(predicate) = filter {
@@ -498,9 +480,6 @@ fn create_executor<'a>(
     }
 }
 
-// --- Physical Plan Executors ---
-
-// TableScanExecutor
 struct TableScanExecutor<'a> {
     bpm: &'a Arc<BufferPoolManager>,
     lm: &'a Arc<LockManager>,
@@ -594,7 +573,6 @@ impl<'a> Executor for TableScanExecutor<'a> {
     }
 }
 
-// IndexScanExecutor
 struct IndexScanExecutor<'a> {
     bpm: &'a Arc<BufferPoolManager>,
     schema: Vec<Column>,
@@ -655,7 +633,6 @@ impl<'a> Executor for IndexScanExecutor<'a> {
     }
 }
 
-// FilterExecutor
 struct FilterExecutor<'a> {
     input: Box<dyn Executor + 'a>,
     predicate: Expression,
@@ -687,7 +664,6 @@ impl<'a> Executor for FilterExecutor<'a> {
     }
 }
 
-// ProjectionExecutor
 struct ProjectionExecutor<'a> {
     input: Box<dyn Executor + 'a>,
     expressions: Vec<SelectItem>,
@@ -714,7 +690,7 @@ impl<'a> ProjectionExecutor<'a> {
                     SelectItem::Wildcard => "*".to_string(),
                     SelectItem::QualifiedWildcard(table_name) => format!("{}.*", table_name),
                 };
-                projected_schema.push(Column { name, type_id: 25 }); // Simplified type
+                projected_schema.push(Column { name, type_id: 25 });
             }
         }
         Self {
@@ -749,8 +725,6 @@ impl<'a> Executor for ProjectionExecutor<'a> {
         if self.input.schema().len() == row.len() {
             row_map = row_vec_to_map(&row, self.input.schema(), None);
         } else {
-            // This is a hack for joins. A proper solution would involve executors
-            // passing down table information.
             let left_len = self
                 .input
                 .schema()
@@ -773,7 +747,6 @@ impl<'a> Executor for ProjectionExecutor<'a> {
     }
 }
 
-// NestedLoopJoinExecutor
 struct NestedLoopJoinExecutor<'a> {
     left: Box<dyn Executor + 'a>,
     right: Box<dyn Executor + 'a>,
@@ -818,7 +791,6 @@ impl<'a> NestedLoopJoinExecutor<'a> {
             joined_schema.extend_from_slice(right_schema);
         }
 
-        // Materialize the right side
         let mut right_rows = Vec::new();
         while let Ok(Some(row)) = right.next() {
             right_rows.push(row);
@@ -876,14 +848,12 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
                 }
             }
 
-            // Move to the next left row and reset the right cursor
             self.left_row = self.left.next()?;
             self.right_cursor = 0;
         }
     }
 }
 
-// HashJoinExecutor
 struct HashJoinExecutor<'a> {
     left: Box<dyn Executor + 'a>,
     left_key: Expression,
@@ -927,7 +897,6 @@ impl<'a> HashJoinExecutor<'a> {
             joined_schema.extend_from_slice(right_schema);
         }
 
-        // Build phase
         let mut hash_table: HashMap<LiteralValue, Vec<Row>> = HashMap::new();
         while let Some(row) = right.next()? {
             let row_map = row_vec_to_map(&row, right.schema(), right_table_name.as_deref());
@@ -954,17 +923,15 @@ impl<'a> Executor for HashJoinExecutor<'a> {
 
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
         loop {
-            // If we have matches for the current left row, return one
             if let Some(match_row) = self.current_matches.pop() {
                 let mut joined_row = self.current_left_row.as_ref().unwrap().clone();
                 joined_row.extend(match_row);
                 return Ok(Some(joined_row));
             }
 
-            // Otherwise, get the next left row and find matches
             let left_row = self.left.next()?;
             if left_row.is_none() {
-                return Ok(None); // Left side is exhausted
+                return Ok(None);
             }
             self.current_left_row = left_row;
             let left_row_ref = self.current_left_row.as_ref().unwrap();
@@ -978,7 +945,7 @@ impl<'a> Executor for HashJoinExecutor<'a> {
 
             if let Some(matching_rows) = self.hash_table.get(&key) {
                 self.current_matches = matching_rows.clone();
-                self.current_matches.reverse(); // To pop from the back
+                self.current_matches.reverse();
             } else {
                 self.current_matches.clear();
             }
@@ -986,7 +953,6 @@ impl<'a> Executor for HashJoinExecutor<'a> {
     }
 }
 
-// SortExecutor
 struct SortExecutor<'a> {
     input: Box<dyn Executor + 'a>,
     sorted_rows: Vec<Row>,
@@ -1069,8 +1035,6 @@ impl<'a> Executor for SortExecutor<'a> {
         Ok(Some(row))
     }
 }
-
-// --- DDL ---
 
 fn execute_create_table(
     stmt: &CreateTableStatement,
@@ -1241,8 +1205,6 @@ fn execute_create_index(
     update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, index_oid, root_page_id)?;
     Ok(())
 }
-
-// --- DML ---
 
 fn execute_insert(
     stmt: &InsertStatement,
@@ -1473,7 +1435,6 @@ fn execute_delete(
     Ok(result[0].parse().unwrap())
 }
 
-/// Scans a table and returns a vector of rows, where each row is a map of column name to value.
 pub fn scan_table(
     bpm: &Arc<BufferPoolManager>,
     lm: &Arc<LockManager>,
@@ -1494,8 +1455,6 @@ pub fn scan_table(
         for i in 0..page.get_tuple_count() {
             if page.is_visible(snapshot, tx_id, i) {
                 if for_update {
-                    // Lock the tuple before reading it. This will block if another transaction
-                    // holds an exclusive lock.
                     lm.lock(
                         tx_id,
                         LockableResource::Tuple((current_page_id, i)),
@@ -1531,11 +1490,10 @@ pub fn evaluate_expr_for_row_to_val<'a>(
     match expr {
         Expression::Literal(lit) => Ok(lit.clone()),
         Expression::Column(name) => {
-            // Try direct match first
             if let Some(val) = row.get(name) {
                 return Ok(val.clone());
             }
-            // Try to find an unambiguous qualified match
+
             let mut found: Option<LiteralValue> = None;
             let mut ambiguous = false;
             for (key, val) in row.iter() {
@@ -1625,35 +1583,28 @@ pub fn evaluate_expr_for_row_to_val<'a>(
                 },
             }
         }
-        Expression::WindowFunction { .. } => {
-            // Window functions are handled by WindowFunctionExecutor
-            Err(ExecutionError::GenericError(
-                "Window functions cannot be evaluated in WHERE clause".to_string(),
-            ))
-        }
-        Expression::Function { name, args } => {
-            // Simple function evaluation (limited support for now)
-            match name.to_uppercase().as_str() {
-                "COUNT" => Ok(LiteralValue::Number("1".to_string())),
-                "SUM" | "AVG" | "MIN" | "MAX" => {
-                    if !args.is_empty() {
-                        evaluate_expr_for_row_to_val(&args[0], row)
-                    } else {
-                        Ok(LiteralValue::Null)
-                    }
+        Expression::WindowFunction { .. } => Err(ExecutionError::GenericError(
+            "Window functions cannot be evaluated in WHERE clause".to_string(),
+        )),
+        Expression::Function { name, args } => match name.to_uppercase().as_str() {
+            "COUNT" => Ok(LiteralValue::Number("1".to_string())),
+            "SUM" | "AVG" | "MIN" | "MAX" => {
+                if !args.is_empty() {
+                    evaluate_expr_for_row_to_val(&args[0], row)
+                } else {
+                    Ok(LiteralValue::Null)
                 }
-                _ => Err(ExecutionError::GenericError(format!(
-                    "Unsupported function: {}",
-                    name
-                ))),
             }
-        }
+            _ => Err(ExecutionError::GenericError(format!(
+                "Unsupported function: {}",
+                name
+            ))),
+        },
         Expression::Case {
             operand,
             when_clauses,
             else_clause,
         } => {
-            // CASE expression evaluation
             for (condition, result) in when_clauses {
                 let cond_result = if let Some(op) = operand {
                     let op_val = evaluate_expr_for_row_to_val(op, row)?;
@@ -1677,12 +1628,9 @@ pub fn evaluate_expr_for_row_to_val<'a>(
                 Ok(LiteralValue::Null)
             }
         }
-        Expression::Subquery(_) => {
-            // Subqueries require special handling with executor context
-            Err(ExecutionError::GenericError(
-                "Subqueries are not yet supported in this context".to_string(),
-            ))
-        }
+        Expression::Subquery(_) => Err(ExecutionError::GenericError(
+            "Subqueries are not yet supported in this context".to_string(),
+        )),
     }
 }
 
@@ -1767,8 +1715,6 @@ fn execute_analyze(
     analyze_table_and_update_stats(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
 }
 
-/// Analyzes a table, computes statistics, and updates the system catalog.
-/// This function is a helper for `execute_analyze`.
 fn analyze_table_and_update_stats(
     table_name: &str,
     bpm: &Arc<BufferPoolManager>,
@@ -1782,8 +1728,6 @@ fn analyze_table_and_update_stats(
     const RESERVOIR_SIZE: usize = 1000;
     const MCV_LIST_SIZE: usize = 10;
     const HISTOGRAM_BINS: usize = 100;
-
-    // Invalidate cache at the beginning of ANALYZE to get fresh data.
 
     let (table_oid, first_page_id) = system_catalog
         .lock()
@@ -1803,7 +1747,6 @@ fn analyze_table_and_update_stats(
     let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
     let total_rows = all_rows.len();
 
-    // Pre-fetch pg_statistic info to avoid re-fetching in the loop
     let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) = system_catalog
         .lock()
         .unwrap()
@@ -1811,7 +1754,6 @@ fn analyze_table_and_update_stats(
     {
         info
     } else {
-        // This should not happen in a properly initialized database
         return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
     };
     let pg_stat_schema =
@@ -1820,7 +1762,6 @@ fn analyze_table_and_update_stats(
             .unwrap()
             .get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
 
-    // --- Delete all old statistics for the entire table in one go ---
     let mut current_page_id = pg_stat_first_page_id;
     while current_page_id != bedrock::page::INVALID_PAGE_ID {
         let page_guard = bpm.acquire_page(current_page_id)?;
@@ -1833,7 +1774,6 @@ fn analyze_table_and_update_stats(
                     let parsed = parse_tuple(tuple_data, &pg_stat_schema);
                     if let Some(relid_val) = parsed.get("starelid") {
                         if relid_val.to_string() == table_oid.to_string() {
-                            // Match found, mark as deleted
                             if let Some(item_id_data) = page.get_item_id_data(item_id) {
                                 let offset = item_id_data.offset;
                                 let mut header = page.read_tuple_header(offset);
@@ -1848,13 +1788,9 @@ fn analyze_table_and_update_stats(
                 }
             }
         }
-        if modified {
-            // In a real system, we'd log this change to the WAL.
-        }
+        if modified {}
         current_page_id = page.read_header().next_page_id;
     }
-
-    // Invalidate again after deletion to ensure subsequent inserts see the clean state.
 
     for (i, column) in schema.iter().enumerate() {
         let mut column_values: Vec<LiteralValue> = all_rows
@@ -1862,21 +1798,20 @@ fn analyze_table_and_update_stats(
             .filter_map(|(_, _, parsed_row)| parsed_row.get(&column.name).cloned())
             .collect();
 
-        // --- 1. N_DISTINCT ---
         let n_distinct = column_values
             .iter()
             .collect::<std::collections::HashSet<_>>()
             .len() as i32;
         let mut tuple_data = Vec::new();
-        tuple_data.extend_from_slice(&table_oid.to_be_bytes()); // starelid
-        tuple_data.extend_from_slice(&(i as u32).to_be_bytes()); // staattnum
-        tuple_data.extend_from_slice(&n_distinct.to_be_bytes()); // stadistinct
-        tuple_data.extend_from_slice(&1i32.to_be_bytes()); // stakind = 1 (n_distinct)
-        tuple_data.extend_from_slice(&0i32.to_be_bytes()); // staop
+        tuple_data.extend_from_slice(&table_oid.to_be_bytes());
+        tuple_data.extend_from_slice(&(i as u32).to_be_bytes());
+        tuple_data.extend_from_slice(&n_distinct.to_be_bytes());
+        tuple_data.extend_from_slice(&1i32.to_be_bytes());
+        tuple_data.extend_from_slice(&0i32.to_be_bytes());
         let empty_text = "";
-        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes()); // stanumbers
+        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
         tuple_data.extend_from_slice(empty_text.as_bytes());
-        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes()); // stavalues
+        tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
         tuple_data.extend_from_slice(empty_text.as_bytes());
         insert_tuple_into_system_table(
             &tuple_data,
@@ -1893,7 +1828,6 @@ fn analyze_table_and_update_stats(
             continue;
         }
 
-        // --- Reservoir Sampling ---
         let mut reservoir = Vec::with_capacity(RESERVOIR_SIZE);
         let mut rng = thread_rng();
         for (idx, val) in column_values.iter().enumerate() {
@@ -1907,7 +1841,6 @@ fn analyze_table_and_update_stats(
             }
         }
 
-        // --- 2. MCV (Most Common Values) ---
         let mut counts = HashMap::new();
         for val in &reservoir {
             *counts.entry(val).or_insert(0) += 1;
@@ -1925,9 +1858,9 @@ fn analyze_table_and_update_stats(
             let mut tuple_data = Vec::new();
             tuple_data.extend_from_slice(&table_oid.to_be_bytes());
             tuple_data.extend_from_slice(&(i as u32).to_be_bytes());
-            tuple_data.extend_from_slice(&0i32.to_be_bytes()); // stadistinct
-            tuple_data.extend_from_slice(&2i32.to_be_bytes()); // stakind = 2 (mcv)
-            tuple_data.extend_from_slice(&0i32.to_be_bytes()); // staop
+            tuple_data.extend_from_slice(&0i32.to_be_bytes());
+            tuple_data.extend_from_slice(&2i32.to_be_bytes());
+            tuple_data.extend_from_slice(&0i32.to_be_bytes());
             tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
             tuple_data.extend_from_slice(empty_text.as_bytes());
             tuple_data.extend_from_slice(&(mcv_str.len() as u32).to_be_bytes());
@@ -1944,7 +1877,6 @@ fn analyze_table_and_update_stats(
             )?;
         }
 
-        // --- 3. HISTOGRAM ---
         column_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut histogram_bounds = Vec::new();
         if column_values.len() > 1 {
@@ -1964,7 +1896,7 @@ fn analyze_table_and_update_stats(
             tuple_data.extend_from_slice(&table_oid.to_be_bytes());
             tuple_data.extend_from_slice(&(i as u32).to_be_bytes());
             tuple_data.extend_from_slice(&0i32.to_be_bytes());
-            tuple_data.extend_from_slice(&3i32.to_be_bytes()); // stakind = 3 (histogram)
+            tuple_data.extend_from_slice(&3i32.to_be_bytes());
             tuple_data.extend_from_slice(&0i32.to_be_bytes());
             tuple_data.extend_from_slice(&(hist_str.len() as u32).to_be_bytes());
             tuple_data.extend_from_slice(hist_str.as_bytes());
@@ -1986,8 +1918,6 @@ fn analyze_table_and_update_stats(
     Ok(())
 }
 
-/// A generic helper to insert a raw tuple into a system catalog.
-/// This avoids the overhead of the full `execute_insert` path.
 fn insert_tuple_into_system_table(
     tuple_data: &[u8],
     table_name: &str,
@@ -2061,7 +1991,7 @@ impl<'a> DeleteExecutor<'a> {
 
         let output_schema = vec![Column {
             name: "rows_deleted".to_string(),
-            type_id: 23, // INT
+            type_id: 23,
         }];
 
         Ok(Self {
@@ -2117,7 +2047,6 @@ impl<'a> Executor for DeleteExecutor<'a> {
                     if self.stmt.where_clause.as_ref().map_or(true, |p| {
                         evaluate_expr_for_row(p, &parsed_row).unwrap_or(false)
                     }) {
-                        // Lock and delete
                         self.lm.lock(
                             self.tx_id,
                             LockableResource::Tuple((self.current_page_id, item_id)),
@@ -2135,7 +2064,6 @@ impl<'a> Executor for DeleteExecutor<'a> {
                             self.rows_affected += 1;
                             let after_page = page.data.to_vec();
 
-                            // WAL
                             let prev_lsn = self.tm.get_last_lsn(self.tx_id).unwrap_or(0);
                             let lsn = self.wm.lock().unwrap().log(
                                 self.tx_id,
@@ -2185,8 +2113,6 @@ impl<'a> Executor for DeleteExecutor<'a> {
     }
 }
 
-// --- DML Helper Functions ---
-
 fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionError> {
     let mut tuple_data = Vec::new();
     for value in values {
@@ -2207,13 +2133,12 @@ fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionErro
                 tuple_data.extend_from_slice(&days.to_be_bytes());
             }
             Expression::Literal(LiteralValue::Null) => {
-                // For NULL values, write 4 zero bytes
                 tuple_data.extend_from_slice(&0i32.to_be_bytes());
             }
             _ => {
                 return Err(ExecutionError::GenericError(
                     "Unsupported expression type for insert".to_string(),
-                ))
+                ));
             }
         }
     }
@@ -2244,7 +2169,6 @@ fn serialize_literal_map(
                     new_data.extend_from_slice(&days.to_be_bytes());
                 }
                 LiteralValue::Null => {
-                    // For NULL values, write a special marker
                     new_data.extend_from_slice(&0i32.to_be_bytes());
                 }
             }
