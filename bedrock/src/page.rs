@@ -195,7 +195,10 @@ impl Page {
         current_tx_id: TransactionId,
         item_id: u16,
     ) -> bool {
-        let header = self.read_tuple_header(self.get_item_id_data(item_id).unwrap().offset);
+        let Some(item_id_data) = self.get_item_id_data(item_id) else {
+            return false;
+        };
+        let header = self.read_tuple_header(item_id_data.offset);
 
         if header.xmin == current_tx_id {
             return header.xmax == 0;

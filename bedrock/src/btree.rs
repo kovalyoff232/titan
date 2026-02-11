@@ -4,7 +4,7 @@ use crate::wal::{WalManager, WalRecord};
 use crate::{Page, PageId, TupleId};
 use std::io;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type Key = i32;
 
@@ -14,6 +14,10 @@ const INTERNAL_CELL_SIZE: usize = size_of::<InternalCell>();
 const LEAF_MAX_CELLS: usize = (crate::PAGE_SIZE - B_TREE_PAGE_HEADER_SIZE) / LEAF_CELL_SIZE;
 const INTERNAL_MAX_CELLS: usize =
     (crate::PAGE_SIZE - B_TREE_PAGE_HEADER_SIZE - size_of::<PageId>()) / INTERNAL_CELL_SIZE;
+
+fn lock_wal<'a>(wm: &'a Arc<Mutex<WalManager>>) -> io::Result<MutexGuard<'a, WalManager>> {
+    wm.lock().map_err(|_| io::Error::other("wal lock poisoned"))
+}
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u8)]
@@ -160,12 +164,14 @@ pub fn btree_insert(
         btree_insert_recursive(bpm, tm, wm, tx_id, root_page_id, key, tuple_id)?;
 
     if let Some(median_key) = median_key {
+        let right_child_page_id = new_page_id
+            .ok_or_else(|| io::Error::other("btree insert split did not return new page id"))?;
         let new_root_page_guard = bpm.new_page()?;
         let new_root_page_id = new_root_page_guard.read().id;
         {
             let mut new_root_page = new_root_page_guard.write();
             new_root_page.as_btree_internal_page();
-            *new_root_page.right_child_mut() = new_page_id.unwrap();
+            *new_root_page.right_child_mut() = right_child_page_id;
             *new_root_page.internal_cell_mut(0) = InternalCell {
                 key: median_key,
                 page_id: root_page_id,
@@ -235,8 +241,11 @@ fn btree_insert_recursive(
             };
 
             if let Some(median_key) = child_median_key {
+                let child_new_page_id = child_new_page_id.ok_or_else(|| {
+                    io::Error::other("btree child split did not return new page id")
+                })?;
                 let mut page = page_guard.write();
-                internal_insert(&mut page, median_key, child_new_page_id.unwrap());
+                internal_insert(&mut page, median_key, child_new_page_id);
 
                 if page.btree_header().num_cells as usize > INTERNAL_MAX_CELLS {
                     let new_page_guard = bpm.new_page()?;
@@ -613,7 +622,7 @@ fn log_btree_page(
     page: &Page,
 ) -> io::Result<()> {
     let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-    let lsn = wm.lock().unwrap().log(
+    let lsn = lock_wal(wm)?.log(
         tx_id,
         prev_lsn,
         &WalRecord::BTreePage {
