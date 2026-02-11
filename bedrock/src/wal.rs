@@ -146,7 +146,12 @@ impl WalManager {
     }
 
     pub fn log(&mut self, tx_id: u32, prev_lsn: Lsn, record: &WalRecord) -> io::Result<Lsn> {
-        let record_bytes = bincode::serialize(record).unwrap();
+        let record_bytes = bincode::serialize(record).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WAL record serialize failed: {e}"),
+            )
+        })?;
 
         let header_len = std::mem::size_of::<WalRecordHeader>() as u32;
         let total_len = header_len + record_bytes.len() as u32;
@@ -502,7 +507,7 @@ impl Drop for WalManager {
     fn drop(&mut self) {
         self.stop_sync_thread.store(true, Ordering::SeqCst);
         if let Some(handle) = self.sync_thread_handle.take() {
-            handle.join().unwrap();
+            let _ = handle.join();
         }
 
         if let Ok(file) = self.file.lock() {
