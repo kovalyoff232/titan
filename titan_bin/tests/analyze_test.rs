@@ -43,3 +43,28 @@ fn test_analyze_calculates_distinct_values() {
         "Incorrect distinct count for 'category'"
     );
 }
+
+#[test]
+#[serial]
+fn test_analyze_persists_total_row_count_statistic() {
+    let mut client = common::setup_server_and_client("analyze_total_rows_test");
+
+    client.simple_query("CREATE TABLE test_rows (id INT, name TEXT);");
+    client.simple_query("INSERT INTO test_rows VALUES (1, 'a');");
+    client.simple_query("INSERT INTO test_rows VALUES (2, 'b');");
+    client.simple_query("INSERT INTO test_rows VALUES (3, 'c');");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("ANALYZE test_rows;");
+    client.simple_query("COMMIT;");
+
+    let stats =
+        client.simple_query("SELECT stakind, stadistinct FROM pg_statistic WHERE stakind = 0;");
+    assert_eq!(
+        stats.len(),
+        1,
+        "Should persist one table-level row-count stat"
+    );
+    assert_eq!(stats[0][0], "0");
+    assert_eq!(stats[0][1], "3");
+}

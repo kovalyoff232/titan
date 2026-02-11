@@ -170,6 +170,29 @@ fn analyze_table_and_update_stats(
         current_page_id = page.read_header().next_page_id;
     }
 
+    let empty_text = "";
+    let mut row_count_tuple = Vec::new();
+    row_count_tuple.extend_from_slice(&table_oid.to_be_bytes());
+    row_count_tuple.extend_from_slice(&0i32.to_be_bytes());
+    let total_rows_i32 = i32::try_from(total_rows).unwrap_or(i32::MAX);
+    row_count_tuple.extend_from_slice(&total_rows_i32.to_be_bytes());
+    row_count_tuple.extend_from_slice(&0i32.to_be_bytes());
+    row_count_tuple.extend_from_slice(&0i32.to_be_bytes());
+    row_count_tuple.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
+    row_count_tuple.extend_from_slice(empty_text.as_bytes());
+    row_count_tuple.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
+    row_count_tuple.extend_from_slice(empty_text.as_bytes());
+    insert_tuple_into_system_table(
+        &row_count_tuple,
+        "pg_statistic",
+        bpm,
+        tm,
+        wm,
+        tx_id,
+        snapshot,
+        system_catalog,
+    )?;
+
     for (i, column) in schema.iter().enumerate() {
         let mut column_values: Vec<LiteralValue> = all_rows
             .iter()
@@ -186,7 +209,6 @@ fn analyze_table_and_update_stats(
         tuple_data.extend_from_slice(&n_distinct.to_be_bytes());
         tuple_data.extend_from_slice(&1i32.to_be_bytes());
         tuple_data.extend_from_slice(&0i32.to_be_bytes());
-        let empty_text = "";
         tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
         tuple_data.extend_from_slice(empty_text.as_bytes());
         tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());

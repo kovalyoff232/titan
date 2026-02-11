@@ -93,15 +93,22 @@ pub(super) fn load_statistics_for_table(
                             .and_then(|v| v.to_string().parse::<i32>().ok())
                             .unwrap_or(0);
 
-                        let col_stats = table_stats.column_stats.entry(attnum).or_default();
-
                         match kind {
+                            0 => {
+                                if let Some(LiteralValue::Number(n)) = parsed.get("stadistinct") {
+                                    if let Ok(total_rows) = n.parse::<f64>() {
+                                        table_stats.total_rows = total_rows.max(0.0);
+                                    }
+                                }
+                            }
                             1 => {
+                                let col_stats = table_stats.column_stats.entry(attnum).or_default();
                                 if let Some(LiteralValue::Number(n)) = parsed.get("stadistinct") {
                                     col_stats.n_distinct = n.parse().unwrap_or(0.0);
                                 }
                             }
                             2 => {
+                                let col_stats = table_stats.column_stats.entry(attnum).or_default();
                                 if let Some(LiteralValue::String(s)) = parsed.get("stavalues") {
                                     col_stats.most_common_vals = s
                                         .split(',')
@@ -110,6 +117,7 @@ pub(super) fn load_statistics_for_table(
                                 }
                             }
                             3 => {
+                                let col_stats = table_stats.column_stats.entry(attnum).or_default();
                                 if let Some(LiteralValue::String(s)) = parsed.get("stanumbers") {
                                     col_stats.histogram_bounds = s
                                         .split(',')
