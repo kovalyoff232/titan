@@ -246,3 +246,69 @@ impl LockManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LockError, LockManager, LockMode, LockableResource};
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn shared_locks_are_compatible() {
+        let lm = LockManager::new();
+        let resource = LockableResource::Table(7);
+
+        assert!(lm.lock(1, resource, LockMode::Shared).is_ok());
+        assert!(lm.lock(2, resource, LockMode::Shared).is_ok());
+
+        lm.unlock_all(1);
+        lm.unlock_all(2);
+    }
+
+    #[test]
+    fn deadlock_is_detected_for_two_transactions() {
+        let lm = Arc::new(LockManager::new());
+        let a = LockableResource::Table(11);
+        let b = LockableResource::Table(12);
+
+        lm.lock(1, a, LockMode::Exclusive).unwrap();
+        lm.lock(2, b, LockMode::Exclusive).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+
+        let lm_t1 = Arc::clone(&lm);
+        let tx_t1 = tx.clone();
+        let h1 = thread::spawn(move || {
+            let result = lm_t1.lock(1, b, LockMode::Exclusive);
+            if result.is_err() {
+                lm_t1.unlock_all(1);
+            }
+            tx_t1.send(("t1", result)).unwrap();
+        });
+
+        let lm_t2 = Arc::clone(&lm);
+        let tx_t2 = tx.clone();
+        let h2 = thread::spawn(move || {
+            let result = lm_t2.lock(2, a, LockMode::Exclusive);
+            lm_t2.unlock_all(2);
+            tx_t2.send(("t2", result)).unwrap();
+        });
+
+        let r1 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let r2 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let mut deadlock_count = 0;
+        for (_, res) in [r1, r2] {
+            if matches!(res, Err(LockError::Deadlock)) {
+                deadlock_count += 1;
+            }
+        }
+
+        assert!(deadlock_count >= 1);
+    }
+}
