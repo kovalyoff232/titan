@@ -55,8 +55,16 @@ jobs:
           -Rows 200 `
           -Iterations 10 `
           -Warmup 2 `
+          -OutJson target/benchmarks/smoke-ci.json `
           -BuildTimeoutSec 360 `
           -RunTimeoutSec 360
+
+    - name: Benchmark threshold gate
+      timeout-minutes: 3
+      run: |
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-benchmark-thresholds.ps1 `
+          -ReportJson target/benchmarks/smoke-ci.json `
+          -ThresholdJson scripts/benchmark-thresholds.titan.smoke.json
 
     - name: Run tests (per-target timeout)
       timeout-minutes: 25
@@ -75,3 +83,13 @@ jobs:
         path: |
           target/reports/recovery-reconciliation.json
           titan_bin/target/reports/recovery-reconciliation.json
+
+    - name: Upload benchmark smoke artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-smoke
+        if-no-files-found: warn
+        path: |
+          target/benchmarks/smoke-ci.json
+          target/benchmarks/smoke-ci.csv

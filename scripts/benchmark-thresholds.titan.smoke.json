@@ -1,0 +1,22 @@
+{
+  "engine": "titan",
+  "workload": "read_focused_smoke",
+  "limits": {
+    "point_lookup": {
+      "max_p95_ms": 15.0,
+      "max_mean_ms": 10.0
+    },
+    "range_scan": {
+      "max_p95_ms": 50.0,
+      "max_mean_ms": 40.0
+    },
+    "ordered_scan": {
+      "max_p95_ms": 60.0,
+      "max_mean_ms": 45.0
+    },
+    "full_scan": {
+      "max_p95_ms": 60.0,
+      "max_mean_ms": 45.0
+    }
+  }
+}
