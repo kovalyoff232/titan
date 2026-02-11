@@ -21,7 +21,7 @@ mod join;
 mod maintenance;
 mod pipeline;
 mod scan;
-use ddl::{execute_create_index, execute_create_table};
+use ddl::{DdlCtx, execute_create_index, execute_create_table};
 use dml::{execute_delete, execute_insert, execute_update};
 pub(crate) use eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 pub use helpers::parse_tuple;
@@ -77,17 +77,18 @@ pub fn execute(
         Statement::CreateTable(create_stmt) => {
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
         }
-        Statement::CreateIndex(create_stmt) => execute_create_index(
-            create_stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-        )
-        .map(|_| ExecuteResult::Ddl),
+        Statement::CreateIndex(create_stmt) => {
+            let ctx = DdlCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_create_index(create_stmt, &ctx).map(|_| ExecuteResult::Ddl)
+        }
         Statement::Insert(insert_stmt) => execute_insert(
             insert_stmt,
             bpm,

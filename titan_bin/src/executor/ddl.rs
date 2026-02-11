@@ -12,6 +12,16 @@ use bedrock::transaction::{Snapshot, TransactionManager};
 use bedrock::wal::{WalManager, WalRecord};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(super) struct DdlCtx<'a> {
+    pub(super) bpm: &'a Arc<BufferPoolManager>,
+    pub(super) tm: &'a Arc<TransactionManager>,
+    pub(super) lm: &'a Arc<LockManager>,
+    pub(super) wm: &'a Arc<Mutex<WalManager>>,
+    pub(super) tx_id: u32,
+    pub(super) snapshot: &'a Snapshot,
+    pub(super) system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+}
+
 fn lock_system_catalog<'a>(
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
 ) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
@@ -115,32 +125,26 @@ pub(super) fn execute_create_table(
 
 pub(super) fn execute_create_index(
     stmt: &CreateIndexStatement,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &DdlCtx<'_>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, table_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, table_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(&stmt.table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-    lm.lock(
-        tx_id,
+    ctx.lm.lock(
+        ctx.tx_id,
         LockableResource::Table(table_oid),
         LockMode::Exclusive,
     )?;
 
-    let root_page_guard = bpm.new_page()?;
+    let root_page_guard = ctx.bpm.new_page()?;
     let mut root_page_id = root_page_guard.read().id;
     root_page_guard.write().as_btree_leaf_page();
     drop(root_page_guard);
 
-    let index_oid = tm.get_next_oid();
+    let index_oid = ctx.tm.get_next_oid();
     {
-        let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
+        let page_guard = ctx.bpm.acquire_page(PG_CLASS_TABLE_OID)?;
         let mut page = page_guard.write();
         let mut tuple_data = Vec::new();
         tuple_data.extend_from_slice(&index_oid.to_be_bytes());
@@ -148,40 +152,52 @@ pub(super) fn execute_create_index(
         tuple_data.push(stmt.index_name.len() as u8);
         tuple_data.extend_from_slice(stmt.index_name.as_bytes());
         let before_page = page.data.to_vec();
-        let item_id = page.add_tuple(&tuple_data, tx_id, 0).ok_or_else(|| {
+        let item_id = page.add_tuple(&tuple_data, ctx.tx_id, 0).ok_or_else(|| {
             ExecutionError::GenericError("Failed to insert index entry into pg_class".to_string())
         })?;
         let after_page = page.data.to_vec();
-        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = lock_wal(wm)?.log(
-            tx_id,
+        let prev_lsn = ctx.tm.get_last_lsn(ctx.tx_id).unwrap_or(0);
+        let lsn = lock_wal(ctx.wm)?.log(
+            ctx.tx_id,
             prev_lsn,
             &WalRecord::InsertTuple {
-                tx_id,
+                tx_id: ctx.tx_id,
                 page_id: PG_CLASS_TABLE_OID,
                 item_id,
                 before_page,
                 after_page,
             },
         )?;
-        tm.set_last_lsn(tx_id, lsn);
+        ctx.tm.set_last_lsn(ctx.tx_id, lsn);
         let mut header = page.read_header();
         header.lsn = lsn;
         page.write_header(&header);
     }
 
     if table_page_id != INVALID_PAGE_ID {
-        let schema = lock_system_catalog(system_catalog)?
-            .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-        let rows_with_ids = scan_table(bpm, lm, table_page_id, &schema, tx_id, snapshot, false)?;
+        let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+            ctx.bpm,
+            table_oid,
+            ctx.tx_id,
+            ctx.snapshot,
+        )?;
+        let rows_with_ids = scan_table(
+            ctx.bpm,
+            ctx.lm,
+            table_page_id,
+            &schema,
+            ctx.tx_id,
+            ctx.snapshot,
+            false,
+        )?;
         for (page_id, item_id, parsed_tuple) in rows_with_ids {
             if let Some(LiteralValue::Number(key_str)) = parsed_tuple.get(&stmt.column_name) {
                 if let Ok(key) = key_str.parse::<i32>() {
                     root_page_id = btree::btree_insert(
-                        bpm,
-                        tm,
-                        wm,
-                        tx_id,
+                        ctx.bpm,
+                        ctx.tm,
+                        ctx.wm,
+                        ctx.tx_id,
                         root_page_id,
                         key,
                         (page_id, item_id),
@@ -191,6 +207,14 @@ pub(super) fn execute_create_index(
         }
     }
 
-    update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, index_oid, root_page_id)?;
+    update_pg_class_page_id(
+        ctx.bpm,
+        ctx.tm,
+        ctx.wm,
+        ctx.tx_id,
+        ctx.snapshot,
+        index_oid,
+        root_page_id,
+    )?;
     Ok(())
 }
