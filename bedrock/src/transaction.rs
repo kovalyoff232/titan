@@ -5,7 +5,7 @@ use crate::wal::{Lsn, WalManager, WalRecord};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -53,6 +53,12 @@ pub struct TransactionManager {
     state: Arc<TransactionManagerState>,
 }
 
+fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl TransactionManager {
     pub fn new(initial_tx_id: TransactionId) -> Self {
         println!(
@@ -78,7 +84,7 @@ impl TransactionManager {
     }
 
     fn set_status(&self, tx_id: TransactionId, status: TransactionStatus) {
-        self.state.tx_statuses.lock().unwrap().insert(tx_id, status);
+        lock_mutex_recover(&self.state.tx_statuses).insert(tx_id, status);
     }
 
     fn transition_status(
@@ -87,7 +93,7 @@ impl TransactionManager {
         allowed: &[TransactionStatus],
         next: TransactionStatus,
     ) -> io::Result<()> {
-        let mut statuses = self.state.tx_statuses.lock().unwrap();
+        let mut statuses = lock_mutex_recover(&self.state.tx_statuses);
         let Some(current) = statuses.get(&tx_id).copied() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,17 +120,17 @@ impl TransactionManager {
             .state
             .next_transaction_id
             .fetch_add(1, Ordering::SeqCst);
-        self.state.active_transactions.lock().unwrap().insert(tx_id);
-        self.state.last_lsns.lock().unwrap().insert(tx_id, 0);
+        lock_mutex_recover(&self.state.active_transactions).insert(tx_id);
+        lock_mutex_recover(&self.state.last_lsns).insert(tx_id, 0);
         self.state
             .tx_statuses
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(tx_id, TransactionStatus::Active);
         println!(
             "[TM::begin] Started tx_id: {}. Active transactions: {:?}",
             tx_id,
-            self.state.active_transactions.lock().unwrap()
+            lock_mutex_recover(&self.state.active_transactions)
         );
         tx_id
     }
@@ -133,14 +139,14 @@ impl TransactionManager {
         self.state
             .active_transactions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&tx_id);
-        self.state.last_lsns.lock().unwrap().remove(&tx_id);
-        self.state.tx_statuses.lock().unwrap().remove(&tx_id);
+        lock_mutex_recover(&self.state.last_lsns).remove(&tx_id);
+        lock_mutex_recover(&self.state.tx_statuses).remove(&tx_id);
         println!(
             "[TM::commit] Committed tx_id: {}. Active transactions: {:?}",
             tx_id,
-            self.state.active_transactions.lock().unwrap()
+            lock_mutex_recover(&self.state.active_transactions)
         );
     }
 
@@ -195,18 +201,20 @@ impl TransactionManager {
     }
 
     pub fn get_last_lsn(&self, tx_id: TransactionId) -> Option<Lsn> {
-        self.state.last_lsns.lock().unwrap().get(&tx_id).cloned()
+        lock_mutex_recover(&self.state.last_lsns)
+            .get(&tx_id)
+            .cloned()
     }
 
     pub fn set_last_lsn(&self, tx_id: TransactionId, lsn: Lsn) {
-        self.state.last_lsns.lock().unwrap().insert(tx_id, lsn);
+        lock_mutex_recover(&self.state.last_lsns).insert(tx_id, lsn);
     }
 
     pub fn is_active(&self, tx_id: TransactionId) -> bool {
         self.state
             .active_transactions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(&tx_id)
     }
 
@@ -312,21 +320,21 @@ impl TransactionManager {
         self.state
             .active_transactions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&tx_id);
-        self.state.last_lsns.lock().unwrap().remove(&tx_id);
-        self.state.tx_statuses.lock().unwrap().remove(&tx_id);
+        lock_mutex_recover(&self.state.last_lsns).remove(&tx_id);
+        lock_mutex_recover(&self.state.tx_statuses).remove(&tx_id);
 
         println!(
             "[TM::abort] Finished abort for tx_id: {}. Active transactions: {:?}",
             tx_id,
-            self.state.active_transactions.lock().unwrap()
+            lock_mutex_recover(&self.state.active_transactions)
         );
         Ok(())
     }
 
     pub fn create_snapshot(&self, _current_tx_id: TransactionId) -> Snapshot {
-        let active_txns = self.state.active_transactions.lock().unwrap();
+        let active_txns = lock_mutex_recover(&self.state.active_transactions);
 
         let xmin = active_txns
             .iter()
