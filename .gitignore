@@ -18,6 +18,9 @@ log.txt
 # Environment variables
 .env
 
-
-IMPROVEMENTS.md
-STATUS.md
+# Markdown (keep only README in repo)
+*.md
+!README.md
+!**/README.md
+!readme.md
+!**/readme.md
