@@ -122,6 +122,7 @@ impl WalManager {
             .read(true)
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&path_buf)?;
 
         let file_len = file.metadata()?.len();

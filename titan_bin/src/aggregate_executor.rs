@@ -19,7 +19,7 @@ pub struct HashAggregateExecutor<'a> {
     materialized: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AggregateState {
     states: Vec<SingleAggregateState>,
 }
@@ -42,12 +42,6 @@ impl Default for SingleAggregateState {
             max: None,
             values: Vec::new(),
         }
-    }
-}
-
-impl Default for AggregateState {
-    fn default() -> Self {
-        Self { states: Vec::new() }
     }
 }
 

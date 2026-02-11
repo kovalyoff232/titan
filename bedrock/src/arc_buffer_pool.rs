@@ -318,7 +318,7 @@ impl ArcBufferPoolManager {
         if let Some(_old_page_id) = meta.page_id {
             if meta.is_dirty {
                 let frame = self.frames[frame_idx].read();
-                lock_mutex_recover(&self.pager).write_page(&*frame)?;
+                lock_mutex_recover(&self.pager).write_page(&frame)?;
                 meta.is_dirty = false;
             }
         }
@@ -339,7 +339,7 @@ impl ArcBufferPoolManager {
             let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
             if meta.is_dirty {
                 let frame = self.frames[frame_idx].read();
-                lock_mutex_recover(&self.pager).write_page(&*frame)?;
+                lock_mutex_recover(&self.pager).write_page(&frame)?;
                 meta.is_dirty = false;
             }
         }
@@ -352,7 +352,7 @@ impl ArcBufferPoolManager {
             if meta.is_dirty {
                 if let Some(_page_id) = meta.page_id {
                     let frame = self.frames[idx].read();
-                    lock_mutex_recover(&self.pager).write_page(&*frame)?;
+                    lock_mutex_recover(&self.pager).write_page(&frame)?;
                     meta.is_dirty = false;
                 }
             }
