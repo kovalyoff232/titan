@@ -18,6 +18,24 @@ use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(super) struct DmlCtx<'a> {
+    pub(super) bpm: &'a Arc<BufferPoolManager>,
+    pub(super) tm: &'a Arc<TransactionManager>,
+    pub(super) lm: &'a Arc<LockManager>,
+    pub(super) wm: &'a Arc<Mutex<WalManager>>,
+    pub(super) tx_id: u32,
+    pub(super) snapshot: &'a Snapshot,
+    pub(super) system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+}
+
+pub(super) struct InsertPathCtx<'a> {
+    pub(super) bpm: &'a Arc<BufferPoolManager>,
+    pub(super) tm: &'a Arc<TransactionManager>,
+    pub(super) wm: &'a Arc<Mutex<WalManager>>,
+    pub(super) tx_id: u32,
+    pub(super) snapshot: &'a Snapshot,
+}
+
 fn lock_system_catalog<'a>(
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
 ) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
@@ -46,65 +64,57 @@ fn epoch_date() -> Result<NaiveDate, ExecutionError> {
 
 pub(super) fn execute_insert(
     stmt: &InsertStatement,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &DmlCtx<'_>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, mut first_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, mut first_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(&stmt.table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
+    ctx.lm.lock(
+        ctx.tx_id,
+        LockableResource::Table(table_oid),
+        LockMode::Shared,
+    )?;
 
     let tuple_data = serialize_expressions(&stmt.values)?;
 
-    insert_tuple_and_update_indexes(
-        bpm,
-        tm,
-        wm,
-        tx_id,
-        snapshot,
-        system_catalog,
-        table_oid,
-        &mut first_page_id,
-        &tuple_data,
-    )?;
+    insert_tuple_and_update_indexes(ctx, table_oid, &mut first_page_id, &tuple_data)?;
 
     Ok(1)
 }
 
 fn insert_tuple_and_update_indexes(
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &DmlCtx<'_>,
     table_oid: u32,
     first_page_id: &mut PageId,
     tuple_data: &[u8],
 ) -> Result<(), ExecutionError> {
-    let page_id = find_or_create_page_for_insert(
-        bpm,
-        tm,
-        wm,
-        tx_id,
-        snapshot,
+    let insert_ctx = InsertPathCtx {
+        bpm: ctx.bpm,
+        tm: ctx.tm,
+        wm: ctx.wm,
+        tx_id: ctx.tx_id,
+        snapshot: ctx.snapshot,
+    };
+    let page_id =
+        find_or_create_page_for_insert(&insert_ctx, table_oid, first_page_id, tuple_data.len())?;
+
+    let item_id = insert_tuple_and_log(ctx.bpm, ctx.tm, ctx.wm, ctx.tx_id, page_id, tuple_data)?;
+
+    let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+        ctx.bpm,
         table_oid,
-        first_page_id,
-        tuple_data.len(),
+        ctx.tx_id,
+        ctx.snapshot,
     )?;
-
-    let item_id = insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)?;
-
-    let schema =
-        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
     let parsed_tuple = parse_tuple(tuple_data, &schema);
-    let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
+    let mut indexes = load_convention_int_indexes(
+        ctx.bpm,
+        ctx.tx_id,
+        ctx.snapshot,
+        ctx.system_catalog,
+        &schema,
+    )?;
 
     for index in &mut indexes {
         let Some(key) = extract_i32_key(&parsed_tuple, &index.column_name) else {
@@ -112,15 +122,23 @@ fn insert_tuple_and_update_indexes(
         };
 
         let new_root_page_id = btree::btree_insert(
-            bpm,
-            tm,
-            wm,
-            tx_id,
+            ctx.bpm,
+            ctx.tm,
+            ctx.wm,
+            ctx.tx_id,
             index.root_page_id,
             key,
             (page_id, item_id),
         )?;
-        update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+        update_index_root_if_needed(
+            ctx.bpm,
+            ctx.tm,
+            ctx.wm,
+            ctx.tx_id,
+            ctx.snapshot,
+            index,
+            new_root_page_id,
+        )?;
     }
 
     Ok(())
@@ -128,26 +146,38 @@ fn insert_tuple_and_update_indexes(
 
 pub(super) fn execute_update(
     stmt: &UpdateStatement,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &DmlCtx<'_>,
 ) -> Result<u32, ExecutionError> {
-    let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    let (table_oid, first_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(&stmt.table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(0);
     }
 
-    let schema =
-        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
+    let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+        ctx.bpm,
+        table_oid,
+        ctx.tx_id,
+        ctx.snapshot,
+    )?;
+    let mut indexes = load_convention_int_indexes(
+        ctx.bpm,
+        ctx.tx_id,
+        ctx.snapshot,
+        ctx.system_catalog,
+        &schema,
+    )?;
     let mut rows_affected = 0;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let all_rows = scan_table(
+        ctx.bpm,
+        ctx.lm,
+        first_page_id,
+        &schema,
+        ctx.tx_id,
+        ctx.snapshot,
+        false,
+    )?;
     let mut rows_to_update = Vec::new();
     for row_entry in all_rows {
         let should_update = if let Some(predicate) = &stmt.where_clause {
@@ -161,20 +191,20 @@ pub(super) fn execute_update(
     }
 
     for (page_id, item_id, old_parsed) in rows_to_update {
-        lm.lock(
-            tx_id,
+        ctx.lm.lock(
+            ctx.tx_id,
             LockableResource::Tuple((page_id, item_id)),
             LockMode::Exclusive,
         )?;
-        let page_guard = bpm.acquire_page(page_id)?;
+        let page_guard = ctx.bpm.acquire_page(page_id)?;
         let mut page = page_guard.write();
-        if !page.is_visible(snapshot, tx_id, item_id)
+        if !page.is_visible(ctx.snapshot, ctx.tx_id, item_id)
             || page
                 .get_item_id_data(item_id)
                 .map(|d| page.read_tuple_header(d.offset).xmax != 0)
                 .unwrap_or(true)
         {
-            lm.unlock_all(tx_id);
+            ctx.lm.unlock_all(ctx.tx_id);
             return Err(ExecutionError::SerializationFailure);
         }
 
@@ -193,32 +223,32 @@ pub(super) fn execute_update(
             ExecutionError::GenericError("missing item metadata for visible tuple".to_string())
         })?;
         let mut header = page.read_tuple_header(item_id_data.offset);
-        header.xmax = tx_id;
+        header.xmax = ctx.tx_id;
         page.write_tuple_header(item_id_data.offset, &header);
 
-        let Some(new_item_id) = page.add_tuple(&new_data, tx_id, 0) else {
+        let Some(new_item_id) = page.add_tuple(&new_data, ctx.tx_id, 0) else {
             let mut header = page.read_tuple_header(item_id_data.offset);
             header.xmax = 0;
             page.write_tuple_header(item_id_data.offset, &header);
-            lm.unlock_all(tx_id);
+            ctx.lm.unlock_all(ctx.tx_id);
             return Err(ExecutionError::SerializationFailure);
         };
         let after_page = page.data.to_vec();
 
         rows_affected += 1;
-        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-        let lsn = lock_wal(wm)?.log(
-            tx_id,
+        let prev_lsn = ctx.tm.get_last_lsn(ctx.tx_id).unwrap_or(0);
+        let lsn = lock_wal(ctx.wm)?.log(
+            ctx.tx_id,
             prev_lsn,
             &WalRecord::UpdateTuple {
-                tx_id,
+                tx_id: ctx.tx_id,
                 page_id,
                 item_id: new_item_id,
                 before_page,
                 after_page,
             },
         )?;
-        tm.set_last_lsn(tx_id, lsn);
+        ctx.tm.set_last_lsn(ctx.tx_id, lsn);
         let mut page_header = page.read_header();
         page_header.lsn = lsn;
         page.write_header(&page_header);
@@ -233,22 +263,44 @@ pub(super) fn execute_update(
             }
 
             if let Some(key) = old_key {
-                let new_root_page_id =
-                    btree::btree_delete(bpm, tm, wm, tx_id, index.root_page_id, key)?;
-                update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+                let new_root_page_id = btree::btree_delete(
+                    ctx.bpm,
+                    ctx.tm,
+                    ctx.wm,
+                    ctx.tx_id,
+                    index.root_page_id,
+                    key,
+                )?;
+                update_index_root_if_needed(
+                    ctx.bpm,
+                    ctx.tm,
+                    ctx.wm,
+                    ctx.tx_id,
+                    ctx.snapshot,
+                    index,
+                    new_root_page_id,
+                )?;
             }
 
             if let Some(key) = new_key {
                 let new_root_page_id = btree::btree_insert(
-                    bpm,
-                    tm,
-                    wm,
-                    tx_id,
+                    ctx.bpm,
+                    ctx.tm,
+                    ctx.wm,
+                    ctx.tx_id,
                     index.root_page_id,
                     key,
                     (page_id, new_item_id),
                 )?;
-                update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+                update_index_root_if_needed(
+                    ctx.bpm,
+                    ctx.tm,
+                    ctx.wm,
+                    ctx.tx_id,
+                    ctx.snapshot,
+                    index,
+                    new_root_page_id,
+                )?;
             }
         }
     }
@@ -257,15 +309,9 @@ pub(super) fn execute_update(
 
 pub(super) fn execute_delete(
     stmt: &DeleteStatement,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &DmlCtx<'_>,
 ) -> Result<u32, ExecutionError> {
-    let mut executor = DeleteExecutor::new(stmt, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)?;
+    let mut executor = DeleteExecutor::new(stmt, ctx)?;
     let result = executor.next()?.ok_or_else(|| {
         ExecutionError::GenericError("delete executor did not produce result row".to_string())
     })?;
@@ -331,24 +377,24 @@ struct DeleteExecutor<'a> {
 }
 
 impl<'a> DeleteExecutor<'a> {
-    fn new(
-        stmt: &'a DeleteStatement,
-        bpm: &'a Arc<BufferPoolManager>,
-        tm: &'a Arc<TransactionManager>,
-        lm: &'a Arc<LockManager>,
-        wm: &'a Arc<Mutex<WalManager>>,
-        tx_id: u32,
-        snapshot: &'a Snapshot,
-        system_catalog: &'a Arc<Mutex<SystemCatalog>>,
-    ) -> Result<Self, ExecutionError> {
-        let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
-            .find_table(&stmt.table_name, bpm, tx_id, snapshot)?
+    fn new(stmt: &'a DeleteStatement, ctx: &'a DmlCtx<'a>) -> Result<Self, ExecutionError> {
+        let (table_oid, first_page_id) = lock_system_catalog(ctx.system_catalog)?
+            .find_table(&stmt.table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
             .ok_or_else(|| ExecutionError::TableNotFound(stmt.table_name.clone()))?;
 
-        let table_schema = lock_system_catalog(system_catalog)?
-            .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-        let indexes =
-            load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &table_schema)?;
+        let table_schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+            ctx.bpm,
+            table_oid,
+            ctx.tx_id,
+            ctx.snapshot,
+        )?;
+        let indexes = load_convention_int_indexes(
+            ctx.bpm,
+            ctx.tx_id,
+            ctx.snapshot,
+            ctx.system_catalog,
+            &table_schema,
+        )?;
 
         let output_schema = vec![Column {
             name: "rows_deleted".to_string(),
@@ -357,12 +403,12 @@ impl<'a> DeleteExecutor<'a> {
 
         Ok(Self {
             stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
+            bpm: ctx.bpm,
+            tm: ctx.tm,
+            lm: ctx.lm,
+            wm: ctx.wm,
+            tx_id: ctx.tx_id,
+            snapshot: ctx.snapshot,
             table_schema,
             indexes,
             output_schema,
@@ -540,25 +586,29 @@ pub(super) fn serialize_literal_map(
 }
 
 pub(super) fn find_or_create_page_for_insert(
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
+    ctx: &InsertPathCtx<'_>,
     table_oid: u32,
     first_page_id: &mut PageId,
     tuple_len: usize,
 ) -> Result<PageId, ExecutionError> {
     if *first_page_id == INVALID_PAGE_ID {
-        let new_page_guard = bpm.new_page()?;
+        let new_page_guard = ctx.bpm.new_page()?;
         *first_page_id = new_page_guard.read().id;
-        update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, *first_page_id)?;
+        update_pg_class_page_id(
+            ctx.bpm,
+            ctx.tm,
+            ctx.wm,
+            ctx.tx_id,
+            ctx.snapshot,
+            table_oid,
+            *first_page_id,
+        )?;
         return Ok(*first_page_id);
     }
 
     let mut current_page_id = *first_page_id;
     loop {
-        let page_guard = bpm.acquire_page(current_page_id)?;
+        let page_guard = ctx.bpm.acquire_page(current_page_id)?;
         let has_space = {
             let page = page_guard.read();
             let needed = tuple_len
@@ -574,7 +624,7 @@ pub(super) fn find_or_create_page_for_insert(
 
         let next_page_id = page_guard.read().read_header().next_page_id;
         if next_page_id == INVALID_PAGE_ID {
-            let new_page_guard = bpm.new_page()?;
+            let new_page_guard = ctx.bpm.new_page()?;
             let new_page_id = new_page_guard.read().id;
             let mut page = page_guard.write();
             let mut header = page.read_header();

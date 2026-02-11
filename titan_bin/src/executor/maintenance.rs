@@ -1,5 +1,6 @@
 use super::dml::{
-    find_or_create_page_for_insert, insert_tuple_and_log, scan_table, serialize_literal_map,
+    InsertPathCtx, find_or_create_page_for_insert, insert_tuple_and_log, scan_table,
+    serialize_literal_map,
 };
 use super::helpers::parse_tuple;
 use crate::catalog::{SystemCatalog, update_pg_class_page_id};
@@ -316,12 +317,15 @@ fn insert_tuple_into_system_table(
         .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
 
+    let insert_ctx = InsertPathCtx {
+        bpm: ctx.bpm,
+        tm: ctx.tm,
+        wm: ctx.wm,
+        tx_id: ctx.tx_id,
+        snapshot: ctx.snapshot,
+    };
     let page_id = find_or_create_page_for_insert(
-        ctx.bpm,
-        ctx.tm,
-        ctx.wm,
-        ctx.tx_id,
-        ctx.snapshot,
+        &insert_ctx,
         table_oid,
         &mut first_page_id,
         tuple_data.len(),

@@ -22,7 +22,7 @@ mod maintenance;
 mod pipeline;
 mod scan;
 use ddl::{DdlCtx, execute_create_index, execute_create_table};
-use dml::{execute_delete, execute_insert, execute_update};
+use dml::{DmlCtx, execute_delete, execute_insert, execute_update};
 pub(crate) use eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 pub use helpers::parse_tuple;
 use join::{HashJoinExecutor, NestedLoopJoinExecutor};
@@ -89,39 +89,42 @@ pub fn execute(
             };
             execute_create_index(create_stmt, &ctx).map(|_| ExecuteResult::Ddl)
         }
-        Statement::Insert(insert_stmt) => execute_insert(
-            insert_stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-        )
-        .map(ExecuteResult::Insert),
-        Statement::Update(update_stmt) => execute_update(
-            update_stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-        )
-        .map(ExecuteResult::Update),
-        Statement::Delete(delete_stmt) => execute_delete(
-            delete_stmt,
-            bpm,
-            tm,
-            lm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-        )
-        .map(ExecuteResult::Delete),
+        Statement::Insert(insert_stmt) => {
+            let ctx = DmlCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_insert(insert_stmt, &ctx).map(ExecuteResult::Insert)
+        }
+        Statement::Update(update_stmt) => {
+            let ctx = DmlCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_update(update_stmt, &ctx).map(ExecuteResult::Update)
+        }
+        Statement::Delete(delete_stmt) => {
+            let ctx = DmlCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_delete(delete_stmt, &ctx).map(ExecuteResult::Delete)
+        }
         Statement::Vacuum(table_name) => {
             let ctx = MaintenanceCtx {
                 bpm,
