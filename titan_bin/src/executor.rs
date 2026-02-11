@@ -5,7 +5,7 @@
 //! and expression evaluation.
 
 use crate::catalog::{
-    update_pg_class_page_id, PG_ATTRIBUTE_TABLE_OID, PG_CLASS_TABLE_OID, SystemCatalog,
+    update_pg_class_page_id, SystemCatalog, PG_ATTRIBUTE_TABLE_OID, PG_CLASS_TABLE_OID,
 };
 use crate::errors::ExecutionError;
 use crate::optimizer::{self, PhysicalPlan};
@@ -25,8 +25,6 @@ use bedrock::{btree, PageId};
 use chrono::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-
 
 // --- Type Aliases ---
 type Row = Vec<String>;
@@ -126,6 +124,74 @@ fn row_vec_to_map(
     map
 }
 
+#[derive(Clone)]
+struct IntIndexInfo {
+    column_name: String,
+    index_oid: u32,
+    root_page_id: PageId,
+}
+
+fn extract_i32_key(row: &HashMap<String, LiteralValue>, column_name: &str) -> Option<i32> {
+    match row.get(column_name) {
+        Some(LiteralValue::Number(v)) => v.parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn load_convention_int_indexes(
+    bpm: &Arc<BufferPoolManager>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    schema: &[Column],
+) -> Result<Vec<IntIndexInfo>, ExecutionError> {
+    let mut indexes = Vec::new();
+    let mut catalog = system_catalog.lock().unwrap();
+
+    for column in schema {
+        if column.type_id != 23 {
+            continue;
+        }
+
+        let index_name = format!("idx_{}", column.name);
+        if let Some((index_oid, root_page_id)) =
+            catalog.find_table(&index_name, bpm, tx_id, snapshot)?
+        {
+            indexes.push(IntIndexInfo {
+                column_name: column.name.clone(),
+                index_oid,
+                root_page_id,
+            });
+        }
+    }
+
+    Ok(indexes)
+}
+
+fn update_index_root_if_needed(
+    bpm: &Arc<BufferPoolManager>,
+    tm: &Arc<TransactionManager>,
+    wm: &Arc<Mutex<WalManager>>,
+    tx_id: u32,
+    snapshot: &Snapshot,
+    index: &mut IntIndexInfo,
+    new_root_page_id: PageId,
+) -> Result<(), ExecutionError> {
+    if new_root_page_id != index.root_page_id {
+        update_pg_class_page_id(
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            snapshot,
+            index.index_oid,
+            new_root_page_id,
+        )?;
+        index.root_page_id = new_root_page_id;
+    }
+    Ok(())
+}
+
 // --- Orchestrator ---
 
 pub fn execute(
@@ -173,19 +239,17 @@ pub fn execute(
         Statement::CreateTable(create_stmt) => {
             execute_create_table(create_stmt, bpm, tm, wm, tx_id).map(|_| ExecuteResult::Ddl)
         }
-        Statement::CreateIndex(create_stmt) => {
-            execute_create_index(
-                create_stmt,
-                bpm,
-                tm,
-                lm,
-                wm,
-                tx_id,
-                snapshot,
-                system_catalog,
-            )
-            .map(|_| ExecuteResult::Ddl)
-        }
+        Statement::CreateIndex(create_stmt) => execute_create_index(
+            create_stmt,
+            bpm,
+            tm,
+            lm,
+            wm,
+            tx_id,
+            snapshot,
+            system_catalog,
+        )
+        .map(|_| ExecuteResult::Ddl),
         Statement::Insert(insert_stmt) => execute_insert(
             insert_stmt,
             bpm,
@@ -220,30 +284,12 @@ pub fn execute(
         )
         .map(ExecuteResult::Delete),
         Statement::Vacuum(table_name) => {
-            execute_vacuum(
-                table_name,
-                bpm,
-                tm,
-                lm,
-                wm,
-                tx_id,
-                snapshot,
-                system_catalog,
-            )
-            .map(|_| ExecuteResult::Ddl)
+            execute_vacuum(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
+                .map(|_| ExecuteResult::Ddl)
         }
         Statement::Analyze(table_name) => {
-            execute_analyze(
-                table_name,
-                bpm,
-                tm,
-                lm,
-                wm,
-                tx_id,
-                snapshot,
-                system_catalog,
-            )
-            .map(|_| ExecuteResult::Ddl)
+            execute_analyze(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
+                .map(|_| ExecuteResult::Ddl)
         }
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Err(ExecutionError::GenericError(
@@ -295,7 +341,9 @@ fn create_executor<'a>(
             }
         }
         PhysicalPlan::IndexScan {
-            table_name, key, ..
+            table_name,
+            index_name,
+            key,
         } => {
             let (table_oid, _first_page_id) = system_catalog
                 .lock()
@@ -307,12 +355,11 @@ fn create_executor<'a>(
                 .unwrap()
                 .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
 
-            let index_name = "idx_id".to_string(); // Simplified
             let (_index_oid, index_root_page_id) = system_catalog
                 .lock()
                 .unwrap()
-                .find_table(&index_name, bpm, tx_id, snapshot)?
-                .ok_or(ExecutionError::TableNotFound(index_name))?;
+                .find_table(index_name, bpm, tx_id, snapshot)?
+                .ok_or_else(|| ExecutionError::TableNotFound(index_name.clone()))?;
 
             Ok(Box::new(IndexScanExecutor::new(
                 bpm,
@@ -403,12 +450,15 @@ fn create_executor<'a>(
                 order_by.clone(),
             )?))
         }
-        PhysicalPlan::MergeJoin { .. } => {
-            Err(ExecutionError::GenericError(
-                "MergeJoin is not supported by the iterator executor yet".to_string(),
-            ))
-        }
-        PhysicalPlan::HashAggregate { input, group_by, aggregates, having } => {
+        PhysicalPlan::MergeJoin { .. } => Err(ExecutionError::GenericError(
+            "MergeJoin is not supported by the iterator executor yet".to_string(),
+        )),
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+            having,
+        } => {
             use crate::aggregate_executor::HashAggregateExecutor;
             let input_executor =
                 create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
@@ -419,27 +469,23 @@ fn create_executor<'a>(
                 having.clone(),
             )))
         }
-        PhysicalPlan::StreamAggregate { .. } => {
-            Err(ExecutionError::GenericError(
-                "StreamAggregate not yet fully implemented".to_string(),
-            ))
-        }
-        PhysicalPlan::Window { .. } => {
-            Err(ExecutionError::GenericError(
-                "Window functions not yet fully implemented".to_string(),
-            ))
-        }
-        PhysicalPlan::MaterializeCTE { .. } => {
-            Err(ExecutionError::GenericError(
-                "MaterializeCTE not yet implemented".to_string(),
-            ))
-        }
-        PhysicalPlan::CTEScan { .. } => {
-            Err(ExecutionError::GenericError(
-                "CTEScan not yet implemented".to_string(),
-            ))
-        }
-        PhysicalPlan::Limit { input, limit, offset } => {
+        PhysicalPlan::StreamAggregate { .. } => Err(ExecutionError::GenericError(
+            "StreamAggregate not yet fully implemented".to_string(),
+        )),
+        PhysicalPlan::Window { .. } => Err(ExecutionError::GenericError(
+            "Window functions not yet fully implemented".to_string(),
+        )),
+        PhysicalPlan::MaterializeCTE { .. } => Err(ExecutionError::GenericError(
+            "MaterializeCTE not yet implemented".to_string(),
+        )),
+        PhysicalPlan::CTEScan { .. } => Err(ExecutionError::GenericError(
+            "CTEScan not yet implemented".to_string(),
+        )),
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
             use crate::limit_executor::LimitExecutor;
             let input_executor =
                 create_executor(input, bpm, lm, tx_id, snapshot, select_stmt, system_catalog)?;
@@ -705,7 +751,12 @@ impl<'a> Executor for ProjectionExecutor<'a> {
         } else {
             // This is a hack for joins. A proper solution would involve executors
             // passing down table information.
-            let left_len = self.input.schema().iter().filter(|c| c.name.starts_with("users.")).count();
+            let left_len = self
+                .input
+                .schema()
+                .iter()
+                .filter(|c| c.name.starts_with("users."))
+                .count();
             let (left_row, right_row) = row.split_at(left_len);
             let (left_schema, right_schema) = self.input.schema().split_at(left_len);
             row_map.extend(row_vec_to_map(left_row, left_schema, Some("users")));
@@ -946,7 +997,10 @@ struct SortExecutor<'a> {
 }
 
 impl<'a> SortExecutor<'a> {
-    fn new(mut input: Box<dyn Executor + 'a>, order_by: Vec<Expression>) -> Result<Self, ExecutionError> {
+    fn new(
+        mut input: Box<dyn Executor + 'a>,
+        order_by: Vec<Expression>,
+    ) -> Result<Self, ExecutionError> {
         let mut rows = Vec::new();
         while let Some(row) = input.next()? {
             rows.push(row);
@@ -1038,11 +1092,13 @@ fn execute_create_table(
 
     let pg_class_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
     let mut pg_class_page = pg_class_guard.write();
+    let before_page = pg_class_page.data.to_vec();
     let item_id = pg_class_page
         .add_tuple(&tuple_data, tx_id, 0)
         .ok_or_else(|| {
             ExecutionError::GenericError("Failed to insert into pg_class".to_string())
         })?;
+    let after_page = pg_class_page.data.to_vec();
 
     let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
     let lsn = wm.lock().unwrap().log(
@@ -1052,6 +1108,8 @@ fn execute_create_table(
             tx_id,
             page_id: PG_CLASS_TABLE_OID,
             item_id,
+            before_page,
+            after_page,
         },
     )?;
     tm.set_last_lsn(tx_id, lsn);
@@ -1076,11 +1134,13 @@ fn execute_create_table(
         attr_tuple_data.extend_from_slice(&type_id.to_be_bytes());
         attr_tuple_data.push(col.name.len() as u8);
         attr_tuple_data.extend_from_slice(col.name.as_bytes());
+        let before_page = pg_attr_page.data.to_vec();
         let item_id = pg_attr_page
             .add_tuple(&attr_tuple_data, tx_id, 0)
             .ok_or_else(|| {
                 ExecutionError::GenericError("Failed to insert into pg_attribute".to_string())
             })?;
+        let after_page = pg_attr_page.data.to_vec();
 
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
         let lsn = wm.lock().unwrap().log(
@@ -1090,6 +1150,8 @@ fn execute_create_table(
                 tx_id,
                 page_id: PG_ATTRIBUTE_TABLE_OID,
                 item_id,
+                before_page,
+                after_page,
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
@@ -1136,7 +1198,9 @@ fn execute_create_index(
         tuple_data.extend_from_slice(&root_page_id.to_be_bytes());
         tuple_data.push(stmt.index_name.len() as u8);
         tuple_data.extend_from_slice(stmt.index_name.as_bytes());
+        let before_page = page.data.to_vec();
         let item_id = page.add_tuple(&tuple_data, tx_id, 0).unwrap();
+        let after_page = page.data.to_vec();
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
         let lsn = wm.lock().unwrap().log(
             tx_id,
@@ -1145,6 +1209,8 @@ fn execute_create_index(
                 tx_id,
                 page_id: PG_CLASS_TABLE_OID,
                 item_id,
+                before_page,
+                after_page,
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);
@@ -1158,15 +1224,7 @@ fn execute_create_index(
             .lock()
             .unwrap()
             .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-        let rows_with_ids = scan_table(
-            bpm,
-            lm,
-            table_page_id,
-            &schema,
-            tx_id,
-            snapshot,
-            false,
-        )?;
+        let rows_with_ids = scan_table(bpm, lm, table_page_id, &schema, tx_id, snapshot, false)?;
         for (page_id, item_id, parsed_tuple) in rows_with_ids {
             if let Some(LiteralValue::Number(key_str)) = parsed_tuple.get(&stmt.column_name) {
                 if let Ok(key) = key_str.parse::<i32>() {
@@ -1210,17 +1268,6 @@ fn execute_insert(
 
     let tuple_data = serialize_expressions(&stmt.values)?;
 
-    let _page_id = find_or_create_page_for_insert(
-        bpm,
-        tm,
-        wm,
-        tx_id,
-        snapshot,
-        table_oid,
-        &mut first_page_id,
-        tuple_data.len(),
-    )?;
-
     insert_tuple_and_update_indexes(
         bpm,
         tm,
@@ -1242,7 +1289,7 @@ fn insert_tuple_and_update_indexes(
     wm: &Arc<Mutex<WalManager>>,
     tx_id: u32,
     snapshot: &Snapshot,
-    _system_catalog: &Arc<Mutex<SystemCatalog>>,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
     table_oid: u32,
     first_page_id: &mut PageId,
     tuple_data: &[u8],
@@ -1258,7 +1305,33 @@ fn insert_tuple_and_update_indexes(
         tuple_data.len(),
     )?;
 
-    insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)
+    let item_id = insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)?;
+
+    let schema = system_catalog
+        .lock()
+        .unwrap()
+        .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let parsed_tuple = parse_tuple(tuple_data, &schema);
+    let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
+
+    for index in &mut indexes {
+        let Some(key) = extract_i32_key(&parsed_tuple, &index.column_name) else {
+            continue;
+        };
+
+        let new_root_page_id = btree::btree_insert(
+            bpm,
+            tm,
+            wm,
+            tx_id,
+            index.root_page_id,
+            key,
+            (page_id, item_id),
+        )?;
+        update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+    }
+
+    Ok(())
 }
 
 fn execute_update(
@@ -1284,16 +1357,9 @@ fn execute_update(
         .lock()
         .unwrap()
         .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+    let mut indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
     let mut rows_affected = 0;
-    let all_rows = scan_table(
-        bpm,
-        lm,
-        first_page_id,
-        &schema,
-        tx_id,
-        snapshot,
-        false,
-    )?;
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
     let rows_to_update: Vec<_> = all_rows
         .into_iter()
         .filter(|(_, _, parsed)| {
@@ -1331,35 +1397,66 @@ fn execute_update(
 
         let new_data = serialize_literal_map(&new_parsed, &schema)?;
 
-        let old_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
+        let before_page = page.data.to_vec();
         let item_id_data = page.get_item_id_data(item_id).unwrap();
         let mut header = page.read_tuple_header(item_id_data.offset);
         header.xmax = tx_id;
         page.write_tuple_header(item_id_data.offset, &header);
 
-        if let Some(new_item_id) = page.add_tuple(&new_data, tx_id, 0) {
-            rows_affected += 1;
-            let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
-            let lsn = wm.lock().unwrap().log(
-                tx_id,
-                prev_lsn,
-                &WalRecord::UpdateTuple {
-                    tx_id,
-                    page_id,
-                    item_id: new_item_id,
-                    old_data: old_raw,
-                },
-            )?;
-            tm.set_last_lsn(tx_id, lsn);
-            let mut header = page.read_header();
-            header.lsn = lsn;
-            page.write_header(&header);
-        } else {
+        let Some(new_item_id) = page.add_tuple(&new_data, tx_id, 0) else {
             let mut header = page.read_tuple_header(item_id_data.offset);
             header.xmax = 0;
             page.write_tuple_header(item_id_data.offset, &header);
             lm.unlock_all(tx_id);
             return Err(ExecutionError::SerializationFailure);
+        };
+        let after_page = page.data.to_vec();
+
+        rows_affected += 1;
+        let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wm.lock().unwrap().log(
+            tx_id,
+            prev_lsn,
+            &WalRecord::UpdateTuple {
+                tx_id,
+                page_id,
+                item_id: new_item_id,
+                before_page,
+                after_page,
+            },
+        )?;
+        tm.set_last_lsn(tx_id, lsn);
+        let mut page_header = page.read_header();
+        page_header.lsn = lsn;
+        page.write_header(&page_header);
+        drop(page);
+
+        for index in &mut indexes {
+            let old_key = extract_i32_key(&old_parsed, &index.column_name);
+            let new_key = extract_i32_key(&new_parsed, &index.column_name);
+
+            if old_key == new_key {
+                continue;
+            }
+
+            if let Some(key) = old_key {
+                let new_root_page_id =
+                    btree::btree_delete(bpm, tm, wm, tx_id, index.root_page_id, key)?;
+                update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+            }
+
+            if let Some(key) = new_key {
+                let new_root_page_id = btree::btree_insert(
+                    bpm,
+                    tm,
+                    wm,
+                    tx_id,
+                    index.root_page_id,
+                    key,
+                    (page_id, new_item_id),
+                )?;
+                update_index_root_if_needed(bpm, tm, wm, tx_id, snapshot, index, new_root_page_id)?;
+            }
         }
     }
     Ok(rows_affected)
@@ -1375,16 +1472,7 @@ fn execute_delete(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<u32, ExecutionError> {
-    let mut executor = DeleteExecutor::new(
-        stmt,
-        bpm,
-        tm,
-        lm,
-        wm,
-        tx_id,
-        snapshot,
-        system_catalog,
-    )?;
+    let mut executor = DeleteExecutor::new(stmt, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)?;
     let result = executor.next()?.unwrap();
     Ok(result[0].parse().unwrap())
 }
@@ -1558,12 +1646,17 @@ pub fn evaluate_expr_for_row_to_val<'a>(
                         Ok(LiteralValue::Null)
                     }
                 }
-                _ => Err(ExecutionError::GenericError(
-                    format!("Unsupported function: {}", name),
-                ))
+                _ => Err(ExecutionError::GenericError(format!(
+                    "Unsupported function: {}",
+                    name
+                ))),
             }
         }
-        Expression::Case { operand, when_clauses, else_clause } => {
+        Expression::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             // CASE expression evaluation
             for (condition, result) in when_clauses {
                 let cond_result = if let Some(op) = operand {
@@ -1576,12 +1669,12 @@ pub fn evaluate_expr_for_row_to_val<'a>(
                         _ => false,
                     }
                 };
-                
+
                 if cond_result {
                     return evaluate_expr_for_row_to_val(result, row);
                 }
             }
-            
+
             if let Some(else_expr) = else_clause {
                 evaluate_expr_for_row_to_val(else_expr, row)
             } else {
@@ -1625,18 +1718,11 @@ fn execute_vacuum(
         .lock()
         .unwrap()
         .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let live_tuples: Vec<_> = scan_table(
-        bpm,
-        lm,
-        old_first_page_id,
-        &schema,
-        tx_id,
-        snapshot,
-        false,
-    )?
-    .into_iter()
-    .map(|(_, _, parsed)| parsed)
-    .collect();
+    let live_tuples: Vec<_> =
+        scan_table(bpm, lm, old_first_page_id, &schema, tx_id, snapshot, false)?
+            .into_iter()
+            .map(|(_, _, parsed)| parsed)
+            .collect();
 
     let mut new_first_page_id = INVALID_PAGE_ID;
     if !live_tuples.is_empty() {
@@ -1718,33 +1804,25 @@ fn analyze_table_and_update_stats(
         .lock()
         .unwrap()
         .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let all_rows = scan_table(
-        bpm,
-        lm,
-        first_page_id,
-        &schema,
-        tx_id,
-        snapshot,
-        false,
-    )?;
+    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
     let total_rows = all_rows.len();
 
     // Pre-fetch pg_statistic info to avoid re-fetching in the loop
-    let (pg_stat_oid, pg_stat_first_page_id) =
-        if let Some(info) = system_catalog
-            .lock()
-            .unwrap()
-            .find_table("pg_statistic", bpm, tx_id, snapshot)?
-        {
-            info
-        } else {
-            // This should not happen in a properly initialized database
-            return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
-        };
-    let pg_stat_schema = system_catalog
+    let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) = system_catalog
         .lock()
         .unwrap()
-        .get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
+        .find_table("pg_statistic", bpm, tx_id, snapshot)?
+    {
+        info
+    } else {
+        // This should not happen in a properly initialized database
+        return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
+    };
+    let pg_stat_schema =
+        system_catalog
+            .lock()
+            .unwrap()
+            .get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
 
     // --- Delete all old statistics for the entire table in one go ---
     let mut current_page_id = pg_stat_first_page_id;
@@ -1941,7 +2019,8 @@ fn insert_tuple_into_system_table(
         tuple_data.len(),
     )?;
 
-    insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)
+    let _ = insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)?;
+    Ok(())
 }
 
 struct DeleteExecutor<'a> {
@@ -1954,6 +2033,7 @@ struct DeleteExecutor<'a> {
     snapshot: &'a Snapshot,
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
     schema: Vec<Column>,
+    indexes: Vec<IntIndexInfo>,
     output_schema: Vec<Column>,
     current_page_id: PageId,
     current_item_id: u16,
@@ -1982,6 +2062,7 @@ impl<'a> DeleteExecutor<'a> {
             .lock()
             .unwrap()
             .get_table_schema(bpm, table_oid, tx_id, snapshot)?;
+        let indexes = load_convention_int_indexes(bpm, tx_id, snapshot, system_catalog, &schema)?;
 
         let output_schema = vec![Column {
             name: "rows_deleted".to_string(),
@@ -1998,6 +2079,7 @@ impl<'a> DeleteExecutor<'a> {
             snapshot,
             system_catalog,
             schema,
+            indexes,
             output_schema,
             current_page_id: first_page_id,
             current_item_id: 0,
@@ -2038,12 +2120,9 @@ impl<'a> Executor for DeleteExecutor<'a> {
             if page.is_visible(self.snapshot, self.tx_id, item_id) {
                 if let Some(tuple_data) = page.get_tuple(item_id) {
                     let parsed_row = parse_tuple(tuple_data, &self.schema);
-                    if self
-                        .stmt
-                        .where_clause
-                        .as_ref()
-                        .map_or(true, |p| evaluate_expr_for_row(p, &parsed_row).unwrap_or(false))
-                    {
+                    if self.stmt.where_clause.as_ref().map_or(true, |p| {
+                        evaluate_expr_for_row(p, &parsed_row).unwrap_or(false)
+                    }) {
                         // Lock and delete
                         self.lm.lock(
                             self.tx_id,
@@ -2052,6 +2131,7 @@ impl<'a> Executor for DeleteExecutor<'a> {
                         )?;
 
                         if let Some(item_id_data) = page.get_item_id_data(item_id) {
+                            let before_page = page.data.to_vec();
                             let mut header = page.read_tuple_header(item_id_data.offset);
                             if header.xmax != 0 {
                                 return Err(ExecutionError::SerializationFailure);
@@ -2059,6 +2139,7 @@ impl<'a> Executor for DeleteExecutor<'a> {
                             header.xmax = self.tx_id;
                             page.write_tuple_header(item_id_data.offset, &header);
                             self.rows_affected += 1;
+                            let after_page = page.data.to_vec();
 
                             // WAL
                             let prev_lsn = self.tm.get_last_lsn(self.tx_id).unwrap_or(0);
@@ -2069,12 +2150,39 @@ impl<'a> Executor for DeleteExecutor<'a> {
                                     tx_id: self.tx_id,
                                     page_id: self.current_page_id,
                                     item_id,
+                                    before_page,
+                                    after_page,
                                 },
                             )?;
                             self.tm.set_last_lsn(self.tx_id, lsn);
                             let mut page_header = page.read_header();
                             page_header.lsn = lsn;
                             page.write_header(&page_header);
+                            drop(page);
+
+                            for index in &mut self.indexes {
+                                let Some(key) = extract_i32_key(&parsed_row, &index.column_name)
+                                else {
+                                    continue;
+                                };
+                                let new_root_page_id = btree::btree_delete(
+                                    self.bpm,
+                                    self.tm,
+                                    self.wm,
+                                    self.tx_id,
+                                    index.root_page_id,
+                                    key,
+                                )?;
+                                update_index_root_if_needed(
+                                    self.bpm,
+                                    self.tm,
+                                    self.wm,
+                                    self.tx_id,
+                                    self.snapshot,
+                                    index,
+                                    new_root_page_id,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -2163,7 +2271,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
             }
 
             let page_guard = self.bpm.acquire_page(self.current_page_id)?;
-            
+
             if self.current_item_id >= page_guard.read().get_tuple_count() {
                 self.current_page_id = page_guard.read().read_header().next_page_id;
                 self.current_item_id = 0;
@@ -2175,7 +2283,7 @@ impl<'a> Executor for UpdateExecutor<'a> {
 
             let old_parsed = {
                 let page = page_guard.read();
-                 if !page.is_visible(self.snapshot, self.tx_id, item_id) {
+                if !page.is_visible(self.snapshot, self.tx_id, item_id) {
                     continue;
                 }
                 if let Some(tuple_data) = page.get_tuple(item_id) {
@@ -2185,12 +2293,9 @@ impl<'a> Executor for UpdateExecutor<'a> {
                 }
             };
 
-            if self
-                .stmt
-                .where_clause
-                .as_ref()
-                .map_or(true, |p| evaluate_expr_for_row(p, &old_parsed).unwrap_or(false))
-            {
+            if self.stmt.where_clause.as_ref().map_or(true, |p| {
+                evaluate_expr_for_row(p, &old_parsed).unwrap_or(false)
+            }) {
                 self.lm.lock(
                     self.tx_id,
                     LockableResource::Tuple((self.current_page_id, item_id)),
@@ -2244,13 +2349,14 @@ impl<'a> Executor for UpdateExecutor<'a> {
                     }
                 }
 
-                let old_raw = page.get_raw_tuple(item_id).unwrap().to_vec();
+                let before_page = page.data.to_vec();
                 let item_id_data = page.get_item_id_data(item_id).unwrap();
                 let mut header = page.read_tuple_header(item_id_data.offset);
                 header.xmax = self.tx_id;
                 page.write_tuple_header(item_id_data.offset, &header);
 
                 if let Some(new_item_id) = page.add_tuple(&new_data, self.tx_id, 0) {
+                    let after_page = page.data.to_vec();
                     self.rows_affected += 1;
                     let prev_lsn = self.tm.get_last_lsn(self.tx_id).unwrap_or(0);
                     let lsn = self.wm.lock().unwrap().log(
@@ -2260,7 +2366,8 @@ impl<'a> Executor for UpdateExecutor<'a> {
                             tx_id: self.tx_id,
                             page_id: self.current_page_id,
                             item_id: new_item_id,
-                            old_data: old_raw,
+                            before_page,
+                            after_page,
                         },
                     )?;
                     self.tm.set_last_lsn(self.tx_id, lsn);
@@ -2373,10 +2480,7 @@ fn find_or_create_page_for_insert(
                 + std::mem::size_of::<bedrock::page::HeapTupleHeaderData>()
                 + std::mem::size_of::<bedrock::page::ItemIdData>();
             let header = page.read_header();
-            header
-                .upper_offset
-                .saturating_sub(header.lower_offset)
-                >= needed as u16
+            header.upper_offset.saturating_sub(header.lower_offset) >= needed as u16
         };
 
         if has_space {
@@ -2404,12 +2508,14 @@ fn insert_tuple_and_log(
     tx_id: u32,
     page_id: PageId,
     tuple_data: &[u8],
-) -> Result<(), ExecutionError> {
+) -> Result<u16, ExecutionError> {
     let page_guard = bpm.acquire_page(page_id)?;
     let mut page = page_guard.write();
+    let before_page = page.data.to_vec();
     let item_id = page
         .add_tuple(tuple_data, tx_id, 0)
         .ok_or_else(|| ExecutionError::GenericError("Failed to add tuple".to_string()))?;
+    let after_page = page.data.to_vec();
 
     let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
     let lsn = wm.lock().unwrap().log(
@@ -2419,11 +2525,13 @@ fn insert_tuple_and_log(
             tx_id,
             page_id,
             item_id,
+            before_page,
+            after_page,
         },
     )?;
     tm.set_last_lsn(tx_id, lsn);
     let mut header = page.read_header();
     header.lsn = lsn;
     page.write_header(&header);
-    Ok(())
+    Ok(item_id)
 }

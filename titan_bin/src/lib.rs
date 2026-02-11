@@ -1,4 +1,3 @@
-
 //! The main library for the TitanDB binary.
 //!
 //! This library contains the core logic for the TitanDB server, including:
@@ -234,7 +233,7 @@ fn handle_client(
                             continue; // Continue to next statement in the query string
                         }
                         parser::Statement::Commit => {
-                            tm.commit(tx_id);
+                            tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
                             lm.unlock_all(tx_id);
                             bpm.flush_all_pages()?;
                             in_transaction = false;
@@ -321,8 +320,9 @@ fn handle_client(
                         "[handle_client] Committing implicit transaction with tx_id: {}",
                         tx_id
                     );
-                    tm.commit(tx_id);
+                    tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
                     lm.unlock_all(tx_id);
+                    bpm.flush_all_pages()?;
                     in_transaction = false;
                 }
 
@@ -536,7 +536,7 @@ fn initialize_db(
     )?;
     println!("[initialize_db] pg_statistic table created.");
 
-    tm.commit(tx_id);
+    tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
     lm.unlock_all(tx_id);
     println!("[initialize_db] Initialization transaction committed.");
     Ok(())

@@ -3,7 +3,7 @@
 use crate::{pager::Pager, PageId};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -41,19 +41,24 @@ pub enum WalRecord {
         tx_id: u32,
         page_id: PageId,
         item_id: u16,
+        before_page: Vec<u8>,
+        after_page: Vec<u8>,
     },
     /// A tuple was marked as deleted.
     DeleteTuple {
         tx_id: u32,
         page_id: PageId,
         item_id: u16,
+        before_page: Vec<u8>,
+        after_page: Vec<u8>,
     },
-    /// A tuple was updated (old data is logged for UNDO).
+    /// A tuple was updated.
     UpdateTuple {
         tx_id: u32,
         page_id: PageId,
         item_id: u16,
-        old_data: Vec<u8>,
+        before_page: Vec<u8>,
+        after_page: Vec<u8>,
     },
     /// A B-Tree page was updated.
     BTreePage {
@@ -212,7 +217,7 @@ impl WalManager {
 
         Ok((Self::deserialize_record(&record_buf), header.prev_lsn))
     }
- 
+
     pub fn checkpoint(
         &mut self,
         active_tx_table: HashMap<u32, Lsn>,
@@ -263,7 +268,7 @@ impl WalManager {
         let mut wal_file = OpenOptions::new()
             .read(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .write(true)
             .open(wal_path)?;
         let mut buf = Vec::new();
@@ -273,60 +278,38 @@ impl WalManager {
             return Ok(0);
         }
 
-        let mut highest_tx_id = 0;
-        let mut active_tx_table: HashMap<u32, Lsn> = HashMap::new();
-        let mut dirty_page_table: HashMap<PageId, Lsn> = HashMap::new();
-        let mut last_checkpoint_lsn = 0;
-
-        // Analysis pass: find the last checkpoint and build initial tables
-        let mut current_pos = 0;
-        while current_pos < buf.len() {
-            let header_slice =
-                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader =
-                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
-
-            let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
-            let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
-            let record_end = record_start + record_len;
-            let record_buf = &buf[record_start..record_end];
-
-            if let Some(WalRecord::Checkpoint {
-                active_tx_table: att,
-                dirty_page_table: dpt,
-            }) = Self::deserialize_record(record_buf)
-            {
-                active_tx_table = att;
-                dirty_page_table = dpt;
-                last_checkpoint_lsn = current_pos as Lsn;
-            }
-            current_pos += header.total_len as usize;
+        #[derive(Clone)]
+        struct ParsedWalEntry {
+            lsn: Lsn,
+            header: WalRecordHeader,
+            record: WalRecord,
         }
 
-        // Start analysis from the last checkpoint
-        current_pos = last_checkpoint_lsn as usize;
-        // We need to skip the checkpoint record itself
-        if current_pos > 0 {
-            let header_slice =
-                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader =
-                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
-            current_pos += header.total_len as usize;
-        }
+        let header_len = std::mem::size_of::<WalRecordHeader>();
+        let mut entries = Vec::new();
+        let mut pos = 0usize;
 
-        while current_pos < buf.len() {
-            let header_slice =
-                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader =
-                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
+        while pos + header_len <= buf.len() {
+            let header_slice = &buf[pos..pos + header_len];
+            let header: WalRecordHeader = unsafe {
+                std::ptr::read_unaligned(header_slice.as_ptr() as *const WalRecordHeader)
+            };
 
-            if header.tx_id > highest_tx_id {
-                highest_tx_id = header.tx_id;
+            if header.total_len < header_len as u32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL record has invalid length",
+                ));
             }
 
-            let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
-            let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
-            let record_end = record_start + record_len;
+            let total_len = header.total_len as usize;
+            if pos + total_len > buf.len() {
+                // Torn tail record (crash during append): ignore incomplete tail.
+                break;
+            }
+
+            let record_start = pos + header_len;
+            let record_end = pos + total_len;
             let record_buf = &buf[record_start..record_end];
 
             let mut hasher = Hasher::new();
@@ -338,120 +321,180 @@ impl WalManager {
                 ));
             }
 
-            if let Some(record) = Self::deserialize_record(record_buf) {
-                if record.tx_id() != 0 && !active_tx_table.contains_key(&record.tx_id()) {
-                    active_tx_table.insert(record.tx_id(), current_pos as Lsn);
+            let record = Self::deserialize_record(record_buf).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL record decode failed")
+            })?;
+
+            entries.push(ParsedWalEntry {
+                lsn: pos as Lsn,
+                header,
+                record,
+            });
+            pos += total_len;
+        }
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut highest_tx_id = entries.iter().map(|e| e.header.tx_id).max().unwrap_or(0);
+        let mut active_tx_table: HashMap<u32, Lsn> = HashMap::new();
+        let mut dirty_page_table: HashMap<PageId, Lsn> = HashMap::new();
+
+        // Start from the latest checkpoint payload if one exists.
+        let mut start_idx = 0usize;
+        for (idx, entry) in entries.iter().enumerate().rev() {
+            if let WalRecord::Checkpoint {
+                active_tx_table: att,
+                dirty_page_table: dpt,
+            } = &entry.record
+            {
+                active_tx_table = att.clone();
+                dirty_page_table = dpt.clone();
+                start_idx = idx + 1;
+                break;
+            }
+        }
+
+        for entry in entries.iter().skip(start_idx) {
+            if entry.header.tx_id > highest_tx_id {
+                highest_tx_id = entry.header.tx_id;
+            }
+
+            let tx_id = entry.record.tx_id();
+            if tx_id != 0 {
+                // Track last LSN per active transaction (needed for UNDO chains).
+                active_tx_table.insert(tx_id, entry.lsn);
+            }
+
+            match &entry.record {
+                WalRecord::Commit { tx_id } | WalRecord::Abort { tx_id } => {
+                    active_tx_table.remove(tx_id);
+                }
+                WalRecord::InsertTuple { page_id, .. }
+                | WalRecord::DeleteTuple { page_id, .. }
+                | WalRecord::UpdateTuple { page_id, .. }
+                | WalRecord::BTreePage { page_id, .. }
+                | WalRecord::SetNextPageId { page_id, .. } => {
+                    dirty_page_table.entry(*page_id).or_insert(entry.lsn);
+                }
+                _ => {}
+            }
+        }
+
+        // REDO pass.
+        let redo_start_lsn = dirty_page_table.values().min().copied().unwrap_or(0);
+        for entry in entries.iter().filter(|e| e.lsn >= redo_start_lsn) {
+            match &entry.record {
+                WalRecord::BTreePage { page_id, data, .. } => {
+                    let mut page = pager.read_page(*page_id)?;
+                    if page.read_header().lsn < entry.lsn {
+                        page.data.copy_from_slice(data);
+                        let mut header = page.read_header();
+                        header.lsn = entry.lsn;
+                        page.write_header(&header);
+                        pager.write_page(&page)?;
+                    }
+                }
+                WalRecord::SetNextPageId {
+                    page_id,
+                    next_page_id,
+                    ..
+                } => {
+                    let mut page = pager.read_page(*page_id)?;
+                    if page.read_header().lsn < entry.lsn {
+                        let mut header = page.read_header();
+                        header.next_page_id = *next_page_id;
+                        header.lsn = entry.lsn;
+                        page.write_header(&header);
+                        pager.write_page(&page)?;
+                    }
+                }
+                WalRecord::InsertTuple {
+                    page_id,
+                    after_page,
+                    ..
+                }
+                | WalRecord::DeleteTuple {
+                    page_id,
+                    after_page,
+                    ..
+                }
+                | WalRecord::UpdateTuple {
+                    page_id,
+                    after_page,
+                    ..
+                } => {
+                    let mut page = pager.read_page(*page_id)?;
+                    if page.read_header().lsn < entry.lsn {
+                        if after_page.len() == page.data.len() {
+                            page.data.copy_from_slice(after_page);
+                        }
+                        let mut header = page.read_header();
+                        header.lsn = entry.lsn;
+                        page.write_header(&header);
+                        pager.write_page(&page)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // UNDO pass for loser transactions.
+        let mut lsn_to_index: HashMap<Lsn, usize> = HashMap::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            lsn_to_index.insert(entry.lsn, idx);
+        }
+
+        let loser_txs: Vec<u32> = active_tx_table.keys().copied().collect();
+        for tx_id in loser_txs {
+            let mut current_lsn = active_tx_table.get(&tx_id).copied().unwrap_or(0);
+
+            while current_lsn > 0 {
+                let Some(&idx) = lsn_to_index.get(&current_lsn) else {
+                    break;
+                };
+                let entry = &entries[idx];
+
+                if entry.record.tx_id() != tx_id {
+                    current_lsn = entry.header.prev_lsn;
+                    continue;
                 }
 
-                match record {
-                    WalRecord::Commit { tx_id } | WalRecord::Abort { tx_id } => {
-                        active_tx_table.remove(&tx_id);
+                match &entry.record {
+                    WalRecord::CompensationLogRecord { undo_next_lsn, .. } => {
+                        current_lsn = *undo_next_lsn;
+                        continue;
                     }
-                    WalRecord::InsertTuple { page_id, .. }
-                    | WalRecord::DeleteTuple { page_id, .. }
-                    | WalRecord::UpdateTuple { page_id, .. }
-                    | WalRecord::BTreePage { page_id, .. }
-                    | WalRecord::SetNextPageId { page_id, .. } => {
-                        dirty_page_table
-                            .entry(page_id)
-                            .or_insert(current_pos as Lsn);
+                    WalRecord::InsertTuple {
+                        page_id,
+                        before_page,
+                        ..
+                    }
+                    | WalRecord::DeleteTuple {
+                        page_id,
+                        before_page,
+                        ..
+                    }
+                    | WalRecord::UpdateTuple {
+                        page_id,
+                        before_page,
+                        ..
+                    } => {
+                        let mut page = pager.read_page(*page_id)?;
+                        if before_page.len() == page.data.len() {
+                            page.data.copy_from_slice(before_page);
+                        }
+                        let mut header = page.read_header();
+                        header.lsn = header.lsn.max(current_lsn);
+                        page.write_header(&header);
+                        pager.write_page(&page)?;
                     }
                     _ => {}
                 }
+
+                current_lsn = entry.header.prev_lsn;
             }
-            current_pos += header.total_len as usize;
-        }
-
-       
-        let redo_start_lsn = dirty_page_table.values().min().cloned().unwrap_or(0);
-        current_pos = redo_start_lsn as usize;
-
-        while current_pos < buf.len() {
-            let header_slice =
-                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader =
-                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
-
-            let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
-            let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
-            let record_end = record_start + record_len;
-            let record_buf = &buf[record_start..record_end];
- 
-             let mut hasher = Hasher::new();
-             hasher.update(record_buf);
-             if hasher.finalize() != header.crc {
-                 return Err(io::Error::new(
-                     io::ErrorKind::InvalidData,
-                     "WAL record CRC mismatch",
-                 ));
-             }
- 
-            if let Some(WalRecord::BTreePage { page_id, data, .. }) =
-                Self::deserialize_record(record_buf)
-           {
-               let mut page = pager.read_page(page_id)?;
-               if page.read_header().lsn < current_pos as u64 {
-                   page.data.copy_from_slice(&data);
-                   let mut header = page.read_header();
-                   header.lsn = current_pos as u64;
-                   page.write_header(&header);
-                   pager.write_page(&page)?;
-               }
-           }
-            current_pos += header.total_len as usize;
-        }
-
-      
-        let to_undo: HashSet<u32> = active_tx_table.keys().cloned().collect();
-
-     
-        let mut max_lsn = 0;
-        for tx_id in &to_undo {
-            if let Some(lsn) = active_tx_table.get(tx_id) {
-                if *lsn > max_lsn {
-                    max_lsn = *lsn;
-                }
-            }
-        }
-
-        let mut current_pos = max_lsn as usize;
-        while current_pos > 0 {
-            let header_slice =
-                &buf[current_pos..current_pos + std::mem::size_of::<WalRecordHeader>()];
-            let header: WalRecordHeader =
-                unsafe { *header_slice.as_ptr().cast::<WalRecordHeader>() };
-
-            if to_undo.contains(&header.tx_id) {
-                let record_len = header.total_len as usize - std::mem::size_of::<WalRecordHeader>();
-                let record_start = current_pos + std::mem::size_of::<WalRecordHeader>();
-                let record_end = record_start + record_len;
-                let record_buf = &buf[record_start..record_end];
- 
-                 let mut hasher = Hasher::new();
-                 hasher.update(record_buf);
-                 if hasher.finalize() != header.crc {
-                     return Err(io::Error::new(
-                         io::ErrorKind::InvalidData,
-                         "WAL record CRC mismatch",
-                     ));
-                 }
- 
-                 if let Some(WalRecord::UpdateTuple { page_id, .. }) =
-                     Self::deserialize_record(record_buf)
-                {
-                   
-                    let page = pager.read_page(page_id)?;
-                   
-                    if page.read_header().lsn >= current_pos as u64 {
-                       
-                        println!(
-                            "[RECOVERY-UNDO] Undoing update for tx {} on page {}",
-                            header.tx_id, page_id
-                        );
-                    }
-                }
-            }
-            current_pos = header.prev_lsn as usize;
         }
 
         Ok(highest_tx_id)

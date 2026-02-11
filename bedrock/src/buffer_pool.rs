@@ -221,10 +221,16 @@ impl BufferPoolManager {
             return Some(frame_index);
         }
 
+        let frame_count = self.frames.len();
+        if frame_count == 0 {
+            return None;
+        }
+
         let mut clock_hand = self.clock_hand.lock().unwrap();
-        loop {
+        // Two full passes: first pass can clear second-chance bits, second can pick a victim.
+        for _ in 0..(frame_count * 2) {
             let frame_index = *clock_hand;
-            *clock_hand = (*clock_hand + 1) % self.frames.len();
+            *clock_hand = (*clock_hand + 1) % frame_count;
 
             let frame = &self.frames[frame_index];
             let pin_count = frame.pin_count.lock().unwrap();
@@ -238,5 +244,8 @@ impl BufferPoolManager {
                 }
             }
         }
+
+        // All frames are pinned.
+        None
     }
 }

@@ -167,6 +167,8 @@ pub fn update_pg_class_page_id(
 
     let mut old_item_id = None;
     let mut old_tuple_data = None;
+    let mut delete_before_page: Option<Vec<u8>> = None;
+    let mut delete_after_page: Option<Vec<u8>> = None;
 
     // Find the old entry and mark it as deleted.
     for i in 0..pg_class_page.get_tuple_count() {
@@ -178,9 +180,11 @@ pub fn update_pg_class_page_id(
             if oid == table_oid {
                 let tuple_data_vec = pg_class_page.get_tuple(i).unwrap().to_vec();
                 if let Some(item_id_data) = pg_class_page.get_item_id_data(i) {
+                    delete_before_page = Some(pg_class_page.data.to_vec());
                     let mut header = pg_class_page.read_tuple_header(item_id_data.offset);
                     header.xmax = tx_id;
                     pg_class_page.write_tuple_header(item_id_data.offset, &header);
+                    delete_after_page = Some(pg_class_page.data.to_vec());
                     old_item_id = Some(i);
                     old_tuple_data = Some(tuple_data_vec);
                 }
@@ -191,13 +195,6 @@ pub fn update_pg_class_page_id(
 
     // Add the new entry with the correct page_id.
     if let Some(mut tuple_data) = old_tuple_data {
-        tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
-        let new_item_id = pg_class_page
-            .add_tuple(&tuple_data, tx_id, 0)
-            .ok_or_else(|| {
-                ExecutionError::GenericError("Failed to insert into pg_class".to_string())
-            })?;
-
         if let Some(old_id) = old_item_id {
             let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
             let lsn = wm.lock().unwrap().log(
@@ -207,10 +204,22 @@ pub fn update_pg_class_page_id(
                     tx_id,
                     page_id: PG_CLASS_TABLE_OID,
                     item_id: old_id,
+                    before_page: delete_before_page.unwrap_or_default(),
+                    after_page: delete_after_page.unwrap_or_default(),
                 },
             )?;
             tm.set_last_lsn(tx_id, lsn);
         }
+
+        let before_insert_page = pg_class_page.data.to_vec();
+        tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
+        let new_item_id = pg_class_page
+            .add_tuple(&tuple_data, tx_id, 0)
+            .ok_or_else(|| {
+                ExecutionError::GenericError("Failed to insert into pg_class".to_string())
+            })?;
+        let after_insert_page = pg_class_page.data.to_vec();
+
         let prev_lsn = tm.get_last_lsn(tx_id).unwrap_or(0);
         let lsn = wm.lock().unwrap().log(
             tx_id,
@@ -219,6 +228,8 @@ pub fn update_pg_class_page_id(
                 tx_id,
                 page_id: PG_CLASS_TABLE_OID,
                 item_id: new_item_id,
+                before_page: before_insert_page,
+                after_page: after_insert_page,
             },
         )?;
         tm.set_last_lsn(tx_id, lsn);

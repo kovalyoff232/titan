@@ -92,8 +92,7 @@ impl TransactionManager {
         tx_id
     }
 
-    /// Commits a transaction.
-    pub fn commit(&self, tx_id: TransactionId) {
+    fn finalize_commit(&self, tx_id: TransactionId) {
         self.state
             .active_transactions
             .lock()
@@ -105,6 +104,27 @@ impl TransactionManager {
             tx_id,
             self.state.active_transactions.lock().unwrap()
         );
+    }
+
+    /// Commits a transaction.
+    ///
+    /// This path keeps legacy behavior for call sites that do not have access to WAL.
+    /// Prefer `commit_with_wal` for durable commits.
+    pub fn commit(&self, tx_id: TransactionId) {
+        self.finalize_commit(tx_id);
+    }
+
+    /// Commits a transaction and persists a COMMIT record in WAL.
+    pub fn commit_with_wal(
+        &self,
+        tx_id: TransactionId,
+        wal: &mut WalManager,
+    ) -> std::io::Result<()> {
+        let prev_lsn = self.get_last_lsn(tx_id).unwrap_or(0);
+        let lsn = wal.log(tx_id, prev_lsn, &WalRecord::Commit { tx_id })?;
+        self.set_last_lsn(tx_id, lsn);
+        self.finalize_commit(tx_id);
+        Ok(())
     }
 
     /// Gets the last LSN for a transaction.
@@ -163,48 +183,24 @@ impl TransactionManager {
             // Now, perform the physical UNDO operation.
             match rec {
                 WalRecord::InsertTuple {
-                    page_id, item_id, ..
-                } => {
-                    let page_guard = bpm.acquire_page(page_id)?;
-                    let mut page = page_guard.write();
-                    if let Some(item_id_data) = page.get_item_id_data(item_id) {
-                        let mut header = page.read_tuple_header(item_id_data.offset);
-                        // Physically mark the tuple as deleted by this abort.
-                        header.xmax = tx_id;
-                        page.write_tuple_header(item_id_data.offset, &header);
-                    }
-                    let mut header = page.read_header();
-                    header.lsn = clr_lsn;
-                    page.write_header(&header);
-                }
-                WalRecord::DeleteTuple {
-                    page_id, item_id, ..
-                } => {
-                    let page_guard = bpm.acquire_page(page_id)?;
-                    let mut page = page_guard.write();
-                    if let Some(item_id_data) = page.get_item_id_data(item_id) {
-                        let mut header = page.read_tuple_header(item_id_data.offset);
-                        // Undo the deletion by clearing the xmax.
-                        if header.xmax == tx_id {
-                            header.xmax = 0;
-                        }
-                        page.write_tuple_header(item_id_data.offset, &header);
-                    }
-                    let mut header = page.read_header();
-                    header.lsn = clr_lsn;
-                    page.write_header(&header);
-                }
-                WalRecord::UpdateTuple {
                     page_id,
-                    item_id,
-                    old_data,
+                    before_page,
+                    ..
+                }
+                | WalRecord::DeleteTuple {
+                    page_id,
+                    before_page,
+                    ..
+                }
+                | WalRecord::UpdateTuple {
+                    page_id,
+                    before_page,
                     ..
                 } => {
                     let page_guard = bpm.acquire_page(page_id)?;
                     let mut page = page_guard.write();
-                    if let Some(tuple) = page.get_raw_tuple_mut(item_id) {
-                        // Restore the old version of the tuple.
-                        tuple.copy_from_slice(&old_data);
+                    if before_page.len() == page.data.len() {
+                        page.data.copy_from_slice(&before_page);
                     }
                     let mut header = page.read_header();
                     header.lsn = clr_lsn;

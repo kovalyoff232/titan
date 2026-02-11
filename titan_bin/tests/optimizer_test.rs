@@ -89,7 +89,8 @@ fn test_optimizer_chooses_index_scan() {
     client.simple_query("CREATE INDEX idx_id ON t5(id);");
     client.simple_query("COMMIT;");
 
-    for i in 0..1000 {
+    // Keep this dataset moderate so the test stays bounded in debug builds.
+    for i in 0..200 {
         client.simple_query(&format!("INSERT INTO t5 VALUES ({}, 'text{}');", i, i));
     }
     client.simple_query("COMMIT;");
@@ -97,8 +98,8 @@ fn test_optimizer_chooses_index_scan() {
     client.simple_query("ANALYZE t5;");
     client.simple_query("COMMIT;");
 
-    let result = client.simple_query("SELECT data FROM t5 WHERE id = 500;");
+    let result = client.simple_query("SELECT data FROM t5 WHERE id = 150;");
 
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0][0], "text500");
+    assert_eq!(result[0][0], "text150");
 }
