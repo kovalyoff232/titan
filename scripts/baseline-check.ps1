@@ -23,14 +23,22 @@ function Invoke-Step {
     )
 
     Write-Host "==> $Name"
-    $proc = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList @("-NoProfile", "-Command", $Command) `
-        -WorkingDirectory (Get-Location).Path `
-        -NoNewWindow `
-        -PassThru
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -EncodedCommand $encoded"
+    $psi.WorkingDirectory = (Get-Location).Path
+    $psi.UseShellExecute = $false
 
-    if (-not (Wait-Process -Id $proc.Id -Timeout $TimeoutSec -ErrorAction SilentlyContinue)) {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        try {
+            $proc.Kill()
+        } catch {
+        }
         throw "Step '$Name' timed out after ${TimeoutSec}s"
     }
 

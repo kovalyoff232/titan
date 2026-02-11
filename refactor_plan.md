@@ -39,8 +39,9 @@
 - [x] Plan documented.
 - [x] Phase 1 started with baseline artifacts.
 - [x] Phase 2 started with the first safe extraction from `executor.rs`.
+- [x] `executor` domain split started: `scan` and `join` moved to dedicated submodules.
 
-## Immediate Execution Order
-1. Add baseline check script with command timeouts.
-2. Do the first no-risk `executor` cut: extract helper layer to submodule.
-3. Run formatting and keep the result in a separate commit.
+## Next Execution Order
+1. Continue `executor` split: move `dml` flow (`insert`, `update`, `delete`) to submodules.
+2. Keep `executor::execute` as the single stable facade.
+3. Add smoke scenarios and PR checklist to complete Phase 1 guardrails.
