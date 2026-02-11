@@ -26,7 +26,7 @@ use dml::{execute_delete, execute_insert, execute_update};
 pub(crate) use eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 pub use helpers::parse_tuple;
 use join::{HashJoinExecutor, NestedLoopJoinExecutor};
-use maintenance::{execute_analyze, execute_vacuum};
+use maintenance::{MaintenanceCtx, execute_analyze, execute_vacuum};
 use pipeline::{FilterExecutor, ProjectionExecutor, SortExecutor};
 use scan::{IndexScanExecutor, TableScanExecutor};
 
@@ -122,12 +122,28 @@ pub fn execute(
         )
         .map(ExecuteResult::Delete),
         Statement::Vacuum(table_name) => {
-            execute_vacuum(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
-                .map(|_| ExecuteResult::Ddl)
+            let ctx = MaintenanceCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_vacuum(table_name, &ctx).map(|_| ExecuteResult::Ddl)
         }
         Statement::Analyze(table_name) => {
-            execute_analyze(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
-                .map(|_| ExecuteResult::Ddl)
+            let ctx = MaintenanceCtx {
+                bpm,
+                tm,
+                lm,
+                wm,
+                tx_id,
+                snapshot,
+                system_catalog,
+            };
+            execute_analyze(table_name, &ctx).map(|_| ExecuteResult::Ddl)
         }
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Err(ExecutionError::GenericError(

@@ -14,6 +14,16 @@ use rand::thread_rng;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(super) struct MaintenanceCtx<'a> {
+    pub(super) bpm: &'a Arc<BufferPoolManager>,
+    pub(super) tm: &'a Arc<TransactionManager>,
+    pub(super) lm: &'a Arc<LockManager>,
+    pub(super) wm: &'a Arc<Mutex<WalManager>>,
+    pub(super) tx_id: u32,
+    pub(super) snapshot: &'a Snapshot,
+    pub(super) system_catalog: &'a Arc<Mutex<SystemCatalog>>,
+}
+
 fn lock_system_catalog<'a>(
     system_catalog: &'a Arc<Mutex<SystemCatalog>>,
 ) -> Result<MutexGuard<'a, SystemCatalog>, ExecutionError> {
@@ -24,19 +34,13 @@ fn lock_system_catalog<'a>(
 
 pub(super) fn execute_vacuum(
     table_name: &str,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &MaintenanceCtx<'_>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, old_first_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(table_name, bpm, tx_id, snapshot)?
+    let (table_oid, old_first_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
-    lm.lock(
-        tx_id,
+    ctx.lm.lock(
+        ctx.tx_id,
         LockableResource::Table(table_oid),
         LockMode::Exclusive,
     )?;
@@ -44,17 +48,28 @@ pub(super) fn execute_vacuum(
         return Ok(());
     }
 
-    let schema =
-        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let live_tuples: Vec<_> =
-        scan_table(bpm, lm, old_first_page_id, &schema, tx_id, snapshot, false)?
-            .into_iter()
-            .map(|(_, _, parsed)| parsed)
-            .collect();
+    let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+        ctx.bpm,
+        table_oid,
+        ctx.tx_id,
+        ctx.snapshot,
+    )?;
+    let live_tuples: Vec<_> = scan_table(
+        ctx.bpm,
+        ctx.lm,
+        old_first_page_id,
+        &schema,
+        ctx.tx_id,
+        ctx.snapshot,
+        false,
+    )?
+    .into_iter()
+    .map(|(_, _, parsed)| parsed)
+    .collect();
 
     let mut new_first_page_id = INVALID_PAGE_ID;
     if !live_tuples.is_empty() {
-        let first_page_guard = bpm.new_page()?;
+        let first_page_guard = ctx.bpm.new_page()?;
         new_first_page_id = first_page_guard.read().id;
         drop(first_page_guard);
         let mut current_new_page_id = new_first_page_id;
@@ -64,12 +79,12 @@ pub(super) fn execute_vacuum(
 
             let mut inserted = false;
             while !inserted {
-                let page_guard = bpm.acquire_page(current_new_page_id)?;
+                let page_guard = ctx.bpm.acquire_page(current_new_page_id)?;
                 let mut page = page_guard.write();
-                if page.add_tuple(&tuple_data, tx_id, 0).is_some() {
+                if page.add_tuple(&tuple_data, ctx.tx_id, 0).is_some() {
                     inserted = true;
                 } else {
-                    let new_page_guard = bpm.new_page()?;
+                    let new_page_guard = ctx.bpm.new_page()?;
                     let next_id = new_page_guard.read().id;
                     let mut header = page.read_header();
                     header.next_page_id = next_id;
@@ -80,68 +95,86 @@ pub(super) fn execute_vacuum(
         }
     }
 
-    update_pg_class_page_id(bpm, tm, wm, tx_id, snapshot, table_oid, new_first_page_id)?;
+    update_pg_class_page_id(
+        ctx.bpm,
+        ctx.tm,
+        ctx.wm,
+        ctx.tx_id,
+        ctx.snapshot,
+        table_oid,
+        new_first_page_id,
+    )?;
     Ok(())
 }
 
 pub(super) fn execute_analyze(
     table_name: &str,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &MaintenanceCtx<'_>,
 ) -> Result<(), ExecutionError> {
-    analyze_table_and_update_stats(table_name, bpm, tm, lm, wm, tx_id, snapshot, system_catalog)
+    analyze_table_and_update_stats(table_name, ctx)
 }
 
 fn analyze_table_and_update_stats(
     table_name: &str,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    lm: &Arc<LockManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &MaintenanceCtx<'_>,
 ) -> Result<(), ExecutionError> {
     const RESERVOIR_SIZE: usize = 1000;
     const MCV_LIST_SIZE: usize = 10;
     const HISTOGRAM_BINS: usize = 100;
 
-    let (table_oid, first_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(table_name, bpm, tx_id, snapshot)?
+    let (table_oid, first_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
     if first_page_id == INVALID_PAGE_ID {
         return Ok(());
     }
 
-    lm.lock(tx_id, LockableResource::Table(table_oid), LockMode::Shared)?;
+    ctx.lm.lock(
+        ctx.tx_id,
+        LockableResource::Table(table_oid),
+        LockMode::Shared,
+    )?;
 
-    let schema =
-        lock_system_catalog(system_catalog)?.get_table_schema(bpm, table_oid, tx_id, snapshot)?;
-    let all_rows = scan_table(bpm, lm, first_page_id, &schema, tx_id, snapshot, false)?;
+    let schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+        ctx.bpm,
+        table_oid,
+        ctx.tx_id,
+        ctx.snapshot,
+    )?;
+    let all_rows = scan_table(
+        ctx.bpm,
+        ctx.lm,
+        first_page_id,
+        &schema,
+        ctx.tx_id,
+        ctx.snapshot,
+        false,
+    )?;
     let total_rows = all_rows.len();
 
-    let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) =
-        lock_system_catalog(system_catalog)?.find_table("pg_statistic", bpm, tx_id, snapshot)?
+    let (pg_stat_oid, pg_stat_first_page_id) = if let Some(info) = lock_system_catalog(
+        ctx.system_catalog,
+    )?
+    .find_table("pg_statistic", ctx.bpm, ctx.tx_id, ctx.snapshot)?
     {
         info
     } else {
         return Err(ExecutionError::TableNotFound("pg_statistic".to_string()));
     };
-    let pg_stat_schema =
-        lock_system_catalog(system_catalog)?.get_table_schema(bpm, pg_stat_oid, tx_id, snapshot)?;
+    let pg_stat_schema = lock_system_catalog(ctx.system_catalog)?.get_table_schema(
+        ctx.bpm,
+        pg_stat_oid,
+        ctx.tx_id,
+        ctx.snapshot,
+    )?;
 
     let mut current_page_id = pg_stat_first_page_id;
     while current_page_id != bedrock::page::INVALID_PAGE_ID {
-        let page_guard = bpm.acquire_page(current_page_id)?;
+        let page_guard = ctx.bpm.acquire_page(current_page_id)?;
         let mut page = page_guard.write();
 
         for item_id in 0..page.get_tuple_count() {
-            if page.is_visible(snapshot, tx_id, item_id) {
+            if page.is_visible(ctx.snapshot, ctx.tx_id, item_id) {
                 if let Some(tuple_data) = page.get_tuple(item_id) {
                     let parsed = parse_tuple(tuple_data, &pg_stat_schema);
                     if let Some(relid_val) = parsed.get("starelid") {
@@ -150,7 +183,7 @@ fn analyze_table_and_update_stats(
                                 let offset = item_id_data.offset;
                                 let mut header = page.read_tuple_header(offset);
                                 if header.xmax == 0 {
-                                    header.xmax = tx_id;
+                                    header.xmax = ctx.tx_id;
                                     page.write_tuple_header(offset, &header);
                                 }
                             }
@@ -174,16 +207,7 @@ fn analyze_table_and_update_stats(
     row_count_tuple.extend_from_slice(empty_text.as_bytes());
     row_count_tuple.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
     row_count_tuple.extend_from_slice(empty_text.as_bytes());
-    insert_tuple_into_system_table(
-        &row_count_tuple,
-        "pg_statistic",
-        bpm,
-        tm,
-        wm,
-        tx_id,
-        snapshot,
-        system_catalog,
-    )?;
+    insert_tuple_into_system_table(&row_count_tuple, "pg_statistic", ctx)?;
 
     for (i, column) in schema.iter().enumerate() {
         let mut column_values: Vec<LiteralValue> = all_rows
@@ -205,16 +229,7 @@ fn analyze_table_and_update_stats(
         tuple_data.extend_from_slice(empty_text.as_bytes());
         tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
         tuple_data.extend_from_slice(empty_text.as_bytes());
-        insert_tuple_into_system_table(
-            &tuple_data,
-            "pg_statistic",
-            bpm,
-            tm,
-            wm,
-            tx_id,
-            snapshot,
-            system_catalog,
-        )?;
+        insert_tuple_into_system_table(&tuple_data, "pg_statistic", ctx)?;
 
         if total_rows == 0 {
             continue;
@@ -257,16 +272,7 @@ fn analyze_table_and_update_stats(
             tuple_data.extend_from_slice(empty_text.as_bytes());
             tuple_data.extend_from_slice(&(mcv_str.len() as u32).to_be_bytes());
             tuple_data.extend_from_slice(mcv_str.as_bytes());
-            insert_tuple_into_system_table(
-                &tuple_data,
-                "pg_statistic",
-                bpm,
-                tm,
-                wm,
-                tx_id,
-                snapshot,
-                system_catalog,
-            )?;
+            insert_tuple_into_system_table(&tuple_data, "pg_statistic", ctx)?;
         }
 
         column_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -294,16 +300,7 @@ fn analyze_table_and_update_stats(
             tuple_data.extend_from_slice(hist_str.as_bytes());
             tuple_data.extend_from_slice(&(empty_text.len() as u32).to_be_bytes());
             tuple_data.extend_from_slice(empty_text.as_bytes());
-            insert_tuple_into_system_table(
-                &tuple_data,
-                "pg_statistic",
-                bpm,
-                tm,
-                wm,
-                tx_id,
-                snapshot,
-                system_catalog,
-            )?;
+            insert_tuple_into_system_table(&tuple_data, "pg_statistic", ctx)?;
         }
     }
 
@@ -313,28 +310,23 @@ fn analyze_table_and_update_stats(
 fn insert_tuple_into_system_table(
     tuple_data: &[u8],
     table_name: &str,
-    bpm: &Arc<BufferPoolManager>,
-    tm: &Arc<TransactionManager>,
-    wm: &Arc<Mutex<WalManager>>,
-    tx_id: u32,
-    snapshot: &Snapshot,
-    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    ctx: &MaintenanceCtx<'_>,
 ) -> Result<(), ExecutionError> {
-    let (table_oid, mut first_page_id) = lock_system_catalog(system_catalog)?
-        .find_table(table_name, bpm, tx_id, snapshot)?
+    let (table_oid, mut first_page_id) = lock_system_catalog(ctx.system_catalog)?
+        .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
         .ok_or_else(|| ExecutionError::TableNotFound(table_name.to_string()))?;
 
     let page_id = find_or_create_page_for_insert(
-        bpm,
-        tm,
-        wm,
-        tx_id,
-        snapshot,
+        ctx.bpm,
+        ctx.tm,
+        ctx.wm,
+        ctx.tx_id,
+        ctx.snapshot,
         table_oid,
         &mut first_page_id,
         tuple_data.len(),
     )?;
 
-    let _ = insert_tuple_and_log(bpm, tm, wm, tx_id, page_id, tuple_data)?;
+    let _ = insert_tuple_and_log(ctx.bpm, ctx.tm, ctx.wm, ctx.tx_id, page_id, tuple_data)?;
     Ok(())
 }
