@@ -10,6 +10,7 @@ use super::model::{
 };
 
 type PlanCache = HashMap<u32, Vec<PlanInfo>>;
+const DP_JOIN_RELATION_LIMIT: usize = 8;
 
 fn find_scan_filter<'a>(plan: &'a LogicalPlan, table_name: &str) -> Option<&'a Expression> {
     match plan {
@@ -104,7 +105,12 @@ pub(super) fn choose_best_join_plan(
     stats: &HashMap<String, Arc<TableStats>>,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Option<PlanInfo> {
-    if table_names.is_empty() {
+    let num_tables = table_names.len();
+    if num_tables == 0 {
+        return None;
+    }
+
+    if num_tables > DP_JOIN_RELATION_LIMIT {
         return None;
     }
 
@@ -161,7 +167,6 @@ pub(super) fn choose_best_join_plan(
         cache.insert(relation_mask, plans_for_rel);
     }
 
-    let num_tables = table_names.len();
     for i in 2..=num_tables {
         for subset_mask in (0..(1u32 << num_tables)).filter(|m| m.count_ones() == i as u32) {
             let mut best_plans_for_subset = Vec::new();
@@ -433,5 +438,18 @@ mod tests {
         let best = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
             .expect("expected a plan");
         assert!(matches!(&*best.plan, PhysicalPlan::TableScan { .. }));
+    }
+
+    #[test]
+    fn returns_none_when_relation_count_exceeds_dp_limit() {
+        let logical = build_two_table_equi_join();
+        let table_names = (0..(DP_JOIN_RELATION_LIMIT + 1))
+            .map(|i| format!("t{}", i))
+            .collect::<Vec<_>>();
+        let stats: HashMap<String, Arc<TableStats>> = HashMap::new();
+        let system_catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+
+        let best = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog);
+        assert!(best.is_none());
     }
 }
