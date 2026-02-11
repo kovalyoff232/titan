@@ -7,7 +7,7 @@ use bedrock::wal::WalManager;
 use bytes::{BufMut, BytesMut};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 pub mod aggregate_executor;
@@ -21,6 +21,93 @@ pub mod planner;
 pub mod sql_extensions;
 pub mod types;
 pub mod window_executor;
+
+const SSL_REQUEST_CODE: u32 = 80_877_103;
+const PG_PROTOCOL_V3: u32 = 196_608;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn parse_startup_code(startup_buf: &[u8], read_len: usize) -> io::Result<u32> {
+    if read_len < 8 || startup_buf.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet too short",
+        ));
+    }
+
+    let mut code = [0u8; 4];
+    code.copy_from_slice(&startup_buf[4..8]);
+    Ok(u32::from_be_bytes(code))
+}
+
+fn parse_message_payload_len(len_bytes: [u8; 4]) -> io::Result<usize> {
+    let total_len = i32::from_be_bytes(len_bytes);
+    if total_len < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid message length prefix",
+        ));
+    }
+    let payload_len = (total_len - 4) as usize;
+    if payload_len > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message payload exceeds limit",
+        ));
+    }
+    Ok(payload_len)
+}
+
+fn parse_simple_query_payload(payload: &[u8]) -> io::Result<String> {
+    if payload.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty query payload",
+        ));
+    }
+    let text = if payload.last() == Some(&0) {
+        &payload[..payload.len() - 1]
+    } else {
+        payload
+    };
+    Ok(String::from_utf8_lossy(text).to_string())
+}
+
+fn lock_wal<'a>(wal: &'a Arc<Mutex<WalManager>>) -> io::Result<MutexGuard<'a, WalManager>> {
+    wal.lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "wal lock poisoned"))
+}
+
+fn abort_transaction(
+    tm: &TransactionManager,
+    wal: &Arc<Mutex<WalManager>>,
+    bpm: &Arc<BufferPoolManager>,
+    lm: &LockManager,
+    tx_id: u32,
+) -> io::Result<()> {
+    let mut wal_guard = lock_wal(wal)?;
+    tm.abort(tx_id, &mut wal_guard, bpm)?;
+    drop(wal_guard);
+    lm.unlock_all(tx_id);
+    Ok(())
+}
+
+fn commit_transaction(
+    tm: &TransactionManager,
+    wal: &Arc<Mutex<WalManager>>,
+    bpm: &Arc<BufferPoolManager>,
+    lm: &LockManager,
+    tx_id: u32,
+    flush_pages: bool,
+) -> io::Result<()> {
+    let mut wal_guard = lock_wal(wal)?;
+    tm.commit_with_wal(tx_id, &mut wal_guard)?;
+    drop(wal_guard);
+    lm.unlock_all(tx_id);
+    if flush_pages {
+        bpm.flush_all_pages()?;
+    }
+    Ok(())
+}
 
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
@@ -107,21 +194,29 @@ fn handle_client(
     let mut buffer = BytesMut::with_capacity(1024);
 
     let mut startup_buf = [0; 1024];
-    let _n = stream.read(&mut startup_buf)?;
+    let mut startup_len = stream.read(&mut startup_buf)?;
+    if startup_len == 0 {
+        return Ok(());
+    }
 
-    let request_code = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
-    if request_code == 80877103 {
+    let request_code = parse_startup_code(&startup_buf, startup_len)?;
+    if request_code == SSL_REQUEST_CODE {
         println!("[handle_client] SSLRequest received, denying.");
         stream.write_all(b"N")?;
-        let n = stream.read(&mut startup_buf)?;
-        if n == 0 {
+        startup_len = stream.read(&mut startup_buf)?;
+        if startup_len == 0 {
+            return Ok(());
+        }
+        let request_code = parse_startup_code(&startup_buf, startup_len)?;
+        if request_code == SSL_REQUEST_CODE {
+            send_error_response(&mut stream, "Repeated SSLRequest", "08P01")?;
             return Ok(());
         }
     }
 
-    let protocol_version = u32::from_be_bytes(startup_buf[4..8].try_into().unwrap());
+    let protocol_version = parse_startup_code(&startup_buf, startup_len)?;
     println!("[handle_client] Protocol version: {}", protocol_version);
-    if protocol_version != 196608 {
+    if protocol_version != PG_PROTOCOL_V3 {
         send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
         return Ok(());
     }
@@ -139,22 +234,31 @@ fn handle_client(
         if stream.read_exact(&mut msg_type).is_err() {
             println!("[handle_client] Connection closed by peer.");
             if in_transaction {
-                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                lm.unlock_all(tx_id);
+                if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                    println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                }
             }
             return Ok(());
         }
 
         let mut len_bytes = [0u8; 4];
         stream.read_exact(&mut len_bytes)?;
-        let len = i32::from_be_bytes(len_bytes) as usize - 4;
+        let len = parse_message_payload_len(len_bytes)?;
 
         buffer.resize(len, 0);
         stream.read_exact(&mut buffer)?;
 
         match msg_type[0] {
             b'Q' => {
-                let query_str = String::from_utf8_lossy(&buffer[..len - 1]).to_string();
+                let query_str = match parse_simple_query_payload(&buffer[..len]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("[handle_client] Invalid query payload: {}", e);
+                        send_error_response(&mut stream, "Invalid simple query payload", "08P01")?;
+                        send_ready_for_query(&mut stream)?;
+                        continue;
+                    }
+                };
                 println!("[handle_client] Received query: '{}'", query_str);
 
                 let stmts = match parser::sql_parser(&query_str) {
@@ -204,9 +308,7 @@ fn handle_client(
                             continue;
                         }
                         parser::Statement::Commit => {
-                            tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
-                            lm.unlock_all(tx_id);
-                            bpm.flush_all_pages()?;
+                            commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true)?;
                             in_transaction = false;
                             in_explicit_transaction = false;
                             send_command_complete(&mut stream, "COMMIT")?;
@@ -214,8 +316,7 @@ fn handle_client(
                             continue;
                         }
                         parser::Statement::Rollback => {
-                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                            lm.unlock_all(tx_id);
+                            abort_transaction(&tm, &wal, &bpm, &lm, tx_id)?;
                             in_transaction = false;
                             in_explicit_transaction = false;
                             send_command_complete(&mut stream, "ROLLBACK")?;
@@ -235,8 +336,9 @@ fn handle_client(
                                 tx_id
                             );
                             send_error_response(&mut stream, "Serialization failure", "40001")?;
-                            tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                            lm.unlock_all(tx_id);
+                            if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                                println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                            }
                             in_transaction = false;
                             in_explicit_transaction = false;
                             last_result = None;
@@ -250,8 +352,14 @@ fn handle_client(
                                 "XX000",
                             )?;
                             if in_transaction {
-                                tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                                lm.unlock_all(tx_id);
+                                if let Err(abort_err) =
+                                    abort_transaction(&tm, &wal, &bpm, &lm, tx_id)
+                                {
+                                    println!(
+                                        "[handle_client] Failed to abort tx_id {}: {}",
+                                        tx_id, abort_err
+                                    );
+                                }
                                 in_transaction = false;
                                 in_explicit_transaction = false;
                             }
@@ -289,9 +397,7 @@ fn handle_client(
                         "[handle_client] Committing implicit transaction with tx_id: {}",
                         tx_id
                     );
-                    tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
-                    lm.unlock_all(tx_id);
-                    bpm.flush_all_pages()?;
+                    commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true)?;
                     in_transaction = false;
                 }
 
@@ -300,8 +406,9 @@ fn handle_client(
             b'X' => {
                 println!("[handle_client] Terminate message received. Closing connection.");
                 if in_transaction {
-                    tm.abort(tx_id, &mut wal.lock().unwrap(), &bpm).unwrap();
-                    lm.unlock_all(tx_id);
+                    if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                        println!("[handle_client] Failed to abort tx_id {}: {}", tx_id, e);
+                    }
                 }
                 return Ok(());
             }
@@ -338,12 +445,15 @@ pub fn run_server(db_path: &str, wal_path: &str, addr: &str) -> std::io::Result<
 
     if db_is_new {
         println!("[INIT] New database detected, initializing system tables.");
-        initialize_db(&bpm, &tm, &lm, &wal, &system_catalog)
-            .expect("Failed to initialize database");
+        initialize_db(&bpm, &tm, &lm, &wal, &system_catalog).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to initialize database: {:?}", e),
+            )
+        })?;
 
         println!("[INIT] Flushing all pages to disk after initialization.");
-        bpm.flush_all_pages()
-            .expect("Failed to flush pages after init");
+        bpm.flush_all_pages()?;
         println!("[INIT] Flushing completed.");
     }
 
@@ -492,8 +602,66 @@ fn initialize_db(
     )?;
     println!("[initialize_db] pg_statistic table created.");
 
-    tm.commit_with_wal(tx_id, &mut wal.lock().unwrap())?;
+    let mut wal_guard = lock_wal(wal)
+        .map_err(|e| errors::ExecutionError::GenericError(format!("wal lock failed: {}", e)))?;
+    tm.commit_with_wal(tx_id, &mut wal_guard)?;
+    drop(wal_guard);
     lm.unlock_all(tx_id);
     println!("[initialize_db] Initialization transaction committed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PG_PROTOCOL_V3, SSL_REQUEST_CODE, parse_message_payload_len, parse_simple_query_payload,
+        parse_startup_code,
+    };
+
+    #[test]
+    fn parses_startup_code() {
+        let mut buf = [0u8; 8];
+        buf[4..8].copy_from_slice(&PG_PROTOCOL_V3.to_be_bytes());
+        let code = parse_startup_code(&buf, 8).unwrap();
+        assert_eq!(code, PG_PROTOCOL_V3);
+    }
+
+    #[test]
+    fn rejects_short_startup_packet() {
+        let buf = [0u8; 4];
+        assert!(parse_startup_code(&buf, 4).is_err());
+    }
+
+    #[test]
+    fn parses_message_payload_length() {
+        let payload_len = parse_message_payload_len((9_i32).to_be_bytes()).unwrap();
+        assert_eq!(payload_len, 5);
+    }
+
+    #[test]
+    fn rejects_invalid_message_payload_length() {
+        assert!(parse_message_payload_len((3_i32).to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn parses_query_payload_with_trailing_nul() {
+        let q = parse_simple_query_payload(b"SELECT 1;\0").unwrap();
+        assert_eq!(q, "SELECT 1;");
+    }
+
+    #[test]
+    fn parses_query_payload_without_trailing_nul() {
+        let q = parse_simple_query_payload(b"SELECT 2").unwrap();
+        assert_eq!(q, "SELECT 2");
+    }
+
+    #[test]
+    fn rejects_empty_query_payload() {
+        assert!(parse_simple_query_payload(b"").is_err());
+    }
+
+    #[test]
+    fn ssl_request_code_constant_is_stable() {
+        assert_eq!(SSL_REQUEST_CODE, 80_877_103);
+    }
 }
