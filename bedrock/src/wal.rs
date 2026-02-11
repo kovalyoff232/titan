@@ -6,11 +6,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 pub type Lsn = u64;
+
+fn lock_mutex_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -129,9 +135,8 @@ impl WalManager {
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
-                if let Ok(file) = file_clone.lock() {
-                    let _ = file.sync_all();
-                }
+                let file = lock_mutex_recover(&file_clone);
+                let _ = file.sync_all();
             }
         });
 
@@ -169,7 +174,7 @@ impl WalManager {
             crc,
         };
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = lock_mutex_recover(&self.file);
         file.seek(SeekFrom::Start(lsn))?;
         file.write_all(unsafe {
             std::slice::from_raw_parts(&header as *const _ as *const u8, header_len as usize)
@@ -184,7 +189,7 @@ impl WalManager {
     }
 
     pub fn read_record(&mut self, lsn: Lsn) -> io::Result<(Option<WalRecord>, Lsn)> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = lock_mutex_recover(&self.file);
         if lsn >= file.metadata()?.len() {
             return Ok((None, 0));
         }
@@ -236,7 +241,7 @@ impl WalManager {
             return Ok(());
         }
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = lock_mutex_recover(&self.file);
         let file_len = file.metadata()?.len();
 
         if last_checkpoint_lsn < file_len {
