@@ -583,6 +583,84 @@ mod tests {
     }
 
     #[test]
+    fn sort_executor_defaults_to_nulls_last_for_ascending_order() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "payload".to_string(),
+                type_id: 25,
+            }],
+            vec![
+                vec!["b".to_string()],
+                vec!["".to_string()],
+                vec!["a".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Column("payload".to_string()),
+                asc: true,
+                nulls_first: None,
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string()],
+                vec!["".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_defaults_to_nulls_first_for_descending_order() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "payload".to_string(),
+                type_id: 25,
+            }],
+            vec![
+                vec!["b".to_string()],
+                vec!["".to_string()],
+                vec!["a".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Column("payload".to_string()),
+                asc: false,
+                nulls_first: None,
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["".to_string()],
+                vec!["b".to_string()],
+                vec!["a".to_string()],
+            ]
+        );
+    }
+
+    #[test]
     fn sort_executor_supports_order_by_position() {
         let input = StaticRowsExecutor::new(
             vec![

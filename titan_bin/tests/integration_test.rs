@@ -250,6 +250,41 @@ fn test_order_by_supports_nulls_last_for_descending() {
 
 #[test]
 #[serial]
+fn test_order_by_defaults_to_nulls_last_for_ascending() {
+    let mut client = common::setup_server_and_client("order_by_nulls_default_asc_test");
+
+    client.simple_query("CREATE TABLE nulls_sort_default_asc_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO nulls_sort_default_asc_test VALUES (1, NULL);");
+    client.simple_query("INSERT INTO nulls_sort_default_asc_test VALUES (2, 'b');");
+    client.simple_query("INSERT INTO nulls_sort_default_asc_test VALUES (3, 'a');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id FROM nulls_sort_default_asc_test ORDER BY payload;");
+    assert_eq!(rows, vec![vec!["3"], vec!["2"], vec!["1"]]);
+}
+
+#[test]
+#[serial]
+fn test_order_by_defaults_to_nulls_first_for_descending() {
+    let mut client = common::setup_server_and_client("order_by_nulls_default_desc_test");
+
+    client.simple_query("CREATE TABLE nulls_sort_default_desc_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO nulls_sort_default_desc_test VALUES (1, NULL);");
+    client.simple_query("INSERT INTO nulls_sort_default_desc_test VALUES (2, 'b');");
+    client.simple_query("INSERT INTO nulls_sort_default_desc_test VALUES (3, 'a');");
+    client.simple_query("COMMIT;");
+
+    let rows =
+        client.simple_query("SELECT id FROM nulls_sort_default_desc_test ORDER BY payload DESC;");
+    assert_eq!(rows, vec![vec!["1"], vec!["2"], vec!["3"]]);
+}
+
+#[test]
+#[serial]
 fn test_order_by_supports_position_reference() {
     let mut client = common::setup_server_and_client("order_by_position_test");
 
