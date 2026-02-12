@@ -1,0 +1,92 @@
+name: Weekly KPI
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  weekly_kpi:
+    runs-on: windows-latest
+    timeout-minutes: 70
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Runtime panic inventory
+        timeout-minutes: 4
+        continue-on-error: true
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/panic-inventory.ps1 `
+            -OutJson target/reports/panic-inventory.json `
+            -FailOnAny
+
+      - name: Benchmark smoke (Titan only)
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-baseline-benchmark.ps1 `
+            -Target titan `
+            -Rows 300 `
+            -Iterations 12 `
+            -Warmup 2 `
+            -OutJson target/benchmarks/weekly-kpi-smoke.json `
+            -BuildTimeoutSec 420 `
+            -RunTimeoutSec 420
+
+      - name: Run tests (per-target timeout)
+        timeout-minutes: 35
+        continue-on-error: true
+        env:
+          TITAN_RECOVERY_REPORT: ${{ github.workspace }}/target/reports/recovery-reconciliation.json
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-tests-with-timeout.ps1 `
+            -TimeoutSec 300 `
+            -OutJson target/reports/test-timeout-report.json
+
+      - name: Build weekly KPI report
+        if: always()
+        timeout-minutes: 4
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/weekly-kpi.ps1 `
+            -PanicReport target/reports/panic-inventory.json `
+            -RecoveryReport target/reports/recovery-reconciliation.json `
+            -BenchmarkReport target/benchmarks/weekly-kpi-smoke.json `
+            -TestReport target/reports/test-timeout-report.json `
+            -OutJson target/reports/weekly-kpi.json `
+            -OutTxt target/reports/weekly-kpi.txt `
+            -MinScore 85 `
+            -FailBelowMinScore
+
+      - name: Upload weekly KPI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-kpi-full
+          if-no-files-found: warn
+          path: |
+            target/reports/weekly-kpi.json
+            target/reports/weekly-kpi.txt
+            target/reports/panic-inventory.json
+            target/reports/recovery-reconciliation.json
+            target/reports/test-timeout-report.json
+            target/benchmarks/weekly-kpi-smoke.json
+            target/benchmarks/weekly-kpi-smoke.csv

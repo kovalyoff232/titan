@@ -4,7 +4,10 @@ param(
     [string]$BenchmarkReport = "target/benchmarks/smoke-ci.json",
     [string]$TestReport = "target/reports/test-timeout-report.json",
     [string]$OutJson = "target/reports/weekly-kpi.json",
-    [string]$OutTxt = "target/reports/weekly-kpi.txt"
+    [string]$OutTxt = "target/reports/weekly-kpi.txt",
+    [ValidateRange(0, 100)]
+    [int]$MinScore = 0,
+    [switch]$FailBelowMinScore
 )
 
 $ErrorActionPreference = "Stop"
@@ -158,6 +161,7 @@ $report = [pscustomobject]@{
     generated_at = (Get-Date).ToString("o")
     score = $score
     quality_band = $qualityBand
+    min_score = $MinScore
     sections = [pscustomobject]@{
         correctness = [pscustomobject]@{
             panic_status = $panicStatus
@@ -211,6 +215,10 @@ $summaryLines -join [Environment]::NewLine | Set-Content -Path $outTxtPath -Enco
 Write-Host "Weekly KPI report written: $outJsonPath"
 Write-Host "Weekly KPI text summary written: $outTxtPath"
 Write-Host "Score: $score ($qualityBand)"
+
+if ($FailBelowMinScore.IsPresent -and $score -lt $MinScore) {
+    throw "Weekly KPI score $score is below required minimum $MinScore"
+}
 
 if ($env:GITHUB_STEP_SUMMARY) {
     $md = @(
