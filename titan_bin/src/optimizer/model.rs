@@ -102,6 +102,34 @@ fn estimate_filter_selectivity(
                 _ => 0.33,
             }
         }
+        Expression::IsNull { expr, negated } => {
+            let Some(col_name) = get_col_name(expr) else {
+                return if *negated { 0.9 } else { 0.1 };
+            };
+            let Some(schema) = system_catalog
+                .lock()
+                .ok()
+                .and_then(|catalog| catalog.get_schema(table_name))
+            else {
+                return if *negated { 0.9 } else { 0.1 };
+            };
+            let Some(col_idx) = schema.iter().position(|c| c.name == col_name) else {
+                return if *negated { 0.9 } else { 0.1 };
+            };
+            let Some(col_stats) = table_stats.column_stats.get(&col_idx) else {
+                return if *negated { 0.9 } else { 0.1 };
+            };
+            let null_selectivity = if col_stats.most_common_vals.contains(&LiteralValue::Null) {
+                1.0 / col_stats.n_distinct.max(1.0)
+            } else {
+                0.1
+            };
+            if *negated {
+                (1.0 - null_selectivity).clamp(0.0, 1.0)
+            } else {
+                null_selectivity.clamp(0.0, 1.0)
+            }
+        }
         Expression::Unary { op, expr } => {
             if matches!(op, crate::parser::UnaryOperator::Not) {
                 1.0 - estimate_filter_selectivity(expr, table_name, table_stats, system_catalog)

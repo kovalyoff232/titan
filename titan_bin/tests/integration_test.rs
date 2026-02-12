@@ -125,6 +125,29 @@ fn test_join_with_table_aliases() {
 
 #[test]
 #[serial]
+fn test_is_null_and_is_not_null_filters() {
+    let mut client = common::setup_server_and_client("is_null_filter_test");
+
+    client.simple_query("CREATE TABLE nullable_users_test (id INT, deleted_at TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO nullable_users_test VALUES (1, NULL);");
+    client.simple_query("INSERT INTO nullable_users_test VALUES (2, '2026-02-12');");
+    client.simple_query("INSERT INTO nullable_users_test VALUES (3, NULL);");
+    client.simple_query("COMMIT;");
+
+    let null_rows = client
+        .simple_query("SELECT id FROM nullable_users_test WHERE deleted_at IS NULL ORDER BY id;");
+    assert_eq!(null_rows, vec![vec!["1"], vec!["3"]]);
+
+    let not_null_rows = client.simple_query(
+        "SELECT id FROM nullable_users_test WHERE deleted_at IS NOT NULL ORDER BY id;",
+    );
+    assert_eq!(not_null_rows, vec![vec!["2"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

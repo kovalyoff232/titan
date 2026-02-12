@@ -113,6 +113,10 @@ pub enum Expression {
         op: UnaryOperator,
         expr: Box<Expression>,
     },
+    IsNull {
+        expr: Box<Expression>,
+        negated: bool,
+    },
     WindowFunction {
         function: WindowFunctionType,
         args: Vec<Expression>,
@@ -225,6 +229,13 @@ impl fmt::Display for Expression {
             Expression::QualifiedColumn(table, col) => write!(f, "{}.{}", table, col),
             Expression::Binary { left, op, right } => write!(f, "({} {} {})", left, op, right),
             Expression::Unary { op, expr } => write!(f, "({} {})", op, expr),
+            Expression::IsNull { expr, negated } => {
+                if *negated {
+                    write!(f, "({} IS NOT NULL)", expr)
+                } else {
+                    write!(f, "({} IS NULL)", expr)
+                }
+            }
             Expression::WindowFunction { function, .. } => write!(
                 f,
                 "{}() OVER (...)",
@@ -304,8 +315,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT"
-                | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => Err(Simple::custom(
+                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "ASC" | "DESC"
+                | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => Err(Simple::custom(
                     span,
                     format!("keyword `{}` cannot be used as an identifier", ident),
                 )),
@@ -402,6 +413,32 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 right: Box::new(right),
             });
 
+        let null_check = product
+            .clone()
+            .then(
+                text::keyword("IS")
+                    .padded()
+                    .ignore_then(
+                        text::keyword("NOT")
+                            .padded()
+                            .to(true)
+                            .or_not()
+                            .map(|negated| negated.unwrap_or(false)),
+                    )
+                    .then_ignore(text::keyword("NULL").padded())
+                    .or_not(),
+            )
+            .map(|(expr, is_null_predicate)| {
+                if let Some(negated) = is_null_predicate {
+                    Expression::IsNull {
+                        expr: Box::new(expr),
+                        negated,
+                    }
+                } else {
+                    expr
+                }
+            });
+
         let comparison_op = just("=")
             .to(BinaryOperator::Eq)
             .or(just("!=").to(BinaryOperator::NotEq))
@@ -411,9 +448,9 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(just(">=").to(BinaryOperator::GtEq))
             .or(just(">").to(BinaryOperator::Gt));
 
-        let comparison = product
+        let comparison = null_check
             .clone()
-            .then(comparison_op.padded().then(product).repeated())
+            .then(comparison_op.padded().then(null_check).repeated())
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
@@ -866,6 +903,35 @@ mod tests {
         };
         assert!(stmt.group_by.is_some());
         assert!(stmt.having.is_some());
+    }
+
+    #[test]
+    fn select_where_parses_is_null_predicate() {
+        let parsed = sql_parser("SELECT id FROM users WHERE deleted_at IS NULL;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::IsNull { expr, negated } = where_expr else {
+            panic!("expected IS NULL expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("deleted_at".to_string()));
+        assert!(!negated);
+    }
+
+    #[test]
+    fn select_where_parses_is_not_null_predicate() {
+        let parsed =
+            sql_parser("SELECT id FROM users WHERE deleted_at IS NOT NULL;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::IsNull { expr, negated } = where_expr else {
+            panic!("expected IS NOT NULL expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("deleted_at".to_string()));
+        assert!(*negated);
     }
 
     #[test]

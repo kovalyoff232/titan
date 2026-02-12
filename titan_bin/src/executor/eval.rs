@@ -150,6 +150,16 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 },
             }
         }
+        Expression::IsNull { expr, negated } => {
+            let value = evaluate_expr_for_row_to_val(expr, row)?;
+            let is_null = matches!(value, LiteralValue::Null)
+                || matches!(value, LiteralValue::String(text) if text.is_empty());
+            Ok(LiteralValue::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            }))
+        }
         Expression::WindowFunction { .. } => Err(ExecutionError::GenericError(
             "Window functions cannot be evaluated in WHERE clause".to_string(),
         )),
@@ -254,6 +264,45 @@ mod tests {
             right: Box::new(Expression::Literal(LiteralValue::String("Bob".to_string()))),
         };
         let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn is_null_predicate_returns_true_for_null_values() {
+        let expr = Expression::IsNull {
+            expr: Box::new(Expression::Column("deleted_at".to_string())),
+            negated: false,
+        };
+        let mut row = HashMap::new();
+        row.insert("deleted_at".to_string(), LiteralValue::Null);
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn is_not_null_predicate_returns_false_for_null_values() {
+        let expr = Expression::IsNull {
+            expr: Box::new(Expression::Column("deleted_at".to_string())),
+            negated: true,
+        };
+        let mut row = HashMap::new();
+        row.insert("deleted_at".to_string(), LiteralValue::Null);
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(false));
+    }
+
+    #[test]
+    fn is_null_predicate_treats_empty_text_as_null_surrogate() {
+        let expr = Expression::IsNull {
+            expr: Box::new(Expression::Column("payload".to_string())),
+            negated: false,
+        };
+        let mut row = HashMap::new();
+        row.insert("payload".to_string(), LiteralValue::String(String::new()));
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Bool(true));
