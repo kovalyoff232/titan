@@ -45,6 +45,13 @@ jobs:
         cargo clippy --package bedrock --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic
         cargo clippy --package titan_bin --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic
 
+    - name: Runtime panic inventory gate
+      timeout-minutes: 3
+      run: |
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/panic-inventory.ps1 `
+          -OutJson target/reports/panic-inventory.json `
+          -FailOnAny
+
     - name: Build (no-run tests)
       timeout-minutes: 20
       run: cargo test --workspace --no-run --verbose
@@ -85,6 +92,15 @@ jobs:
         path: |
           target/reports/recovery-reconciliation.json
           titan_bin/target/reports/recovery-reconciliation.json
+
+    - name: Upload panic inventory report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: panic-inventory-report
+        if-no-files-found: warn
+        path: |
+          target/reports/panic-inventory.json
 
     - name: Upload benchmark smoke artifacts
       if: always()
