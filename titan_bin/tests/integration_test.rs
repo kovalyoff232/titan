@@ -234,6 +234,29 @@ fn test_where_between_and_not_between_filters() {
 
 #[test]
 #[serial]
+fn test_coalesce_function_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("coalesce_test");
+
+    client.simple_query("CREATE TABLE coalesce_values_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO coalesce_values_test VALUES (1, NULL);");
+    client.simple_query("INSERT INTO coalesce_values_test VALUES (2, 'value');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, COALESCE(payload, 'fallback') FROM coalesce_values_test ORDER BY id;",
+    );
+    assert_eq!(rows, vec![vec!["1", "fallback"], vec!["2", "value"]]);
+
+    let filtered_rows = client.simple_query(
+        "SELECT id FROM coalesce_values_test WHERE COALESCE(payload, 'fallback') = 'fallback';",
+    );
+    assert_eq!(filtered_rows, vec![vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

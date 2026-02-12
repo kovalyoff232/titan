@@ -282,6 +282,17 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     Ok(LiteralValue::Null)
                 }
             }
+            "COALESCE" => {
+                for arg in args {
+                    let value = evaluate_expr_for_row_to_val(arg, row)?;
+                    if !matches!(value, LiteralValue::Null)
+                        && !matches!(value, LiteralValue::String(ref text) if text.is_empty())
+                    {
+                        return Ok(value);
+                    }
+                }
+                Ok(LiteralValue::Null)
+            }
             _ => Err(ExecutionError::GenericError(format!(
                 "Unsupported function: {}",
                 name
@@ -540,5 +551,39 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn coalesce_function_returns_first_non_null_argument() {
+        let expr = Expression::Function {
+            name: "COALESCE".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::Null),
+                Expression::Literal(LiteralValue::String(String::new())),
+                Expression::Literal(LiteralValue::String("fallback".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(
+            result.unwrap(),
+            LiteralValue::String("fallback".to_string())
+        );
+    }
+
+    #[test]
+    fn coalesce_function_returns_null_when_all_arguments_are_null() {
+        let expr = Expression::Function {
+            name: "COALESCE".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::Null),
+                Expression::Literal(LiteralValue::Null),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Null);
     }
 }
