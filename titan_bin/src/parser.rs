@@ -155,6 +155,7 @@ pub enum BinaryOperator {
     Eq,
     NotEq,
     Like,
+    NotLike,
     Lt,
     LtEq,
     Gt,
@@ -298,6 +299,7 @@ impl fmt::Display for BinaryOperator {
             BinaryOperator::Eq => write!(f, "="),
             BinaryOperator::NotEq => write!(f, "<>"),
             BinaryOperator::Like => write!(f, "LIKE"),
+            BinaryOperator::NotLike => write!(f, "NOT LIKE"),
             BinaryOperator::Lt => write!(f, "<"),
             BinaryOperator::LtEq => write!(f, "<="),
             BinaryOperator::Gt => write!(f, ">"),
@@ -447,6 +449,10 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .to(BinaryOperator::Eq)
             .or(just("!=").to(BinaryOperator::NotEq))
             .or(just("<>").to(BinaryOperator::NotEq))
+            .or(text::keyword("NOT")
+                .padded()
+                .ignore_then(text::keyword("LIKE"))
+                .to(BinaryOperator::NotLike))
             .or(text::keyword("LIKE").to(BinaryOperator::Like))
             .or(just("<=").to(BinaryOperator::LtEq))
             .or(just("<").to(BinaryOperator::Lt))
@@ -896,6 +902,19 @@ mod tests {
             panic!("expected binary expression in WHERE");
         };
         assert_eq!(*op, super::BinaryOperator::Like);
+    }
+
+    #[test]
+    fn select_where_parses_not_like_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE name NOT LIKE 'Al%';").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Binary { op, .. } = where_expr else {
+            panic!("expected binary expression in WHERE");
+        };
+        assert_eq!(*op, super::BinaryOperator::NotLike);
     }
 
     #[test]

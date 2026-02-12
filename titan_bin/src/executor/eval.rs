@@ -127,6 +127,9 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         BinaryOperator::Like => Err(ExecutionError::GenericError(
                             "Unsupported operator for number".to_string(),
                         )),
+                        BinaryOperator::NotLike => Err(ExecutionError::GenericError(
+                            "Unsupported operator for number".to_string(),
+                        )),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => match op {
@@ -161,6 +164,7 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     BinaryOperator::Gt => Ok(LiteralValue::Bool(l > r)),
                     BinaryOperator::GtEq => Ok(LiteralValue::Bool(l >= r)),
                     BinaryOperator::Like => Ok(LiteralValue::Bool(like_match(&l, &r))),
+                    BinaryOperator::NotLike => Ok(LiteralValue::Bool(!like_match(&l, &r))),
                     _ => Err(ExecutionError::GenericError(
                         "Unsupported operator for text".to_string(),
                     )),
@@ -349,6 +353,21 @@ mod tests {
             right: Box::new(Expression::Literal(LiteralValue::String(
                 "Al_ce".to_string(),
             ))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn string_not_like_pattern_comparison_evaluates_to_boolean() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::String(
+                "Alice".to_string(),
+            ))),
+            op: BinaryOperator::NotLike,
+            right: Box::new(Expression::Literal(LiteralValue::String("Bo%".to_string()))),
         };
         let row = HashMap::new();
 

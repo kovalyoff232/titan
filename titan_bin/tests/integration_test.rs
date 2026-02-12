@@ -166,6 +166,10 @@ fn test_where_like_filter() {
     let single_char_rows =
         client.simple_query("SELECT id FROM like_users_test WHERE name LIKE '_ob' ORDER BY id;");
     assert_eq!(single_char_rows, vec![vec!["3"]]);
+
+    let not_like_rows = client
+        .simple_query("SELECT id FROM like_users_test WHERE name NOT LIKE 'Al%' ORDER BY id;");
+    assert_eq!(not_like_rows, vec![vec!["3"]]);
 }
 
 #[test]
