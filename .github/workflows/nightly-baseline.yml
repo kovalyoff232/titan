@@ -70,6 +70,13 @@ jobs:
             --postgres-dsn "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=titan_bench" \
             --out-json target/benchmarks/nightly-baseline.json
 
+      - name: Baseline ratio gate (Titan vs PostgreSQL)
+        timeout-minutes: 3
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-baseline-ratios.ps1 \
+            -ReportJson target/benchmarks/nightly-baseline.json \
+            -ThresholdJson scripts/benchmark-thresholds.baseline-ratio.json
+
       - name: Upload baseline artifacts
         uses: actions/upload-artifact@v4
         with:

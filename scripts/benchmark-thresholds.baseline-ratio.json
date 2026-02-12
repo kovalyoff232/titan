@@ -1,0 +1,23 @@
+{
+  "titan_engine": "titan",
+  "reference_engine": "postgres",
+  "min_reference_ms": 0.5,
+  "limits": {
+    "point_lookup": {
+      "max_p95_ratio": 25.0,
+      "max_mean_ratio": 25.0
+    },
+    "range_scan": {
+      "max_p95_ratio": 25.0,
+      "max_mean_ratio": 25.0
+    },
+    "ordered_scan": {
+      "max_p95_ratio": 25.0,
+      "max_mean_ratio": 25.0
+    },
+    "full_scan": {
+      "max_p95_ratio": 25.0,
+      "max_mean_ratio": 25.0
+    }
+  }
+}
