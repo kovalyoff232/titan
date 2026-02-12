@@ -125,14 +125,16 @@ impl<'a> SortExecutor<'a> {
                 "ORDER BY only supports a single column".to_string(),
             ));
         }
-        let sort_expr = &order_by[0];
+        let sort_expr = order_by.first().ok_or_else(|| {
+            ExecutionError::GenericError("missing ORDER BY expression".to_string())
+        })?;
 
         let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
             input
                 .schema()
                 .iter()
                 .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
-                .map(|i| (i, input.schema()[i].type_id))
+                .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
                 .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
         } else {
             return Err(ExecutionError::GenericError(
@@ -140,9 +142,19 @@ impl<'a> SortExecutor<'a> {
             ));
         };
 
+        if rows.iter().any(|row| row.get(sort_col_idx).is_none()) {
+            return Err(ExecutionError::GenericError(
+                "ORDER BY column index out of bounds for one or more rows".to_string(),
+            ));
+        }
+
         rows.sort_by(|a, b| {
-            let val_a = &a[sort_col_idx];
-            let val_b = &b[sort_col_idx];
+            let Some(val_a) = a.get(sort_col_idx) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(val_b) = b.get(sort_col_idx) else {
+                return std::cmp::Ordering::Equal;
+            };
             match sort_col_type {
                 23 => {
                     let num_a = val_a.parse::<i32>().unwrap_or(0);
@@ -184,7 +196,9 @@ impl<'a> Executor for SortExecutor<'a> {
         if self.cursor >= self.sorted_rows.len() {
             return Ok(None);
         }
-        let row = self.sorted_rows[self.cursor].clone();
+        let Some(row) = self.sorted_rows.get(self.cursor).cloned() else {
+            return Ok(None);
+        };
         self.cursor += 1;
         Ok(Some(row))
     }
@@ -217,7 +231,9 @@ mod tests {
             if self.cursor >= self.rows.len() {
                 return Ok(None);
             }
-            let row = self.rows[self.cursor].clone();
+            let Some(row) = self.rows.get(self.cursor).cloned() else {
+                return Ok(None);
+            };
             self.cursor += 1;
             Ok(Some(row))
         }
@@ -249,7 +265,10 @@ mod tests {
 
         let mut sorted = Vec::new();
         while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
-            sorted.push(row[0].clone());
+            let first = row
+                .first()
+                .expect("expected sort result row to have first column");
+            sorted.push(first.clone());
         }
 
         assert_eq!(sorted.len(), 3);
