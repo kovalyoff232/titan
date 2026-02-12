@@ -94,6 +94,50 @@ fn trim_string_by_charset(
     result.to_string()
 }
 
+fn literal_to_concat_text(value: LiteralValue) -> Option<String> {
+    match value {
+        LiteralValue::String(text) | LiteralValue::Number(text) | LiteralValue::Date(text) => {
+            Some(text)
+        }
+        LiteralValue::Bool(flag) => Some(if flag { "t" } else { "f" }.to_string()),
+        LiteralValue::Null => None,
+    }
+}
+
+fn substring_by_char_index(value: &str, start: i32, length: Option<i32>) -> String {
+    let total_chars = value.chars().count() as i32;
+    let start_index = if start <= 1 { 0 } else { start - 1 };
+    if start_index >= total_chars {
+        return String::new();
+    }
+    let max_len = total_chars - start_index;
+    let take_len = match length {
+        Some(len) if len <= 0 => 0,
+        Some(len) => len.min(max_len),
+        None => max_len,
+    };
+    value
+        .chars()
+        .skip(start_index as usize)
+        .take(take_len as usize)
+        .collect()
+}
+
+fn strpos_by_char_index(value: &str, pattern: &str) -> i32 {
+    if pattern.is_empty() {
+        return 1;
+    }
+    if let Some(byte_pos) = value.find(pattern) {
+        let char_pos = value
+            .char_indices()
+            .take_while(|(idx, _)| *idx < byte_pos)
+            .count();
+        (char_pos + 1) as i32
+    } else {
+        0
+    }
+}
+
 pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
@@ -368,6 +412,129 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         "LENGTH requires text argument".to_string(),
                     )),
                 }
+            }
+            "CONCAT" => {
+                let mut out = String::new();
+                for arg in args {
+                    if let Some(text) =
+                        literal_to_concat_text(evaluate_expr_for_row_to_val(arg, row)?)
+                    {
+                        out.push_str(&text);
+                    }
+                }
+                Ok(LiteralValue::String(out))
+            }
+            "REPLACE" => {
+                if args.len() != 3 {
+                    return Err(ExecutionError::GenericError(
+                        "REPLACE requires exactly 3 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "REPLACE source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let from = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "REPLACE search argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let to = match evaluate_expr_for_row_to_val(&args[2], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "REPLACE replacement argument must be text".to_string(),
+                        ));
+                    }
+                };
+                Ok(LiteralValue::String(source.replace(&from, &to)))
+            }
+            "SUBSTRING" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(ExecutionError::GenericError(
+                        "SUBSTRING requires 2 or 3 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "SUBSTRING source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let start = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::Number(text) => parse_i32_literal(&text)?,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "SUBSTRING start argument must be integer".to_string(),
+                        ));
+                    }
+                };
+                let length = if let Some(length_expr) = args.get(2) {
+                    match evaluate_expr_for_row_to_val(length_expr, row)? {
+                        LiteralValue::Number(text) => {
+                            let parsed = parse_i32_literal(&text)?;
+                            if parsed < 0 {
+                                return Err(ExecutionError::GenericError(
+                                    "SUBSTRING length cannot be negative".to_string(),
+                                ));
+                            }
+                            Some(parsed)
+                        }
+                        LiteralValue::Null => return Ok(LiteralValue::Null),
+                        _ => {
+                            return Err(ExecutionError::GenericError(
+                                "SUBSTRING length argument must be integer".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(LiteralValue::String(substring_by_char_index(
+                    &source, start, length,
+                )))
+            }
+            "STRPOS" | "POSITION" => {
+                if args.len() != 2 {
+                    return Err(ExecutionError::GenericError(
+                        "STRPOS requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "STRPOS source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let search = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "STRPOS search argument must be text".to_string(),
+                        ));
+                    }
+                };
+                Ok(LiteralValue::Number(
+                    strpos_by_char_index(&source, &search).to_string(),
+                ))
             }
             "TRIM" | "BTRIM" => {
                 if args.is_empty() || args.len() > 2 {
@@ -904,6 +1071,69 @@ mod tests {
             evaluate_expr_for_row_to_val(&rtrim_expr, &row).unwrap(),
             LiteralValue::String("y".to_string())
         );
+    }
+
+    #[test]
+    fn concat_function_skips_null_arguments() {
+        let expr = Expression::Function {
+            name: "CONCAT".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("user-".to_string())),
+                Expression::Literal(LiteralValue::Null),
+                Expression::Literal(LiteralValue::Number("42".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("user-42".to_string()));
+    }
+
+    #[test]
+    fn replace_function_rewrites_matching_substrings() {
+        let expr = Expression::Function {
+            name: "REPLACE".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("aba".to_string())),
+                Expression::Literal(LiteralValue::String("a".to_string())),
+                Expression::Literal(LiteralValue::String("x".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("xbx".to_string()));
+    }
+
+    #[test]
+    fn substring_function_uses_sql_style_start_index() {
+        let expr = Expression::Function {
+            name: "SUBSTRING".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("abcdef".to_string())),
+                Expression::Literal(LiteralValue::Number("2".to_string())),
+                Expression::Literal(LiteralValue::Number("3".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("bcd".to_string()));
+    }
+
+    #[test]
+    fn strpos_function_returns_one_based_position() {
+        let expr = Expression::Function {
+            name: "STRPOS".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("alphabet".to_string())),
+                Expression::Literal(LiteralValue::String("pha".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Number("3".to_string()));
     }
 
     #[test]

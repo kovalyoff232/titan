@@ -331,6 +331,36 @@ fn test_length_and_trim_functions_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_substring_replace_concat_and_strpos_functions() {
+    let mut client = common::setup_server_and_client("string_functions_test");
+
+    client.simple_query("CREATE TABLE text_ops_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO text_ops_test VALUES (1, 'alpha beta');");
+    client.simple_query("INSERT INTO text_ops_test VALUES (2, 'gamma');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, SUBSTRING(payload, 1, 5), REPLACE(payload, 'a', 'x'), \
+         CONCAT('row-', id), STRPOS(payload, 'beta') \
+         FROM text_ops_test ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "alpha", "xlphx betx", "row-1", "7"],
+            vec!["2", "gamma", "gxmmx", "row-2", "0"]
+        ]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM text_ops_test WHERE STRPOS(payload, 'beta') > 0;");
+    assert_eq!(filtered_rows, vec![vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 
