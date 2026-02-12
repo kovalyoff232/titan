@@ -135,3 +135,40 @@ fn test_optimizer_handles_nested_join_with_where_filter() {
     assert_eq!(result[0][1], "12");
     assert_eq!(result[0][2], "102");
 }
+
+#[test]
+#[serial]
+fn test_optimizer_handles_large_join_graph_with_fallback() {
+    let mut client = common::setup_server_and_client("optimizer_large_join_graph_test");
+
+    for i in 0..9 {
+        client.simple_query(&format!("CREATE TABLE t{i} (id INT, prev INT);"));
+    }
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO t0 VALUES (1, 0);");
+    for i in 1..9 {
+        let id = (i * 10) + 1;
+        let prev = ((i - 1) * 10) + 1;
+        client.simple_query(&format!("INSERT INTO t{i} VALUES ({id}, {prev});"));
+    }
+    client.simple_query("COMMIT;");
+
+    let result = client.simple_query(
+        "SELECT t0.id, t8.id \
+         FROM t0 \
+         JOIN t1 ON t0.id = t1.prev \
+         JOIN t2 ON t1.id = t2.prev \
+         JOIN t3 ON t2.id = t3.prev \
+         JOIN t4 ON t3.id = t4.prev \
+         JOIN t5 ON t4.id = t5.prev \
+         JOIN t6 ON t5.id = t6.prev \
+         JOIN t7 ON t6.id = t7.prev \
+         JOIN t8 ON t7.id = t8.prev \
+         WHERE t8.id = 81;",
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], "1");
+    assert_eq!(result[0][1], "81");
+}
