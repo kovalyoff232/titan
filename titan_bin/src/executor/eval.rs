@@ -139,8 +139,8 @@ pub(crate) fn evaluate_expr_for_row_to_val(
         Expression::Function { name, args } => match name.to_uppercase().as_str() {
             "COUNT" => Ok(LiteralValue::Number("1".to_string())),
             "SUM" | "AVG" | "MIN" | "MAX" => {
-                if !args.is_empty() {
-                    evaluate_expr_for_row_to_val(&args[0], row)
+                if let Some(first_arg) = args.first() {
+                    evaluate_expr_for_row_to_val(first_arg, row)
                 } else {
                     Ok(LiteralValue::Null)
                 }

@@ -20,46 +20,46 @@ pub fn parse_tuple(tuple_data: &[u8], schema: &[Column]) -> HashMap<String, Lite
         }
         match col.type_id {
             16 => {
-                if offset + 1 > tuple_data.len() {
+                let Some(byte) = tuple_data.get(offset) else {
                     break;
-                }
-                parsed_tuple.insert(
-                    col.name.clone(),
-                    LiteralValue::Bool(tuple_data[offset] != 0),
-                );
+                };
+                parsed_tuple.insert(col.name.clone(), LiteralValue::Bool(*byte != 0));
                 offset += 1;
             }
             23 => {
-                if offset + 4 > tuple_data.len() {
+                let Some(bytes_slice) = tuple_data.get(offset..offset + 4) else {
                     break;
-                }
-                let mut bytes = [0_u8; 4];
-                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
+                };
+                let Some(bytes) = <[u8; 4]>::try_from(bytes_slice).ok() else {
+                    break;
+                };
                 let val = i32::from_be_bytes(bytes);
                 parsed_tuple.insert(col.name.clone(), LiteralValue::Number(val.to_string()));
                 offset += 4;
             }
             25 => {
-                if offset + 4 > tuple_data.len() {
+                let Some(len_slice) = tuple_data.get(offset..offset + 4) else {
                     break;
-                }
-                let mut bytes = [0_u8; 4];
-                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
-                let len = u32::from_be_bytes(bytes) as usize;
+                };
+                let Some(len_bytes) = <[u8; 4]>::try_from(len_slice).ok() else {
+                    break;
+                };
+                let len = u32::from_be_bytes(len_bytes) as usize;
                 offset += 4;
-                if offset + len > tuple_data.len() {
+                let Some(value_slice) = tuple_data.get(offset..offset + len) else {
                     break;
-                }
-                let val = String::from_utf8_lossy(&tuple_data[offset..offset + len]);
+                };
+                let val = String::from_utf8_lossy(value_slice);
                 parsed_tuple.insert(col.name.clone(), LiteralValue::String(val.into_owned()));
                 offset += len;
             }
             1082 => {
-                if offset + 4 > tuple_data.len() {
+                let Some(bytes_slice) = tuple_data.get(offset..offset + 4) else {
                     break;
-                }
-                let mut bytes = [0_u8; 4];
-                bytes.copy_from_slice(&tuple_data[offset..offset + 4]);
+                };
+                let Some(bytes) = <[u8; 4]>::try_from(bytes_slice).ok() else {
+                    break;
+                };
                 let days = i32::from_be_bytes(bytes);
                 let Some(epoch) = NaiveDate::from_ymd_opt(2000, 1, 1) else {
                     break;

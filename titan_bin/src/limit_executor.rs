@@ -103,13 +103,11 @@ impl<'a> Executor for TopNExecutor<'a> {
     fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
         self.materialize()?;
 
-        if self.cursor < self.sorted_rows.len() {
-            let row = self.sorted_rows[self.cursor].clone();
-            self.cursor += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
+        let Some(row) = self.sorted_rows.get(self.cursor).cloned() else {
+            return Ok(None);
+        };
+        self.cursor += 1;
+        Ok(Some(row))
     }
 }
 

@@ -109,7 +109,11 @@ impl<'a> HashAggregateExecutor<'a> {
                 });
 
             for (agg_idx, agg) in self.aggregates.iter().enumerate() {
-                let agg_state = &mut state.states[agg_idx];
+                let agg_state = state.states.get_mut(agg_idx).ok_or_else(|| {
+                    ExecutionError::GenericError(
+                        "Aggregate state mismatch: missing aggregate state slot".to_string(),
+                    )
+                })?;
 
                 if agg.function.to_uppercase() == "COUNT" && agg.args.is_empty() {
                     agg_state.count += 1;
@@ -181,7 +185,12 @@ impl<'a> HashAggregateExecutor<'a> {
             result_row.extend_from_slice(group_key);
 
             for (agg_idx, agg) in self.aggregates.iter().enumerate() {
-                let agg_result = self.compute_aggregate_result(&state.states[agg_idx], agg)?;
+                let agg_state = state.states.get(agg_idx).ok_or_else(|| {
+                    ExecutionError::GenericError(
+                        "Aggregate state mismatch: missing aggregate state slot".to_string(),
+                    )
+                })?;
+                let agg_result = self.compute_aggregate_result(agg_state, agg)?;
                 result_row.push(agg_result);
             }
 
@@ -204,15 +213,16 @@ impl<'a> HashAggregateExecutor<'a> {
     fn row_to_map(&self, row: &[String]) -> HashMap<String, LiteralValue> {
         let mut map = HashMap::new();
         for (i, col) in self.input.schema().iter().enumerate() {
-            if i < row.len() {
-                let value = match col.type_id {
-                    23 => LiteralValue::Number(row[i].clone()),
-                    16 => LiteralValue::Bool(row[i] == "t" || row[i] == "true"),
-                    1082 => LiteralValue::Date(row[i].clone()),
-                    _ => LiteralValue::String(row[i].clone()),
-                };
-                map.insert(col.name.clone(), value);
-            }
+            let Some(cell) = row.get(i) else {
+                continue;
+            };
+            let value = match col.type_id {
+                23 => LiteralValue::Number(cell.clone()),
+                16 => LiteralValue::Bool(cell == "t" || cell == "true"),
+                1082 => LiteralValue::Date(cell.clone()),
+                _ => LiteralValue::String(cell.clone()),
+            };
+            map.insert(col.name.clone(), value);
         }
         map
     }
@@ -220,9 +230,10 @@ impl<'a> HashAggregateExecutor<'a> {
     fn result_row_to_map(&self, row: &[String]) -> HashMap<String, LiteralValue> {
         let mut map = HashMap::new();
         for (i, col) in self.schema.iter().enumerate() {
-            if i < row.len() {
-                map.insert(col.name.clone(), LiteralValue::String(row[i].clone()));
-            }
+            let Some(cell) = row.get(i) else {
+                continue;
+            };
+            map.insert(col.name.clone(), LiteralValue::String(cell.clone()));
         }
         map
     }

@@ -83,7 +83,12 @@ impl<'a> Executor for NestedLoopJoinExecutor<'a> {
             }
 
             while self.right_cursor < self.right_rows.len() {
-                let right_row = &self.right_rows[self.right_cursor];
+                let Some(right_row) = self.right_rows.get(self.right_cursor) else {
+                    return Err(ExecutionError::GenericError(
+                        "NestedLoopJoin invariant violation: right row cursor out of bounds"
+                            .to_string(),
+                    ));
+                };
                 self.right_cursor += 1;
 
                 let Some(left_row) = self.left_row.as_ref() else {
