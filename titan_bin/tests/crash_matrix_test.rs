@@ -6,6 +6,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+struct ManagedServer {
+    child: Child,
+}
+
+impl ManagedServer {
+    fn stop(&mut self) {
+        stop_server(&mut self.child);
+    }
+}
+
+impl Drop for ManagedServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn server_binary_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/../target/debug/titan_bin")
@@ -18,7 +34,12 @@ fn pick_free_port() -> u16 {
     port
 }
 
-fn start_server(db_path: &Path, wal_path: &Path, addr: &str, failpoints: Option<&str>) -> Child {
+fn start_server(
+    db_path: &Path,
+    wal_path: &Path,
+    addr: &str,
+    failpoints: Option<&str>,
+) -> ManagedServer {
     let mut cmd = Command::new(server_binary_path());
     cmd.env("TITAN_DB_PATH", db_path)
         .env("TITAN_WAL_PATH", wal_path)
@@ -26,7 +47,9 @@ fn start_server(db_path: &Path, wal_path: &Path, addr: &str, failpoints: Option<
     if let Some(points) = failpoints {
         cmd.env("TITAN_FAILPOINTS", points);
     }
-    cmd.spawn().expect("failed to start server")
+    ManagedServer {
+        child: cmd.spawn().expect("failed to start server"),
+    }
 }
 
 fn connect_with_retry(conn_str: &str, timeout: Duration) -> Client {
@@ -88,7 +111,7 @@ fn crash_matrix_commit_before_wal_does_not_persist_insert() {
     query_rows(&mut client, "COMMIT;");
     wait_for_background_sync();
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, Some("tm.commit.before_wal"));
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
@@ -102,13 +125,13 @@ fn crash_matrix_commit_before_wal_does_not_persist_insert() {
         "commit should fail when tm.commit.before_wal failpoint is active"
     );
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, None);
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
     let select_result = try_query_rows(&mut client, "SELECT id, name FROM crash_t ORDER BY id;");
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     match select_result {
         Ok(rows) => {
@@ -146,7 +169,7 @@ fn crash_matrix_flush_failure_after_commit_still_recovers_row() {
     query_rows(&mut client, "COMMIT;");
     wait_for_background_sync();
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, Some("bpm.flush.before_page"));
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
@@ -161,7 +184,7 @@ fn crash_matrix_flush_failure_after_commit_still_recovers_row() {
     );
     wait_for_background_sync();
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, None);
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
@@ -170,7 +193,7 @@ fn crash_matrix_flush_failure_after_commit_still_recovers_row() {
         "SELECT oid, relname FROM pg_class ORDER BY oid;",
     );
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let _rows = recovery_rows.expect("recovery catalog query should succeed");
 }
@@ -190,7 +213,7 @@ fn crash_matrix_commit_after_wal_keeps_server_usable_and_recovers() {
     let _ = query_rows(&mut client, "SELECT oid FROM pg_class ORDER BY oid;");
     wait_for_background_sync();
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, Some("tm.commit.after_wal"));
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
@@ -222,13 +245,13 @@ fn crash_matrix_commit_after_wal_keeps_server_usable_and_recovers() {
         "unexpected sqlstate for failpoint follow-up query: {db_err:?}"
     );
     drop(probe_client);
-    stop_server(&mut server);
+    server.stop();
 
     let mut server = start_server(&db_path, &wal_path, &addr, None);
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
     let recovery_rows = try_query_rows(&mut client, "SELECT oid FROM pg_class ORDER BY oid;");
     drop(client);
-    stop_server(&mut server);
+    server.stop();
 
     assert!(
         recovery_rows.is_ok(),
