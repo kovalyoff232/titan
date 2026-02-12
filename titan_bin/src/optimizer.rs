@@ -354,9 +354,14 @@ fn apply_non_filter_wrappers(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_simple_physical_plan, sorted_table_names};
-    use crate::parser::{BinaryOperator, Expression, SelectItem};
+    use super::{
+        PhysicalPlan, create_physical_plan, create_simple_physical_plan, sorted_table_names,
+    };
+    use crate::catalog::SystemCatalog;
+    use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
     use crate::planner::LogicalPlan;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn build_join_logical_plan() -> LogicalPlan {
         LogicalPlan::Join {
@@ -403,5 +408,69 @@ mod tests {
         let right = create_simple_physical_plan(plan);
 
         assert_eq!(format!("{:?}", left), format!("{:?}", right));
+    }
+
+    #[test]
+    fn create_physical_plan_preserves_projection_sort_wrapper_order() {
+        let logical = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Scan {
+                    table_name: "users".to_string(),
+                    alias: None,
+                    filter: None,
+                }),
+                order_by: vec![Expression::Column("id".to_string())],
+            }),
+            expressions: vec![SelectItem::Wildcard],
+        };
+        let table_names = vec!["users".to_string()];
+        let stats = HashMap::new();
+        let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+
+        let physical = create_physical_plan(logical, &table_names, &stats, &catalog);
+
+        match physical {
+            PhysicalPlan::Projection { input, .. } => match *input {
+                PhysicalPlan::Sort { input, .. } => {
+                    assert!(matches!(*input, PhysicalPlan::TableScan { .. }));
+                }
+                other => panic!("expected Sort under Projection, got {other:?}"),
+            },
+            other => panic!("expected Projection at root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_physical_plan_keeps_scan_filter_under_sort_and_projection() {
+        let logical = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Scan {
+                    table_name: "users".to_string(),
+                    alias: None,
+                    filter: Some(Expression::Binary {
+                        left: Box::new(Expression::Column("id".to_string())),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(Expression::Literal(LiteralValue::Number("7".to_string()))),
+                    }),
+                }),
+                order_by: vec![Expression::Column("id".to_string())],
+            }),
+            expressions: vec![SelectItem::Wildcard],
+        };
+        let table_names = vec!["users".to_string()];
+        let stats = HashMap::new();
+        let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+
+        let physical = create_physical_plan(logical, &table_names, &stats, &catalog);
+
+        match physical {
+            PhysicalPlan::Projection { input, .. } => match *input {
+                PhysicalPlan::Sort { input, .. } => {
+                    assert!(matches!(*input, PhysicalPlan::Filter { .. }));
+                }
+                other => panic!("expected Sort under Projection, got {other:?}"),
+            },
+            other => panic!("expected Projection at root, got {other:?}"),
+        }
     }
 }
