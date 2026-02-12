@@ -41,7 +41,9 @@ jobs:
 
     - name: Clippy core
       timeout-minutes: 15
-      run: cargo clippy --package titan_bin --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic
+      run: |
+        cargo clippy --package bedrock --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic
+        cargo clippy --package titan_bin --lib -- -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic
 
     - name: Build (no-run tests)
       timeout-minutes: 20
