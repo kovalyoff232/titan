@@ -247,3 +247,18 @@ fn test_select_order_by_limit_offset() {
     let rows = client.simple_query("SELECT id FROM limit_test ORDER BY id LIMIT 2 OFFSET 1;");
     assert_eq!(rows, vec![vec!["2"], vec!["3"]]);
 }
+
+#[test]
+#[serial]
+fn test_insert_and_select_null_literal() {
+    let mut client = common::setup_server_and_client("null_literal_test");
+
+    client.simple_query("CREATE TABLE null_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO null_test VALUES (1, NULL);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, payload FROM null_test ORDER BY id;");
+    assert_eq!(rows, vec![vec!["1", ""]]);
+}

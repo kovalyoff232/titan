@@ -303,7 +303,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT" | "OFFSET" => {
+                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" => {
                     Err(Simple::custom(
                         span,
                         format!("keyword `{}` cannot be used as an identifier", ident),
@@ -329,6 +329,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .or(text::keyword("FALSE").to(false))
         .map(LiteralValue::Bool);
 
+    let null = text::keyword("NULL").to(LiteralValue::Null);
+
     let date = text::keyword("DATE")
         .padded()
         .ignore_then(string_literal)
@@ -338,6 +340,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .or(string)
         .or(boolean)
         .or(date)
+        .or(null)
         .map(Expression::Literal)
         .padded();
 
@@ -749,5 +752,17 @@ mod tests {
         };
         assert_eq!(stmt.limit, Some(2));
         assert_eq!(stmt.offset, Some(1));
+    }
+
+    #[test]
+    fn select_null_literal_is_parsed() {
+        let parsed = sql_parser("SELECT NULL;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert!(matches!(
+            stmt.select_list[0],
+            super::SelectItem::UnnamedExpr(Expression::Literal(super::LiteralValue::Null))
+        ));
     }
 }
