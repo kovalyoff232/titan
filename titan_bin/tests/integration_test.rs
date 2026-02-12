@@ -287,3 +287,24 @@ fn test_group_by_count_star_and_having() {
         client.simple_query("SELECT group_id, COUNT(*) AS cnt FROM agg_test GROUP BY group_id HAVING cnt > 2 ORDER BY group_id;");
     assert_eq!(having_rows, vec![vec!["2", "3"]]);
 }
+
+#[test]
+#[serial]
+fn test_group_by_lowercase_sum_avg_with_having_alias() {
+    let mut client = common::setup_server_and_client("group_by_sum_avg_lowercase_test");
+
+    client.simple_query("CREATE TABLE agg_lower_test (group_id INT, val INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO agg_lower_test VALUES (1, 10);");
+    client.simple_query("INSERT INTO agg_lower_test VALUES (1, 20);");
+    client.simple_query("INSERT INTO agg_lower_test VALUES (2, 30);");
+    client.simple_query("INSERT INTO agg_lower_test VALUES (2, 40);");
+    client.simple_query("INSERT INTO agg_lower_test VALUES (2, 50);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT group_id, sum(val) AS total, avg(val) AS avg_val FROM agg_lower_test GROUP BY group_id HAVING total > 40 ORDER BY group_id;",
+    );
+    assert_eq!(rows, vec![vec!["2", "120", "40"]]);
+}

@@ -65,9 +65,10 @@ impl<'a> HashAggregateExecutor<'a> {
 
         for agg in &aggregates {
             let name = agg.alias.as_ref().unwrap_or(&agg.function);
+            let function_name = agg.function.to_uppercase();
             schema.push(Column {
                 name: name.clone(),
-                type_id: match agg.function.as_str() {
+                type_id: match function_name.as_str() {
                     "COUNT" => 23,
                     "SUM" | "AVG" => 701,
                     _ => 25,
@@ -333,9 +334,10 @@ impl<'a> StreamAggregateExecutor<'a> {
 
         for agg in &aggregates {
             let name = agg.alias.as_ref().unwrap_or(&agg.function);
+            let function_name = agg.function.to_uppercase();
             schema.push(Column {
                 name: name.clone(),
-                type_id: match agg.function.as_str() {
+                type_id: match function_name.as_str() {
                     "COUNT" => 23,
                     "SUM" | "AVG" => 701,
                     _ => 25,
