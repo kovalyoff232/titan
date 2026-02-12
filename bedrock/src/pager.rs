@@ -54,8 +54,8 @@ impl Pager {
             crate::bedrock_debug_log!(
                 "[Pager::read_page] Read {bytes_read} bytes (less than page size), zeroing rest."
             );
-            for i in bytes_read..PAGE_SIZE {
-                page.data[i] = 0;
+            if let Some(rest) = page.data.get_mut(bytes_read..) {
+                rest.fill(0);
             }
         } else {
             crate::bedrock_debug_log!("[Pager::read_page] Successfully read full page {page_id}");

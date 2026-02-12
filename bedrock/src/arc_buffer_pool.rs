@@ -183,15 +183,42 @@ pub struct ArcPageGuard<'a> {
 }
 
 impl<'a> ArcPageGuard<'a> {
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Page> {
-        self.bpm.frames[self.frame_idx].read()
+    pub fn read(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Page>> {
+        let frame = self.bpm.frames.get(self.frame_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ArcPageGuard read with invalid frame index {}",
+                    self.frame_idx
+                ),
+            )
+        })?;
+        Ok(frame.read())
     }
 
-    pub fn write(&self) -> parking_lot::RwLockWriteGuard<'_, Page> {
-        let mut meta = lock_mutex_recover(&self.bpm.frame_metadata[self.frame_idx]);
+    pub fn write(&self) -> io::Result<parking_lot::RwLockWriteGuard<'_, Page>> {
+        let meta_mutex = self.bpm.frame_metadata.get(self.frame_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ArcPageGuard write with invalid frame index {}",
+                    self.frame_idx
+                ),
+            )
+        })?;
+        let mut meta = lock_mutex_recover(meta_mutex);
         meta.is_dirty = true;
         drop(meta);
-        self.bpm.frames[self.frame_idx].write()
+        let frame = self.bpm.frames.get(self.frame_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ArcPageGuard write with invalid frame index {}",
+                    self.frame_idx
+                ),
+            )
+        })?;
+        Ok(frame.write())
     }
 }
 
@@ -202,6 +229,24 @@ impl<'a> Drop for ArcPageGuard<'a> {
 }
 
 impl ArcBufferPoolManager {
+    fn frame(&self, frame_idx: usize) -> io::Result<&ParkingRwLock<Page>> {
+        self.frames.get(frame_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame index: {frame_idx}"),
+            )
+        })
+    }
+
+    fn frame_meta(&self, frame_idx: usize) -> io::Result<&Mutex<FrameMetadata>> {
+        self.frame_metadata.get(frame_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame metadata index: {frame_idx}"),
+            )
+        })
+    }
+
     pub fn new(pager: Pager, config: BufferPoolConfig) -> Self {
         let size = config.size;
         let mut frames = Vec::with_capacity(size);
@@ -231,7 +276,7 @@ impl ArcBufferPoolManager {
         {
             let page_table = self.page_table.read();
             if let Some(&frame_idx) = page_table.get(&page_id) {
-                let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
+                let mut meta = lock_mutex_recover(self.frame_meta(frame_idx)?);
                 meta.pin_count += 1;
                 meta.access_count += 1;
                 drop(meta);
@@ -261,12 +306,12 @@ impl ArcBufferPoolManager {
         let new_page = lock_mutex_recover(&self.pager).read_page(page_id)?;
 
         {
-            let mut frame = self.frames[frame_idx].write();
+            let mut frame = self.frame(frame_idx)?.write();
             *frame = new_page;
         }
 
         {
-            let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
+            let mut meta = lock_mutex_recover(self.frame_meta(frame_idx)?);
             meta.page_id = Some(page_id);
             meta.is_dirty = false;
             meta.pin_count = 1;
@@ -314,10 +359,10 @@ impl ArcBufferPoolManager {
     }
 
     fn evict_if_dirty(&self, frame_idx: usize) -> io::Result<()> {
-        let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
+        let mut meta = lock_mutex_recover(self.frame_meta(frame_idx)?);
         if let Some(_old_page_id) = meta.page_id {
             if meta.is_dirty {
-                let frame = self.frames[frame_idx].read();
+                let frame = self.frame(frame_idx)?.read();
                 lock_mutex_recover(&self.pager).write_page(&frame)?;
                 meta.is_dirty = false;
             }
@@ -327,18 +372,20 @@ impl ArcBufferPoolManager {
     }
 
     fn unpin_page(&self, _page_id: PageId, frame_idx: usize) {
-        let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
-        if meta.pin_count > 0 {
-            meta.pin_count -= 1;
+        if let Ok(meta_mutex) = self.frame_meta(frame_idx) {
+            let mut meta = lock_mutex_recover(meta_mutex);
+            if meta.pin_count > 0 {
+                meta.pin_count -= 1;
+            }
         }
     }
 
     pub fn flush_page(&self, page_id: PageId) -> io::Result<()> {
         let page_table = self.page_table.read();
         if let Some(&frame_idx) = page_table.get(&page_id) {
-            let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
+            let mut meta = lock_mutex_recover(self.frame_meta(frame_idx)?);
             if meta.is_dirty {
-                let frame = self.frames[frame_idx].read();
+                let frame = self.frame(frame_idx)?.read();
                 lock_mutex_recover(&self.pager).write_page(&frame)?;
                 meta.is_dirty = false;
             }
@@ -351,7 +398,7 @@ impl ArcBufferPoolManager {
             let mut meta = lock_mutex_recover(meta_mutex);
             if meta.is_dirty {
                 if let Some(_page_id) = meta.page_id {
-                    let frame = self.frames[idx].read();
+                    let frame = self.frame(idx)?.read();
                     lock_mutex_recover(&self.pager).write_page(&frame)?;
                     meta.is_dirty = false;
                 }
@@ -372,12 +419,12 @@ impl ArcBufferPoolManager {
         self.evict_if_dirty(frame_idx)?;
 
         {
-            let mut frame = self.frames[frame_idx].write();
+            let mut frame = self.frame(frame_idx)?.write();
             *frame = Page::new(new_page_id);
         }
 
         {
-            let mut meta = lock_mutex_recover(&self.frame_metadata[frame_idx]);
+            let mut meta = lock_mutex_recover(self.frame_meta(frame_idx)?);
             meta.page_id = Some(new_page_id);
             meta.is_dirty = true;
             meta.pin_count = 1;

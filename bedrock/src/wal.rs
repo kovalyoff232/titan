@@ -347,7 +347,9 @@ impl WalManager {
         let mut pos = 0usize;
 
         while pos + header_len <= buf.len() {
-            let header_slice = &buf[pos..pos + header_len];
+            let header_slice = buf.get(pos..pos + header_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL header bounds out of range")
+            })?;
             let header_arr: [u8; WAL_HEADER_LEN] = header_slice.try_into().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "WAL header size mismatch")
             })?;
@@ -367,7 +369,9 @@ impl WalManager {
 
             let record_start = pos + header_len;
             let record_end = pos + total_len;
-            let record_buf = &buf[record_start..record_end];
+            let record_buf = buf.get(record_start..record_end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL record bounds out of range")
+            })?;
 
             let mut hasher = Hasher::new();
             hasher.update(record_buf);
@@ -518,7 +522,9 @@ impl WalManager {
                 let Some(&idx) = lsn_to_index.get(&current_lsn) else {
                     break;
                 };
-                let entry = &entries[idx];
+                let Some(entry) = entries.get(idx) else {
+                    break;
+                };
 
                 if entry.record.tx_id() != tx_id {
                     current_lsn = entry.header.prev_lsn;

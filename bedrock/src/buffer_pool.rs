@@ -86,7 +86,14 @@ impl BufferPoolManager {
 
     pub fn acquire_page(self: &Arc<Self>, page_id: PageId) -> io::Result<PageGuard<'_>> {
         if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
-            let frame = self.frames[frame_index].clone();
+            let frame = self.frames.get(frame_index).cloned().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "page table points to invalid frame index {frame_index} for page {page_id}"
+                    ),
+                )
+            })?;
             self.pin_frame(&frame);
             return Ok(PageGuard {
                 bpm: self,
@@ -98,7 +105,12 @@ impl BufferPoolManager {
         let frame_index = self
             .find_victim_frame()
             .ok_or_else(|| io::Error::other("all pages are pinned"))?;
-        let frame = self.frames[frame_index].clone();
+        let frame = self.frames.get(frame_index).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("victim frame index out of bounds: {frame_index}"),
+            )
+        })?;
 
         self.evict_if_dirty(frame_index)?;
 
@@ -123,7 +135,12 @@ impl BufferPoolManager {
         let frame_index = self
             .find_victim_frame()
             .ok_or_else(|| io::Error::other("all pages are pinned"))?;
-        let frame = self.frames[frame_index].clone();
+        let frame = self.frames.get(frame_index).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("victim frame index out of bounds: {frame_index}"),
+            )
+        })?;
 
         self.evict_if_dirty(frame_index)?;
 
@@ -151,7 +168,12 @@ impl BufferPoolManager {
     }
 
     fn evict_if_dirty(&self, frame_index: usize) -> io::Result<()> {
-        let frame = &self.frames[frame_index];
+        let frame = self.frames.get(frame_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("evict requested invalid frame index: {frame_index}"),
+            )
+        })?;
         let mut page_table = write_lock_recover(&self.page_table);
         if let Some((&old_page_id, _)) = page_table.iter().find(|&(_, &idx)| idx == frame_index) {
             let mut is_dirty = lock_mutex_recover(&frame.is_dirty);
@@ -170,17 +192,25 @@ impl BufferPoolManager {
 
     fn unpin_page(&self, page_id: PageId) {
         if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
-            let frame = &self.frames[frame_index];
-            let mut pin_count = lock_mutex_recover(&frame.pin_count);
-            if *pin_count > 0 {
-                *pin_count -= 1;
+            if let Some(frame) = self.frames.get(frame_index) {
+                let mut pin_count = lock_mutex_recover(&frame.pin_count);
+                if *pin_count > 0 {
+                    *pin_count -= 1;
+                }
             }
         }
     }
 
     pub fn flush_page(&self, page_id: PageId) -> io::Result<()> {
         if let Some(&frame_index) = read_lock_recover(&self.page_table).get(&page_id) {
-            let frame = &self.frames[frame_index];
+            let frame = self.frames.get(frame_index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "page table points to invalid frame index {frame_index} for page {page_id}"
+                    ),
+                )
+            })?;
             let mut is_dirty = lock_mutex_recover(&frame.is_dirty);
             if *is_dirty {
                 let page = read_lock_recover(&frame.page);
@@ -201,7 +231,14 @@ impl BufferPoolManager {
 
     pub fn delete_page(&self, page_id: PageId) -> io::Result<()> {
         if let Some(frame_index) = write_lock_recover(&self.page_table).remove(&page_id) {
-            let frame = &self.frames[frame_index];
+            let frame = self.frames.get(frame_index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "page table points to invalid frame index {frame_index} for page {page_id}"
+                    ),
+                )
+            })?;
             *lock_mutex_recover(&frame.is_dirty) = false;
             *lock_mutex_recover(&frame.pin_count) = 0;
             *lock_mutex_recover(&frame.recently_used) = false;
@@ -227,7 +264,9 @@ impl BufferPoolManager {
             let frame_index = *clock_hand;
             *clock_hand = (*clock_hand + 1) % frame_count;
 
-            let frame = &self.frames[frame_index];
+            let Some(frame) = self.frames.get(frame_index) else {
+                continue;
+            };
             let pin_count = lock_mutex_recover(&frame.pin_count);
 
             if *pin_count == 0 {
