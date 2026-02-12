@@ -257,6 +257,27 @@ fn test_coalesce_function_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_nullif_function_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("nullif_test");
+
+    client.simple_query("CREATE TABLE nullif_values_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO nullif_values_test VALUES (1, 'same');");
+    client.simple_query("INSERT INTO nullif_values_test VALUES (2, 'value');");
+    client.simple_query("COMMIT;");
+
+    let rows = client
+        .simple_query("SELECT id, NULLIF(payload, 'same') FROM nullif_values_test ORDER BY id;");
+    assert_eq!(rows, vec![vec!["1", "NULL"], vec!["2", "value"]]);
+
+    let filtered_rows = client
+        .simple_query("SELECT id FROM nullif_values_test WHERE NULLIF(payload, 'same') = 'value';");
+    assert_eq!(filtered_rows, vec![vec!["2"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

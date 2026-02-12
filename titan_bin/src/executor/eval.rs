@@ -293,6 +293,29 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 }
                 Ok(LiteralValue::Null)
             }
+            "NULLIF" => {
+                if args.len() != 2 {
+                    return Err(ExecutionError::GenericError(
+                        "NULLIF requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let left = evaluate_expr_for_row_to_val(&args[0], row)?;
+                let right = evaluate_expr_for_row_to_val(&args[1], row)?;
+                let equals = left == right
+                    || matches!(
+                        (&left, &right),
+                        (LiteralValue::String(text), LiteralValue::Null) if text.is_empty()
+                    )
+                    || matches!(
+                        (&left, &right),
+                        (LiteralValue::Null, LiteralValue::String(text)) if text.is_empty()
+                    );
+                if equals {
+                    Ok(LiteralValue::Null)
+                } else {
+                    Ok(left)
+                }
+            }
             _ => Err(ExecutionError::GenericError(format!(
                 "Unsupported function: {}",
                 name
@@ -585,5 +608,35 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Null);
+    }
+
+    #[test]
+    fn nullif_function_returns_null_when_arguments_are_equal() {
+        let expr = Expression::Function {
+            name: "NULLIF".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("same".to_string())),
+                Expression::Literal(LiteralValue::String("same".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Null);
+    }
+
+    #[test]
+    fn nullif_function_returns_left_argument_when_values_differ() {
+        let expr = Expression::Function {
+            name: "NULLIF".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("left".to_string())),
+                Expression::Literal(LiteralValue::String("right".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("left".to_string()));
     }
 }
