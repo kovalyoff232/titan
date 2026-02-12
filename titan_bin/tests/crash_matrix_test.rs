@@ -174,3 +174,64 @@ fn crash_matrix_flush_failure_after_commit_still_recovers_row() {
 
     let _rows = recovery_rows.expect("recovery catalog query should succeed");
 }
+
+#[test]
+#[serial]
+fn crash_matrix_commit_after_wal_keeps_server_usable_and_recovers() {
+    let temp_dir = tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("crash_after_wal.db");
+    let wal_path = temp_dir.path().join("crash_after_wal.wal");
+    let port = pick_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let conn_str = format!("host=localhost port={port} user=postgres");
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    let _ = query_rows(&mut client, "SELECT oid FROM pg_class ORDER BY oid;");
+    wait_for_background_sync();
+    drop(client);
+    stop_server(&mut server);
+
+    let mut server = start_server(&db_path, &wal_path, &addr, Some("tm.commit.after_wal"));
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+
+    client.simple_query("BEGIN;").expect("begin");
+    let _ = query_rows(
+        &mut client,
+        "SELECT oid, relname FROM pg_class ORDER BY oid;",
+    );
+
+    let commit_result = client.simple_query("COMMIT;");
+    assert!(
+        commit_result.is_err(),
+        "commit should fail when tm.commit.after_wal failpoint is active"
+    );
+
+    drop(client);
+    let mut probe_client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    let follow_up = try_query_rows(&mut probe_client, "SELECT oid FROM pg_class ORDER BY oid;");
+    let follow_up_err = follow_up.expect_err(
+        "follow-up query should fail while tm.commit.after_wal failpoint remains active",
+    );
+    let Some(db_err) = follow_up_err.as_db_error() else {
+        panic!("expected db error for failpoint follow-up query: {follow_up_err:?}");
+    };
+    assert_eq!(
+        db_err.code().code(),
+        "XX000",
+        "unexpected sqlstate for failpoint follow-up query: {db_err:?}"
+    );
+    drop(probe_client);
+    stop_server(&mut server);
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    let recovery_rows = try_query_rows(&mut client, "SELECT oid FROM pg_class ORDER BY oid;");
+    drop(client);
+    stop_server(&mut server);
+
+    assert!(
+        recovery_rows.is_ok(),
+        "restart recovery should remain queryable after tm.commit.after_wal failure"
+    );
+}

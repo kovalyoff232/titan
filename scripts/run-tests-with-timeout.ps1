@@ -19,6 +19,12 @@ function Resolve-CargoExe {
     throw "cargo executable not found in PATH or $fallback"
 }
 
+function Stop-TitanServerProcesses {
+    Get-Process titan_bin -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 120
+}
+
 function Invoke-CargoWithTimeout {
     param(
         [string]$CargoExe,
@@ -30,64 +36,69 @@ function Invoke-CargoWithTimeout {
     Write-Host ""
     Write-Host "=== $Label ==="
     Write-Host "$CargoExe $($CargoArgs -join ' ')"
+    Stop-TitanServerProcesses
 
-    $start = Get-Date
-    $escapedArgs = $CargoArgs | ForEach-Object {
-        if ($_ -match '\s') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $CargoExe
-    $psi.Arguments = ($escapedArgs -join ' ')
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    [void]$proc.Start()
-
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-
-    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
-        Write-Warning "Timeout exceeded (${TimeoutSeconds}s). Killing process $($proc.Id)."
-        try {
-            $proc.Kill($true)
-        } catch {
+    try {
+        $start = Get-Date
+        $escapedArgs = $CargoArgs | ForEach-Object {
+            if ($_ -match '\s') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
         }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $CargoExe
+        $psi.Arguments = ($escapedArgs -join ' ')
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            Write-Warning "Timeout exceeded (${TimeoutSeconds}s). Killing process $($proc.Id)."
+            try {
+                $proc.Kill($true)
+            } catch {
+            }
+            $stdout = $stdoutTask.Result
+            $stderr = $stderrTask.Result
+            if ($stdout) {
+                Write-Host "---- stdout (tail) ----"
+                $stdout.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+            }
+            if ($stderr) {
+                Write-Host "---- stderr (tail) ----"
+                $stderr.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+            }
+            throw "Timed out: cargo $($CargoArgs -join ' ')"
+        }
+
+        $proc.WaitForExit()
         $stdout = $stdoutTask.Result
         $stderr = $stderrTask.Result
-        if ($stdout) {
-            Write-Host "---- stdout (tail) ----"
-            $stdout.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0) {
+            if ($stdout) {
+                Write-Host "---- stdout (tail) ----"
+                $stdout.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
+            }
+            if ($stderr) {
+                Write-Host "---- stderr (tail) ----"
+                $stderr.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
+            }
+            throw "Failed with exit code ${exitCode}: cargo $($CargoArgs -join ' ')"
         }
-        if ($stderr) {
-            Write-Host "---- stderr (tail) ----"
-            $stderr.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
-        }
-        throw "Timed out: cargo $($CargoArgs -join ' ')"
+
+        $elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
+        Write-Host "Completed in ${elapsed}s"
+    } finally {
+        Stop-TitanServerProcesses
     }
-
-    $proc.WaitForExit()
-    $stdout = $stdoutTask.Result
-    $stderr = $stderrTask.Result
-
-    $exitCode = $proc.ExitCode
-    if ($exitCode -ne 0) {
-        if ($stdout) {
-            Write-Host "---- stdout (tail) ----"
-            $stdout.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
-        }
-        if ($stderr) {
-            Write-Host "---- stderr (tail) ----"
-            $stderr.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
-        }
-        throw "Failed with exit code ${exitCode}: cargo $($CargoArgs -join ' ')"
-    }
-
-    $elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
-    Write-Host "Completed in ${elapsed}s"
 }
 
 $cargoExe = Resolve-CargoExe
