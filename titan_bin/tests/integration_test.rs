@@ -148,6 +148,28 @@ fn test_is_null_and_is_not_null_filters() {
 
 #[test]
 #[serial]
+fn test_where_like_filter() {
+    let mut client = common::setup_server_and_client("like_filter_test");
+
+    client.simple_query("CREATE TABLE like_users_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO like_users_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO like_users_test VALUES (2, 'Albert');");
+    client.simple_query("INSERT INTO like_users_test VALUES (3, 'Bob');");
+    client.simple_query("COMMIT;");
+
+    let prefix_rows =
+        client.simple_query("SELECT id FROM like_users_test WHERE name LIKE 'Al%' ORDER BY id;");
+    assert_eq!(prefix_rows, vec![vec!["1"], vec!["2"]]);
+
+    let single_char_rows =
+        client.simple_query("SELECT id FROM like_users_test WHERE name LIKE '_ob' ORDER BY id;");
+    assert_eq!(single_char_rows, vec![vec!["3"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

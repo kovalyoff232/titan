@@ -21,6 +21,33 @@ fn parse_date_literal(value: &str) -> Result<NaiveDate, ExecutionError> {
     })
 }
 
+fn like_match(value: &str, pattern: &str) -> bool {
+    let value_chars: Vec<char> = value.chars().collect();
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let value_len = value_chars.len();
+    let pattern_len = pattern_chars.len();
+    let mut dp = vec![vec![false; value_len + 1]; pattern_len + 1];
+    dp[0][0] = true;
+
+    for i in 1..=pattern_len {
+        if pattern_chars[i - 1] == '%' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+
+    for i in 1..=pattern_len {
+        for j in 1..=value_len {
+            dp[i][j] = match pattern_chars[i - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && c == value_chars[j - 1],
+            };
+        }
+    }
+
+    dp[pattern_len][value_len]
+}
+
 pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
@@ -97,6 +124,9 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         BinaryOperator::GtEq => Ok(LiteralValue::Bool(lnum >= rnum)),
                         BinaryOperator::And => Ok(LiteralValue::Bool(lnum != 0 && rnum != 0)),
                         BinaryOperator::Or => Ok(LiteralValue::Bool(lnum != 0 || rnum != 0)),
+                        BinaryOperator::Like => Err(ExecutionError::GenericError(
+                            "Unsupported operator for number".to_string(),
+                        )),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => match op {
@@ -130,6 +160,7 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     BinaryOperator::LtEq => Ok(LiteralValue::Bool(l <= r)),
                     BinaryOperator::Gt => Ok(LiteralValue::Bool(l > r)),
                     BinaryOperator::GtEq => Ok(LiteralValue::Bool(l >= r)),
+                    BinaryOperator::Like => Ok(LiteralValue::Bool(like_match(&l, &r))),
                     _ => Err(ExecutionError::GenericError(
                         "Unsupported operator for text".to_string(),
                     )),
@@ -303,6 +334,23 @@ mod tests {
         };
         let mut row = HashMap::new();
         row.insert("payload".to_string(), LiteralValue::String(String::new()));
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn string_like_pattern_comparison_evaluates_to_boolean() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::String(
+                "Alice".to_string(),
+            ))),
+            op: BinaryOperator::Like,
+            right: Box::new(Expression::Literal(LiteralValue::String(
+                "Al_ce".to_string(),
+            ))),
+        };
+        let row = HashMap::new();
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Bool(true));
