@@ -2,6 +2,7 @@ use super::{ColumnStats, PhysicalPlan, PlanInfo, TableStats};
 use crate::catalog::SystemCatalog;
 use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use crate::planner::LogicalPlan;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -48,14 +49,19 @@ fn estimate_filter_selectivity(
                 return s1 + s2 - (s1 * s2);
             }
 
-            let (col_name, literal) = if let Expression::Column(name) = &**left {
-                if let Expression::Literal(lit) = &**right {
-                    (name, lit)
-                } else {
-                    return 0.33;
+            let (col_name, literal, comparison_op) = match (&**left, &**right) {
+                (Expression::Column(name), Expression::Literal(lit))
+                | (Expression::QualifiedColumn(_, name), Expression::Literal(lit)) => {
+                    (name.as_str(), lit, op.clone())
                 }
-            } else {
-                return 0.33;
+                (Expression::Literal(lit), Expression::Column(name))
+                | (Expression::Literal(lit), Expression::QualifiedColumn(_, name)) => {
+                    let Some(reversed) = reverse_comparison_operator(op) else {
+                        return 0.33;
+                    };
+                    (name.as_str(), lit, reversed)
+                }
+                _ => return 0.33,
             };
 
             let Some(schema) = system_catalog
@@ -65,7 +71,7 @@ fn estimate_filter_selectivity(
             else {
                 return 0.5;
             };
-            let Some(col_idx) = schema.iter().position(|c| c.name == *col_name) else {
+            let Some(col_idx) = schema.iter().position(|c| c.name == col_name) else {
                 return 0.5;
             };
 
@@ -73,8 +79,11 @@ fn estimate_filter_selectivity(
                 return 0.5;
             };
 
-            match op {
+            match comparison_op {
                 BinaryOperator::Eq => {
+                    if matches!(literal, LiteralValue::Null) {
+                        return 0.0;
+                    }
                     if col_stats.most_common_vals.contains(literal) {
                         1.0 / col_stats.n_distinct.max(1.0)
                     } else {
@@ -87,7 +96,9 @@ fn estimate_filter_selectivity(
                 BinaryOperator::Lt
                 | BinaryOperator::Gt
                 | BinaryOperator::LtEq
-                | BinaryOperator::GtEq => estimate_range_selectivity(col_stats, literal, op),
+                | BinaryOperator::GtEq => {
+                    estimate_range_selectivity(col_stats, literal, &comparison_op)
+                }
                 _ => 0.33,
             }
         }
@@ -102,37 +113,88 @@ fn estimate_filter_selectivity(
     }
 }
 
+fn reverse_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        BinaryOperator::Eq => Some(BinaryOperator::Eq),
+        _ => None,
+    }
+}
+
+fn parse_number_literal(value: &LiteralValue) -> Option<f64> {
+    match value {
+        LiteralValue::Number(raw) | LiteralValue::String(raw) | LiteralValue::Date(raw) => {
+            raw.parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn literal_cmp(left: &LiteralValue, right: &LiteralValue) -> Option<Ordering> {
+    match (left, right) {
+        (LiteralValue::Null, _) | (_, LiteralValue::Null) => None,
+        (LiteralValue::Bool(a), LiteralValue::Bool(b)) => Some(a.cmp(b)),
+        (LiteralValue::String(a), LiteralValue::String(b))
+        | (LiteralValue::Date(a), LiteralValue::Date(b))
+        | (LiteralValue::String(a), LiteralValue::Date(b))
+        | (LiteralValue::Date(a), LiteralValue::String(b)) => Some(a.cmp(b)),
+        _ => {
+            let left_num = parse_number_literal(left)?;
+            let right_num = parse_number_literal(right)?;
+            left_num.partial_cmp(&right_num)
+        }
+    }
+}
+
 fn estimate_range_selectivity(
     col_stats: &ColumnStats,
     literal: &LiteralValue,
     op: &BinaryOperator,
 ) -> f64 {
+    if matches!(literal, LiteralValue::Null) {
+        return 0.0;
+    }
     if col_stats.histogram_bounds.is_empty() {
         return 0.33;
     }
 
-    let literal_str = literal.to_string();
-    let bounds_str: Vec<String> = col_stats
+    if col_stats
         .histogram_bounds
         .iter()
-        .map(|v| v.to_string())
-        .collect();
-
-    let num_buckets = bounds_str.len() - 1;
-    if num_buckets == 0 {
+        .any(|bound| literal_cmp(bound, literal).is_none())
+    {
         return 0.33;
     }
 
-    let bucket_idx = bounds_str
+    let boundary_count = col_stats.histogram_bounds.len();
+    let lt_boundary_idx = col_stats
+        .histogram_bounds
         .iter()
-        .position(|b| *b > literal_str)
-        .unwrap_or(num_buckets);
+        .position(|bound| {
+            matches!(
+                literal_cmp(bound, literal),
+                Some(Ordering::Equal) | Some(Ordering::Greater)
+            )
+        })
+        .unwrap_or(boundary_count);
+    let lte_boundary_idx = col_stats
+        .histogram_bounds
+        .iter()
+        .position(|bound| matches!(literal_cmp(bound, literal), Some(Ordering::Greater)))
+        .unwrap_or(boundary_count);
+
+    let denominator = boundary_count as f64;
+    let lt_selectivity = (lt_boundary_idx as f64 / denominator).clamp(0.0, 1.0);
+    let lte_selectivity = (lte_boundary_idx as f64 / denominator).clamp(0.0, 1.0);
 
     match op {
-        BinaryOperator::Lt | BinaryOperator::LtEq => (bucket_idx as f64) / (num_buckets as f64),
-        BinaryOperator::Gt | BinaryOperator::GtEq => {
-            ((num_buckets - bucket_idx) as f64) / (num_buckets as f64)
-        }
+        BinaryOperator::Lt => lt_selectivity,
+        BinaryOperator::LtEq => lte_selectivity,
+        BinaryOperator::Gt => (1.0 - lte_selectivity).clamp(0.0, 1.0),
+        BinaryOperator::GtEq => (1.0 - lt_selectivity).clamp(0.0, 1.0),
         _ => 0.33,
     }
 }
@@ -305,4 +367,105 @@ pub(super) fn estimate_join_cardinality(
         .map_or(right_card, |cs| cs.n_distinct);
 
     Some((left_card * right_card) / (left_n_distinct.max(right_n_distinct)).max(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{estimate_filter_selectivity, estimate_range_selectivity};
+    use crate::catalog::SystemCatalog;
+    use crate::optimizer::{ColumnStats, TableStats};
+    use crate::parser::{BinaryOperator, Expression, LiteralValue};
+    use crate::types::Column;
+    use std::sync::{Arc, Mutex};
+
+    fn build_int_table_stats(bounds: &[i32]) -> TableStats {
+        let mut table_stats = TableStats::default();
+        let histogram_bounds = bounds
+            .iter()
+            .map(|v| LiteralValue::Number(v.to_string()))
+            .collect::<Vec<_>>();
+        table_stats.column_stats.insert(
+            0,
+            ColumnStats {
+                n_distinct: 100.0,
+                most_common_vals: Vec::new(),
+                histogram_bounds,
+            },
+        );
+        table_stats
+    }
+
+    #[test]
+    fn estimate_range_selectivity_uses_numeric_order() {
+        let col_stats = ColumnStats {
+            n_distinct: 100.0,
+            most_common_vals: Vec::new(),
+            histogram_bounds: vec![
+                LiteralValue::Number("2".to_string()),
+                LiteralValue::Number("10".to_string()),
+                LiteralValue::Number("20".to_string()),
+                LiteralValue::Number("30".to_string()),
+            ],
+        };
+        let selectivity = estimate_range_selectivity(
+            &col_stats,
+            &LiteralValue::Number("9".to_string()),
+            &BinaryOperator::Lt,
+        );
+
+        assert!((selectivity - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_filter_selectivity_supports_literal_on_left_side() {
+        let table_stats = build_int_table_stats(&[10, 20, 30, 40]);
+        let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+        {
+            let catalog_guard = catalog.lock().expect("catalog lock");
+            catalog_guard.add_schema(
+                "users".to_string(),
+                Arc::new(vec![Column {
+                    name: "id".to_string(),
+                    type_id: 23,
+                }]),
+            );
+        }
+
+        let filter = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("25".to_string()))),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expression::Column("id".to_string())),
+        };
+        let selectivity = estimate_filter_selectivity(&filter, "users", &table_stats, &catalog);
+
+        assert!((selectivity - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_filter_selectivity_handles_qualified_column_with_literal_on_left_side() {
+        let table_stats = build_int_table_stats(&[10, 20, 30, 40]);
+        let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+        {
+            let catalog_guard = catalog.lock().expect("catalog lock");
+            catalog_guard.add_schema(
+                "users".to_string(),
+                Arc::new(vec![Column {
+                    name: "id".to_string(),
+                    type_id: 23,
+                }]),
+            );
+        }
+
+        let filter = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("15".to_string()))),
+            op: BinaryOperator::LtEq,
+            right: Box::new(Expression::QualifiedColumn(
+                "users".to_string(),
+                "id".to_string(),
+            )),
+        };
+        let selectivity = estimate_filter_selectivity(&filter, "users", &table_stats, &catalog);
+
+        assert!((selectivity - 0.75).abs() < 1e-9);
+    }
 }
