@@ -211,3 +211,20 @@ fn test_order_by_supports_desc_direction() {
     let rows = client.simple_query("SELECT id, payload FROM desc_sort_test ORDER BY id DESC;");
     assert_eq!(rows, vec![vec!["3", "c"], vec!["2", "b"], vec!["1", "a"]]);
 }
+
+#[test]
+#[serial]
+fn test_order_by_supports_position_reference() {
+    let mut client = common::setup_server_and_client("order_by_position_test");
+
+    client.simple_query("CREATE TABLE position_sort_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO position_sort_test VALUES (3, 'c');");
+    client.simple_query("INSERT INTO position_sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO position_sort_test VALUES (2, 'b');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, payload FROM position_sort_test ORDER BY 1 DESC;");
+    assert_eq!(rows, vec![vec!["3", "c"], vec!["2", "b"], vec!["1", "a"]]);
+}

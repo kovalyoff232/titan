@@ -2,7 +2,7 @@ use super::eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 use super::helpers::row_vec_to_map;
 use super::{Executor, Row};
 use crate::errors::ExecutionError;
-use crate::parser::{Expression, OrderByExpr, SelectItem};
+use crate::parser::{Expression, LiteralValue, OrderByExpr, SelectItem};
 use crate::types::Column;
 use chrono::NaiveDate;
 
@@ -129,33 +129,60 @@ impl<'a> SortExecutor<'a> {
 
         let sort_keys: Vec<(usize, u32, bool)> = sort_exprs
             .iter()
-            .map(|sort_expr| {
-                let (lookup_name, base_name) = match &sort_expr.expr {
-                    Expression::Column(name) => (name.clone(), name.clone()),
-                    Expression::QualifiedColumn(table, column) => {
-                        (format!("{table}.{column}"), column.clone())
-                    }
-                    _ => {
-                        return Err(ExecutionError::GenericError(
-                            "ORDER BY only supports column names".to_string(),
-                        ));
-                    }
-                };
-                input
+            .map(|sort_expr| match &sort_expr.expr {
+                Expression::Column(name) => input
                     .schema()
                     .iter()
-                    .position(|c| {
-                        c.name == lookup_name
-                            || c.name == base_name
-                            || c.name.ends_with(&format!(".{}", base_name))
-                    })
+                    .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
                     .and_then(|i| {
                         input
                             .schema()
                             .get(i)
                             .map(|col| (i, col.type_id, sort_expr.asc))
                     })
-                    .ok_or(ExecutionError::ColumnNotFound(base_name))
+                    .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone())),
+                Expression::QualifiedColumn(table, column) => {
+                    let qualified_name = format!("{table}.{column}");
+                    input
+                        .schema()
+                        .iter()
+                        .position(|c| {
+                            c.name == qualified_name
+                                || c.name == *column
+                                || c.name.ends_with(&format!(".{}", column))
+                        })
+                        .and_then(|i| {
+                            input
+                                .schema()
+                                .get(i)
+                                .map(|col| (i, col.type_id, sort_expr.asc))
+                        })
+                        .ok_or_else(|| ExecutionError::ColumnNotFound(column.clone()))
+                }
+                Expression::Literal(LiteralValue::Number(position_literal)) => {
+                    let position = position_literal
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|v| v.checked_sub(1))
+                        .ok_or_else(|| {
+                            ExecutionError::GenericError(
+                                "ORDER BY position must be a positive integer".to_string(),
+                            )
+                        })?;
+                    input
+                        .schema()
+                        .get(position)
+                        .map(|col| (position, col.type_id, sort_expr.asc))
+                        .ok_or_else(|| {
+                            ExecutionError::GenericError(format!(
+                                "ORDER BY position {} is out of range",
+                                position_literal
+                            ))
+                        })
+                }
+                _ => Err(ExecutionError::GenericError(
+                    "ORDER BY only supports column names or positions".to_string(),
+                )),
             })
             .collect::<Result<_, _>>()?;
 
@@ -233,7 +260,7 @@ impl<'a> Executor for SortExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Executor, ProjectionExecutor, Row, SortExecutor};
-    use crate::parser::{Expression, OrderByExpr};
+    use crate::parser::{Expression, LiteralValue, OrderByExpr};
     use crate::types::Column;
 
     struct StaticRowsExecutor {
@@ -425,6 +452,51 @@ mod tests {
                 vec!["3".to_string()],
                 vec!["2".to_string()],
                 vec!["1".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_supports_order_by_position() {
+        let input = StaticRowsExecutor::new(
+            vec![
+                Column {
+                    name: "id".to_string(),
+                    type_id: 23,
+                },
+                Column {
+                    name: "name".to_string(),
+                    type_id: 25,
+                },
+            ],
+            vec![
+                vec!["3".to_string(), "c".to_string()],
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Literal(LiteralValue::Number("1".to_string())),
+                asc: true,
+                nulls_first: None,
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()],
             ]
         );
     }
