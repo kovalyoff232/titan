@@ -416,3 +416,21 @@ fn test_where_text_equality_filter() {
         client.simple_query("SELECT id FROM text_filter_test WHERE name = 'Bob' ORDER BY id;");
     assert_eq!(rows, vec![vec!["2"]]);
 }
+
+#[test]
+#[serial]
+fn test_where_text_not_equal_filter_with_bang_operator() {
+    let mut client = common::setup_server_and_client("where_text_not_equal_filter_test");
+
+    client.simple_query("CREATE TABLE text_filter_bang_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO text_filter_bang_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO text_filter_bang_test VALUES (2, 'Bob');");
+    client.simple_query("INSERT INTO text_filter_bang_test VALUES (3, 'Charlie');");
+    client.simple_query("COMMIT;");
+
+    let rows = client
+        .simple_query("SELECT id FROM text_filter_bang_test WHERE name != 'Bob' ORDER BY id;");
+    assert_eq!(rows, vec![vec!["1"], vec!["3"]]);
+}

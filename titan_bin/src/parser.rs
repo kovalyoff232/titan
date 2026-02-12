@@ -403,6 +403,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
         let comparison_op = just("=")
             .to(BinaryOperator::Eq)
+            .or(just("!=").to(BinaryOperator::NotEq))
             .or(just("<>").to(BinaryOperator::NotEq))
             .or(just("<=").to(BinaryOperator::LtEq))
             .or(just("<").to(BinaryOperator::Lt))
@@ -818,6 +819,19 @@ mod tests {
         };
         assert_eq!(stmt.limit, Some(2));
         assert_eq!(stmt.offset, Some(1));
+    }
+
+    #[test]
+    fn select_where_parses_bang_not_equal_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE name != 'Bob';").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Binary { op, .. } = where_expr else {
+            panic!("expected binary expression in WHERE");
+        };
+        assert_eq!(*op, super::BinaryOperator::NotEq);
     }
 
     #[test]
