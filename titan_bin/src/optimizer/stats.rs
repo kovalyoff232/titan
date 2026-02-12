@@ -48,7 +48,11 @@ pub(super) fn load_statistics_for_table(
     let mut catalog = system_catalog
         .lock()
         .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))?;
-    if catalog.get_statistics(table_name).is_some() && catalog.get_schema(table_name).is_some() {
+    if let (Some(cached_stats), Some(_schema)) = (
+        catalog.get_statistics(table_name),
+        catalog.get_schema(table_name),
+    ) {
+        stats.insert(table_name.to_string(), cached_stats);
         return Ok(());
     }
 
@@ -139,4 +143,50 @@ pub(super) fn load_statistics_for_table(
     catalog.add_statistics(table_name.to_string(), table_stats_arc);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Column;
+    use bedrock::pager::Pager;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_statistics_uses_cache_to_populate_local_stats_map() {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("stats_cache.db");
+        let pager = Pager::open(&db_path).expect("open pager");
+        let bpm = Arc::new(BufferPoolManager::new(pager));
+        let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
+
+        let mut cached = TableStats::default();
+        cached.total_rows = 42.0;
+        let cached_arc = Arc::new(cached);
+
+        {
+            let catalog_guard = catalog.lock().expect("catalog lock");
+            catalog_guard.add_schema(
+                "users".to_string(),
+                Arc::new(vec![Column {
+                    name: "id".to_string(),
+                    type_id: 23,
+                }]),
+            );
+            catalog_guard.add_statistics("users".to_string(), cached_arc.clone());
+        }
+
+        let snapshot = Snapshot {
+            xmin: 0,
+            xmax: 1,
+            active_transactions: Arc::new(HashSet::new()),
+        };
+        let mut local_stats: HashMap<String, Arc<TableStats>> = HashMap::new();
+        load_statistics_for_table("users", &mut local_stats, &bpm, 1, &snapshot, &catalog)
+            .expect("load cached stats");
+
+        let loaded = local_stats.get("users").expect("stats must be populated");
+        assert!(Arc::ptr_eq(loaded, &cached_arc));
+        assert_eq!(loaded.total_rows, 42.0);
+    }
 }
