@@ -148,3 +148,30 @@ fn test_order_by_sorts_unsorted_input() {
     let rows = client.simple_query("SELECT id, payload FROM sort_test ORDER BY id;");
     assert_eq!(rows, vec![vec!["1", "a"], vec!["2", "b"], vec!["3", "c"]]);
 }
+
+#[test]
+#[serial]
+fn test_order_by_supports_multiple_columns() {
+    let mut client = common::setup_server_and_client("order_by_multi_test");
+
+    client.simple_query("CREATE TABLE multi_sort_test (group_id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO multi_sort_test VALUES (2, 'b');");
+    client.simple_query("INSERT INTO multi_sort_test VALUES (1, 'z');");
+    client.simple_query("INSERT INTO multi_sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO multi_sort_test VALUES (2, 'a');");
+    client.simple_query("COMMIT;");
+
+    let rows =
+        client.simple_query("SELECT group_id, name FROM multi_sort_test ORDER BY group_id, name;");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "a"],
+            vec!["1", "z"],
+            vec!["2", "a"],
+            vec!["2", "b"],
+        ]
+    );
+}

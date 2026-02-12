@@ -120,63 +120,75 @@ impl<'a> SortExecutor<'a> {
             rows.push(row);
         }
 
-        if order_by.len() != 1 {
+        let sort_exprs = order_by.as_slice();
+        if sort_exprs.is_empty() {
             return Err(ExecutionError::GenericError(
-                "ORDER BY only supports a single column".to_string(),
+                "missing ORDER BY expression".to_string(),
             ));
         }
-        let sort_expr = order_by.first().ok_or_else(|| {
-            ExecutionError::GenericError("missing ORDER BY expression".to_string())
-        })?;
 
-        let (sort_col_idx, sort_col_type) = if let Expression::Column(name) = sort_expr {
-            input
-                .schema()
-                .iter()
-                .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
-                .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
-                .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))?
-        } else {
-            return Err(ExecutionError::GenericError(
-                "ORDER BY only supports column names".to_string(),
-            ));
-        };
+        let sort_keys: Vec<(usize, u32)> = sort_exprs
+            .iter()
+            .map(|sort_expr| {
+                if let Expression::Column(name) = sort_expr {
+                    input
+                        .schema()
+                        .iter()
+                        .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
+                        .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
+                        .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))
+                } else {
+                    Err(ExecutionError::GenericError(
+                        "ORDER BY only supports column names".to_string(),
+                    ))
+                }
+            })
+            .collect::<Result<_, _>>()?;
 
-        if rows.iter().any(|row| row.get(sort_col_idx).is_none()) {
+        if rows
+            .iter()
+            .any(|row| sort_keys.iter().any(|(idx, _)| row.get(*idx).is_none()))
+        {
             return Err(ExecutionError::GenericError(
                 "ORDER BY column index out of bounds for one or more rows".to_string(),
             ));
         }
 
         rows.sort_by(|a, b| {
-            let Some(val_a) = a.get(sort_col_idx) else {
-                return std::cmp::Ordering::Equal;
-            };
-            let Some(val_b) = b.get(sort_col_idx) else {
-                return std::cmp::Ordering::Equal;
-            };
-            match sort_col_type {
-                23 => {
-                    let num_a = val_a.parse::<i32>().unwrap_or(0);
-                    let num_b = val_b.parse::<i32>().unwrap_or(0);
-                    num_a.cmp(&num_b)
-                }
-                25 => val_a.cmp(val_b),
-                1082 => {
-                    let parsed_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d");
-                    let parsed_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d");
-                    match (parsed_a, parsed_b) {
-                        (Ok(date_a), Ok(date_b)) => date_a.cmp(&date_b),
-                        _ => val_a.cmp(val_b),
+            for (sort_col_idx, sort_col_type) in &sort_keys {
+                let Some(val_a) = a.get(*sort_col_idx) else {
+                    continue;
+                };
+                let Some(val_b) = b.get(*sort_col_idx) else {
+                    continue;
+                };
+                let cmp = match sort_col_type {
+                    23 => {
+                        let num_a = val_a.parse::<i32>().unwrap_or(0);
+                        let num_b = val_b.parse::<i32>().unwrap_or(0);
+                        num_a.cmp(&num_b)
                     }
+                    25 => val_a.cmp(val_b),
+                    1082 => {
+                        let parsed_a = NaiveDate::parse_from_str(val_a, "%Y-%m-%d");
+                        let parsed_b = NaiveDate::parse_from_str(val_b, "%Y-%m-%d");
+                        match (parsed_a, parsed_b) {
+                            (Ok(date_a), Ok(date_b)) => date_a.cmp(&date_b),
+                            _ => val_a.cmp(val_b),
+                        }
+                    }
+                    16 => {
+                        let bool_a = val_a == "t";
+                        let bool_b = val_b == "t";
+                        bool_a.cmp(&bool_b)
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
                 }
-                16 => {
-                    let bool_a = val_a == "t";
-                    let bool_b = val_b == "t";
-                    bool_a.cmp(&bool_b)
-                }
-                _ => std::cmp::Ordering::Equal,
             }
+            std::cmp::Ordering::Equal
         });
 
         Ok(Self {
@@ -304,5 +316,51 @@ mod tests {
             .expect("projection should succeed")
             .expect("row should be present");
         assert_eq!(row, vec!["77".to_string()]);
+    }
+
+    #[test]
+    fn sort_executor_supports_multiple_order_columns() {
+        let input = StaticRowsExecutor::new(
+            vec![
+                Column {
+                    name: "group_id".to_string(),
+                    type_id: 23,
+                },
+                Column {
+                    name: "name".to_string(),
+                    type_id: 25,
+                },
+            ],
+            vec![
+                vec!["2".to_string(), "b".to_string()],
+                vec!["1".to_string(), "z".to_string()],
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "a".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![
+                Expression::Column("group_id".to_string()),
+                Expression::Column("name".to_string()),
+            ],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["1".to_string(), "z".to_string()],
+                vec!["2".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+            ]
+        );
     }
 }
