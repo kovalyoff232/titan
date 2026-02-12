@@ -72,6 +72,28 @@ fn compare_literal_values(
     }
 }
 
+fn trim_string_by_charset(
+    value: &str,
+    chars: Option<&str>,
+    trim_start: bool,
+    trim_end: bool,
+) -> String {
+    let mut result = value;
+    if trim_start {
+        result = match chars {
+            Some(charset) => result.trim_start_matches(|c| charset.contains(c)),
+            None => result.trim_start(),
+        };
+    }
+    if trim_end {
+        result = match chars {
+            Some(charset) => result.trim_end_matches(|c| charset.contains(c)),
+            None => result.trim_end(),
+        };
+    }
+    result.to_string()
+}
+
 pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
@@ -331,6 +353,127 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     Ok(left)
                 }
             }
+            "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+                if args.len() != 1 {
+                    return Err(ExecutionError::GenericError(
+                        "LENGTH requires exactly 1 argument".to_string(),
+                    ));
+                }
+                match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => {
+                        Ok(LiteralValue::Number(text.chars().count().to_string()))
+                    }
+                    LiteralValue::Null => Ok(LiteralValue::Null),
+                    _ => Err(ExecutionError::GenericError(
+                        "LENGTH requires text argument".to_string(),
+                    )),
+                }
+            }
+            "TRIM" | "BTRIM" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecutionError::GenericError(
+                        "TRIM requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let value = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "TRIM requires text argument".to_string(),
+                        ));
+                    }
+                };
+                let chars = if let Some(chars_expr) = args.get(1) {
+                    match evaluate_expr_for_row_to_val(chars_expr, row)? {
+                        LiteralValue::String(text) => Some(text),
+                        LiteralValue::Null => return Ok(LiteralValue::Null),
+                        _ => {
+                            return Err(ExecutionError::GenericError(
+                                "TRIM characters argument must be text".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(LiteralValue::String(trim_string_by_charset(
+                    &value,
+                    chars.as_deref(),
+                    true,
+                    true,
+                )))
+            }
+            "LTRIM" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecutionError::GenericError(
+                        "LTRIM requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let value = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "LTRIM requires text argument".to_string(),
+                        ));
+                    }
+                };
+                let chars = if let Some(chars_expr) = args.get(1) {
+                    match evaluate_expr_for_row_to_val(chars_expr, row)? {
+                        LiteralValue::String(text) => Some(text),
+                        LiteralValue::Null => return Ok(LiteralValue::Null),
+                        _ => {
+                            return Err(ExecutionError::GenericError(
+                                "LTRIM characters argument must be text".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(LiteralValue::String(trim_string_by_charset(
+                    &value,
+                    chars.as_deref(),
+                    true,
+                    false,
+                )))
+            }
+            "RTRIM" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(ExecutionError::GenericError(
+                        "RTRIM requires 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let value = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "RTRIM requires text argument".to_string(),
+                        ));
+                    }
+                };
+                let chars = if let Some(chars_expr) = args.get(1) {
+                    match evaluate_expr_for_row_to_val(chars_expr, row)? {
+                        LiteralValue::String(text) => Some(text),
+                        LiteralValue::Null => return Ok(LiteralValue::Null),
+                        _ => {
+                            return Err(ExecutionError::GenericError(
+                                "RTRIM characters argument must be text".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(LiteralValue::String(trim_string_by_charset(
+                    &value,
+                    chars.as_deref(),
+                    false,
+                    true,
+                )))
+            }
             "LOWER" => {
                 if args.len() != 1 {
                     return Err(ExecutionError::GenericError(
@@ -339,6 +482,7 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 }
                 match evaluate_expr_for_row_to_val(&args[0], row)? {
                     LiteralValue::String(text) => Ok(LiteralValue::String(text.to_lowercase())),
+                    LiteralValue::Null => Ok(LiteralValue::Null),
                     _ => Err(ExecutionError::GenericError(
                         "LOWER requires text argument".to_string(),
                     )),
@@ -352,6 +496,7 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 }
                 match evaluate_expr_for_row_to_val(&args[0], row)? {
                     LiteralValue::String(text) => Ok(LiteralValue::String(text.to_uppercase())),
+                    LiteralValue::Null => Ok(LiteralValue::Null),
                     _ => Err(ExecutionError::GenericError(
                         "UPPER requires text argument".to_string(),
                     )),
@@ -707,6 +852,58 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::String("MIXED".to_string()));
+    }
+
+    #[test]
+    fn length_function_returns_character_count() {
+        let expr = Expression::Function {
+            name: "LENGTH".to_string(),
+            args: vec![Expression::Literal(LiteralValue::String(
+                "test".to_string(),
+            ))],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Number("4".to_string()));
+    }
+
+    #[test]
+    fn trim_functions_remove_expected_characters() {
+        let trim_expr = Expression::Function {
+            name: "TRIM".to_string(),
+            args: vec![Expression::Literal(LiteralValue::String(
+                "  spaced value  ".to_string(),
+            ))],
+        };
+        let ltrim_expr = Expression::Function {
+            name: "LTRIM".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("xxxy".to_string())),
+                Expression::Literal(LiteralValue::String("x".to_string())),
+            ],
+        };
+        let rtrim_expr = Expression::Function {
+            name: "RTRIM".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("yzzz".to_string())),
+                Expression::Literal(LiteralValue::String("z".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&trim_expr, &row).unwrap(),
+            LiteralValue::String("spaced value".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&ltrim_expr, &row).unwrap(),
+            LiteralValue::String("y".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&rtrim_expr, &row).unwrap(),
+            LiteralValue::String("y".to_string())
+        );
     }
 
     #[test]

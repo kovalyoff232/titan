@@ -302,6 +302,35 @@ fn test_lower_and_upper_functions_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_length_and_trim_functions_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("length_trim_test");
+
+    client.simple_query("CREATE TABLE trim_values_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO trim_values_test VALUES (1, '  Alpha  ');");
+    client.simple_query("INSERT INTO trim_values_test VALUES (2, 'xxbetaxx');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, LENGTH(TRIM(payload)), LTRIM(payload, ' x'), RTRIM(payload, ' x') \
+         FROM trim_values_test ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "5", "Alpha  ", "  Alpha"],
+            vec!["2", "8", "betaxx", "xxbeta"]
+        ]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM trim_values_test WHERE LENGTH(TRIM(payload)) = 5;");
+    assert_eq!(filtered_rows, vec![vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 
