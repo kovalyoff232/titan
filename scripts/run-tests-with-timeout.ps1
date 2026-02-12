@@ -1,5 +1,6 @@
 param(
-    [int]$TimeoutSec = 300
+    [int]$TimeoutSec = 300,
+    [string]$OutJson = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,6 +97,13 @@ function Invoke-CargoWithTimeout {
 
         $elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
         Write-Host "Completed in ${elapsed}s"
+        return [pscustomobject]@{
+            label = $Label
+            args = ($CargoArgs -join " ")
+            elapsed_sec = $elapsed
+            timeout_sec = $TimeoutSeconds
+            status = "ok"
+        }
     } finally {
         Stop-TitanServerProcesses
     }
@@ -125,8 +133,33 @@ foreach ($name in $integrationTargets) {
     }
 }
 
+$runResults = @()
 foreach ($target in $testTargets) {
-    Invoke-CargoWithTimeout -CargoExe $cargoExe -Label $target.Label -CargoArgs $target.Args -TimeoutSeconds $TimeoutSec
+    $runResults += Invoke-CargoWithTimeout -CargoExe $cargoExe -Label $target.Label -CargoArgs $target.Args -TimeoutSeconds $TimeoutSec
+}
+
+if ($OutJson) {
+    $outPath = if ([System.IO.Path]::IsPathRooted($OutJson)) {
+        $OutJson
+    } else {
+        Join-Path (Get-Location) $OutJson
+    }
+
+    $outDir = Split-Path -Path $outPath -Parent
+    if ($outDir -and -not (Test-Path $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+
+    $totalElapsedSec = [Math]::Round((@($runResults | Measure-Object -Property elapsed_sec -Sum)[0].Sum), 2)
+    $report = [pscustomobject]@{
+        generated_at = (Get-Date).ToString("o")
+        timeout_sec = $TimeoutSec
+        total_targets = $runResults.Count
+        total_elapsed_sec = $totalElapsedSec
+        targets = $runResults
+    }
+    $report | ConvertTo-Json -Depth 6 | Set-Content -Path $outPath -Encoding UTF8
+    Write-Host "Test timeout report written: $outPath"
 }
 
 Write-Host ""
