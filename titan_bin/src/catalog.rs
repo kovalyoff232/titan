@@ -88,13 +88,6 @@ impl SystemCatalog {
         tx_id: u32,
         snapshot: &Snapshot,
     ) -> Result<Option<(u32, u32)>, ExecutionError> {
-        if name == "pg_class" {
-            return Ok(Some((PG_CLASS_TABLE_OID, PG_CLASS_TABLE_OID)));
-        }
-        if name == "pg_attribute" {
-            return Ok(Some((PG_ATTRIBUTE_TABLE_OID, PG_ATTRIBUTE_TABLE_OID)));
-        }
-
         let page_guard = bpm.acquire_page(PG_CLASS_TABLE_OID)?;
         let page = page_guard.read();
         let mut best_candidate: Option<(bedrock::page::TransactionId, u32, u32)> = None;
