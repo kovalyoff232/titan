@@ -1,5 +1,7 @@
+use bedrock::{failpoint, wal::WalManager};
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use serial_test::serial;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::thread;
@@ -93,6 +95,15 @@ fn try_query_rows(client: &mut Client, sql: &str) -> Result<Vec<Vec<String>>, po
 
 fn query_rows(client: &mut Client, sql: &str) -> Vec<Vec<String>> {
     try_query_rows(client, sql).expect("query should succeed")
+}
+
+fn run_checkpoint_with_failpoint(wal_path: &Path, failpoint_name: &str) -> std::io::Error {
+    failpoint::clear();
+    failpoint::enable(failpoint_name);
+    let mut wal = WalManager::open(wal_path).expect("open wal manager for checkpoint");
+    let checkpoint_result = wal.checkpoint(HashMap::new(), HashMap::new());
+    failpoint::clear();
+    checkpoint_result.expect_err("checkpoint should fail when failpoint is active")
 }
 
 #[test]
@@ -263,4 +274,90 @@ fn crash_matrix_commit_after_wal_keeps_server_usable_and_recovers() {
             );
         }
     }
+}
+
+#[test]
+#[serial]
+fn crash_matrix_checkpoint_before_record_keeps_committed_rows_recoverable() {
+    let temp_dir = tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("crash_checkpoint_before_record.db");
+    let wal_path = temp_dir.path().join("crash_checkpoint_before_record.wal");
+    let port = pick_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let conn_str = format!("host=localhost port={port} user=postgres");
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    query_rows(
+        &mut client,
+        "CREATE TABLE checkpoint_t1 (id INT, name TEXT);",
+    );
+    query_rows(&mut client, "COMMIT;");
+    client.simple_query("BEGIN;").expect("begin");
+    client
+        .simple_query("INSERT INTO checkpoint_t1 VALUES (1, 'cp_before_record');")
+        .expect("insert");
+    client.simple_query("COMMIT;").expect("commit");
+    wait_for_background_sync();
+    drop(client);
+    server.stop();
+
+    let checkpoint_err = run_checkpoint_with_failpoint(&wal_path, "wal.checkpoint.before_record");
+    assert_eq!(checkpoint_err.kind(), std::io::ErrorKind::Other);
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    let rows = query_rows(
+        &mut client,
+        "SELECT id, name FROM checkpoint_t1 ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string(), "cp_before_record".to_string()]]
+    );
+    drop(client);
+    server.stop();
+}
+
+#[test]
+#[serial]
+fn crash_matrix_checkpoint_before_truncate_keeps_committed_rows_recoverable() {
+    let temp_dir = tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("crash_checkpoint_before_truncate.db");
+    let wal_path = temp_dir.path().join("crash_checkpoint_before_truncate.wal");
+    let port = pick_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let conn_str = format!("host=localhost port={port} user=postgres");
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    query_rows(
+        &mut client,
+        "CREATE TABLE checkpoint_t2 (id INT, name TEXT);",
+    );
+    query_rows(&mut client, "COMMIT;");
+    client.simple_query("BEGIN;").expect("begin");
+    client
+        .simple_query("INSERT INTO checkpoint_t2 VALUES (1, 'cp_before_truncate');")
+        .expect("insert");
+    client.simple_query("COMMIT;").expect("commit");
+    wait_for_background_sync();
+    drop(client);
+    server.stop();
+
+    let checkpoint_err = run_checkpoint_with_failpoint(&wal_path, "wal.checkpoint.before_truncate");
+    assert_eq!(checkpoint_err.kind(), std::io::ErrorKind::Other);
+
+    let mut server = start_server(&db_path, &wal_path, &addr, None);
+    let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
+    let rows = query_rows(
+        &mut client,
+        "SELECT id, name FROM checkpoint_t2 ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string(), "cp_before_truncate".to_string()]]
+    );
+    drop(client);
+    server.stop();
 }
