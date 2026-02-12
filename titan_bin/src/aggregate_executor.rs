@@ -233,7 +233,13 @@ impl<'a> HashAggregateExecutor<'a> {
             let Some(cell) = row.get(i) else {
                 continue;
             };
-            map.insert(col.name.clone(), LiteralValue::String(cell.clone()));
+            let value = match col.type_id {
+                23 | 701 => LiteralValue::Number(cell.clone()),
+                16 => LiteralValue::Bool(cell == "t" || cell == "true"),
+                1082 => LiteralValue::Date(cell.clone()),
+                _ => LiteralValue::String(cell.clone()),
+            };
+            map.insert(col.name.clone(), value);
         }
         map
     }

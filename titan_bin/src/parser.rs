@@ -303,12 +303,11 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" => {
-                    Err(Simple::custom(
-                        span,
-                        format!("keyword `{}` cannot be used as an identifier", ident),
-                    ))
-                }
+                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT"
+                | "OFFSET" | "NULL" => Err(Simple::custom(
+                    span,
+                    format!("keyword `{}` cannot be used as an identifier", ident),
+                )),
                 _ => Ok(ident),
             });
 
@@ -352,9 +351,28 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
     let column = ident.map(Expression::Column);
 
     let expr = recursive(|expr| {
-        let atom = literal.or(qualified_column).or(column).or(expr
-            .clone()
-            .delimited_by(just('(').padded(), just(')').padded()));
+        let function_call = ident
+            .then(
+                just('(')
+                    .padded()
+                    .ignore_then(
+                        just('*').padded().to(Vec::<Expression>::new()).or(expr
+                            .clone()
+                            .separated_by(just(',').padded())
+                            .allow_trailing()
+                            .collect::<Vec<_>>()),
+                    )
+                    .then_ignore(just(')').padded()),
+            )
+            .map(|(name, args)| Expression::Function { name, args });
+
+        let atom = literal
+            .or(function_call)
+            .or(qualified_column)
+            .or(column)
+            .or(expr
+                .clone()
+                .delimited_by(just('(').padded(), just(')').padded()));
 
         let unary = text::keyword("NOT")
             .padded()
@@ -484,6 +502,19 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .ignore_then(expr.clone())
                 .or_not(),
         )
+        .then(
+            text::keyword("GROUP")
+                .padded()
+                .ignore_then(text::keyword("BY").padded())
+                .ignore_then(expr.clone().separated_by(just(',').padded()).collect())
+                .or_not(),
+        )
+        .then(
+            text::keyword("HAVING")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
         .then({
             let order_by_expr = expr
                 .clone()
@@ -535,14 +566,20 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .or_not(),
         )
         .map(
-            |((((((select_list, from), where_clause), order_by), limit), offset), for_update)| {
+            |(
+                (
+                    ((((((select_list, from), where_clause), group_by), having), order_by), limit),
+                    offset,
+                ),
+                for_update,
+            )| {
                 Statement::Select(Box::new(SelectStatement {
                     with_clause: None,
                     select_list,
                     from: from.unwrap_or_default(),
                     where_clause,
-                    group_by: None,
-                    having: None,
+                    group_by,
+                    having,
                     order_by,
                     limit,
                     offset,
@@ -764,5 +801,18 @@ mod tests {
             stmt.select_list[0],
             super::SelectItem::UnnamedExpr(Expression::Literal(super::LiteralValue::Null))
         ));
+    }
+
+    #[test]
+    fn select_group_by_and_having_are_parsed() {
+        let parsed = sql_parser(
+            "SELECT group_id, COUNT(*) AS cnt FROM users GROUP BY group_id HAVING cnt > 1;",
+        )
+        .expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert!(stmt.group_by.is_some());
+        assert!(stmt.having.is_some());
     }
 }

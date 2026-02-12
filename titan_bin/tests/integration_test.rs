@@ -262,3 +262,28 @@ fn test_insert_and_select_null_literal() {
     let rows = client.simple_query("SELECT id, payload FROM null_test ORDER BY id;");
     assert_eq!(rows, vec![vec!["1", ""]]);
 }
+
+#[test]
+#[serial]
+fn test_group_by_count_star_and_having() {
+    let mut client = common::setup_server_and_client("group_by_having_test");
+
+    client.simple_query("CREATE TABLE agg_test (group_id INT, val INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO agg_test VALUES (1, 10);");
+    client.simple_query("INSERT INTO agg_test VALUES (1, 20);");
+    client.simple_query("INSERT INTO agg_test VALUES (2, 30);");
+    client.simple_query("INSERT INTO agg_test VALUES (2, 40);");
+    client.simple_query("INSERT INTO agg_test VALUES (2, 50);");
+    client.simple_query("COMMIT;");
+
+    let grouped_rows = client.simple_query(
+        "SELECT group_id, COUNT(*) AS cnt FROM agg_test GROUP BY group_id ORDER BY group_id;",
+    );
+    assert_eq!(grouped_rows, vec![vec!["1", "2"], vec!["2", "3"]]);
+
+    let having_rows =
+        client.simple_query("SELECT group_id, COUNT(*) AS cnt FROM agg_test GROUP BY group_id HAVING cnt > 2 ORDER BY group_id;");
+    assert_eq!(having_rows, vec![vec!["2", "3"]]);
+}

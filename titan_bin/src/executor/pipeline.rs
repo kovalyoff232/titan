@@ -95,7 +95,34 @@ impl<'a> Executor for ProjectionExecutor<'a> {
         let row_map = row_vec_to_map(&row, self.input.schema(), None);
         let mut projected_row = Vec::new();
         for item in &self.expressions {
-            if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                if let Some(value) = row_map.get(alias) {
+                    projected_row.push(value.to_string());
+                    continue;
+                }
+                if let Expression::Function { name, .. } = expr {
+                    if let Some(value) = row_map
+                        .get(name)
+                        .or_else(|| row_map.get(&name.to_lowercase()))
+                        .or_else(|| row_map.get(&name.to_uppercase()))
+                    {
+                        projected_row.push(value.to_string());
+                        continue;
+                    }
+                }
+                let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
+                projected_row.push(val.to_string());
+            } else if let SelectItem::UnnamedExpr(expr) = item {
+                if let Expression::Function { name, .. } = expr {
+                    if let Some(value) = row_map
+                        .get(name)
+                        .or_else(|| row_map.get(&name.to_lowercase()))
+                        .or_else(|| row_map.get(&name.to_uppercase()))
+                    {
+                        projected_row.push(value.to_string());
+                        continue;
+                    }
+                }
                 let val = evaluate_expr_for_row_to_val(expr, &row_map)?;
                 projected_row.push(val.to_string());
             }
