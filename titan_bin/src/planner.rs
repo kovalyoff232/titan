@@ -114,7 +114,10 @@ pub fn create_logical_plan(
             filter: None,
         }
     } else {
-        build_plan_from_table_ref(&stmt.from[0], bpm, tx_id, snapshot, system_catalog)?
+        let first_table_ref = stmt.from.first().ok_or_else(|| {
+            ExecutionError::GenericError("missing FROM table reference".to_string())
+        })?;
+        build_plan_from_table_ref(first_table_ref, bpm, tx_id, snapshot, system_catalog)?
     };
 
     if let Some(where_clause) = &stmt.where_clause {

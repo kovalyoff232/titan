@@ -47,8 +47,9 @@ fn parse_startup_code(startup_packet: &[u8]) -> io::Result<u32> {
         ));
     }
 
+    let (len_prefix, remaining) = startup_packet.split_at(4);
     let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&startup_packet[0..4]);
+    len_bytes.copy_from_slice(len_prefix);
     let total_len = i32::from_be_bytes(len_bytes);
     if total_len < 8 {
         return Err(io::Error::new(
@@ -64,7 +65,10 @@ fn parse_startup_code(startup_packet: &[u8]) -> io::Result<u32> {
     }
 
     let mut code = [0u8; 4];
-    code.copy_from_slice(&startup_packet[4..8]);
+    let code_slice = remaining
+        .get(..4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup packet too short"))?;
+    code.copy_from_slice(code_slice);
     Ok(u32::from_be_bytes(code))
 }
 
@@ -92,8 +96,9 @@ fn read_startup_packet(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     }
 
     let mut packet = vec![0u8; total_len_usize];
-    packet[0..4].copy_from_slice(&len_prefix);
-    stream.read_exact(&mut packet[4..])?;
+    let (prefix, body) = packet.split_at_mut(4);
+    prefix.copy_from_slice(&len_prefix);
+    stream.read_exact(body)?;
     Ok(Some(packet))
 }
 
@@ -122,8 +127,8 @@ fn parse_simple_query_payload(payload: &[u8]) -> io::Result<String> {
             "empty query payload",
         ));
     }
-    let text = if payload.last() == Some(&0) {
-        &payload[..payload.len() - 1]
+    let text = if let Some((&0, without_nul)) = payload.split_last() {
+        without_nul
     } else {
         payload
     };
@@ -372,7 +377,7 @@ fn handle_client(
 
         match msg_type[0] {
             b'Q' => {
-                let query_str = match parse_simple_query_payload(&buffer[..len]) {
+                let query_str = match parse_simple_query_payload(&buffer) {
                     Ok(s) => s,
                     Err(e) => {
                         crate::titan_debug_log!("[handle_client] Invalid query payload: {}", e);
