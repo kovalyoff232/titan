@@ -164,7 +164,7 @@ mod tests {
         let mut limit_exec = LimitExecutor::new(mock_exec, Some(3), 0);
 
         let mut count = 0;
-        while let Some(_) = limit_exec.next().unwrap() {
+        while limit_exec.next().unwrap().is_some() {
             count += 1;
         }
         assert_eq!(count, 3);
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(first_row[0], "3");
 
         let mut count = 1;
-        while let Some(_) = limit_exec.next().unwrap() {
+        while limit_exec.next().unwrap().is_some() {
             count += 1;
         }
         assert_eq!(count, 3);

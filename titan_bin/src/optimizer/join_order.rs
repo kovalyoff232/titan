@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn stable_compare_breaks_equal_cost_ties_by_plan_key() {
-        let mut candidates = vec![
+        let mut candidates = [
             PlanInfo {
                 plan: Arc::new(PhysicalPlan::TableScan {
                     table_name: "z_table".to_string(),

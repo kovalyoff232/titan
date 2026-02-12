@@ -175,3 +175,22 @@ fn test_order_by_supports_multiple_columns() {
         ]
     );
 }
+
+#[test]
+#[serial]
+fn test_order_by_supports_qualified_column_reference() {
+    let mut client = common::setup_server_and_client("order_by_qualified_test");
+
+    client.simple_query("CREATE TABLE qualified_sort_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO qualified_sort_test VALUES (3, 'c');");
+    client.simple_query("INSERT INTO qualified_sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO qualified_sort_test VALUES (2, 'b');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, payload FROM qualified_sort_test ORDER BY qualified_sort_test.id;",
+    );
+    assert_eq!(rows, vec![vec!["1", "a"], vec!["2", "b"], vec!["3", "c"]]);
+}

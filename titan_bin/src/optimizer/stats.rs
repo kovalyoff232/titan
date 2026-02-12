@@ -191,8 +191,10 @@ mod tests {
         let bpm = Arc::new(BufferPoolManager::new(pager));
         let catalog = Arc::new(Mutex::new(SystemCatalog::new()));
 
-        let mut cached = TableStats::default();
-        cached.total_rows = 42.0;
+        let cached = TableStats {
+            total_rows: 42.0,
+            ..TableStats::default()
+        };
         let cached_arc = Arc::new(cached);
 
         {

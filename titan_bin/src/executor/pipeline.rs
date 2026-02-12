@@ -130,18 +130,27 @@ impl<'a> SortExecutor<'a> {
         let sort_keys: Vec<(usize, u32)> = sort_exprs
             .iter()
             .map(|sort_expr| {
-                if let Expression::Column(name) = sort_expr {
-                    input
-                        .schema()
-                        .iter()
-                        .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
-                        .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
-                        .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone()))
-                } else {
-                    Err(ExecutionError::GenericError(
-                        "ORDER BY only supports column names".to_string(),
-                    ))
-                }
+                let (lookup_name, base_name) = match sort_expr {
+                    Expression::Column(name) => (name.clone(), name.clone()),
+                    Expression::QualifiedColumn(table, column) => {
+                        (format!("{table}.{column}"), column.clone())
+                    }
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "ORDER BY only supports column names".to_string(),
+                        ));
+                    }
+                };
+                input
+                    .schema()
+                    .iter()
+                    .position(|c| {
+                        c.name == lookup_name
+                            || c.name == base_name
+                            || c.name.ends_with(&format!(".{}", base_name))
+                    })
+                    .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
+                    .ok_or(ExecutionError::ColumnNotFound(base_name))
             })
             .collect::<Result<_, _>>()?;
 
@@ -360,6 +369,50 @@ mod tests {
                 vec!["1".to_string(), "z".to_string()],
                 vec!["2".to_string(), "a".to_string()],
                 vec!["2".to_string(), "b".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_accepts_qualified_order_by_column() {
+        let input = StaticRowsExecutor::new(
+            vec![
+                Column {
+                    name: "users.id".to_string(),
+                    type_id: 23,
+                },
+                Column {
+                    name: "users.name".to_string(),
+                    type_id: 25,
+                },
+            ],
+            vec![
+                vec!["3".to_string(), "c".to_string()],
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![Expression::QualifiedColumn(
+                "users".to_string(),
+                "id".to_string(),
+            )],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()],
             ]
         );
     }

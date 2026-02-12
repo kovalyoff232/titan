@@ -121,11 +121,8 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         for row in &results {
-            if row[0] == "30" {
-                assert_eq!(row[1], "2");
-            } else if row[0] == "25" {
-                assert_eq!(row[1], "2");
-            }
+            assert!(row[0] == "30" || row[0] == "25");
+            assert_eq!(row[1], "2");
         }
     }
 
