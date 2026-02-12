@@ -28,6 +28,12 @@ function Quote-Arg {
     return "'" + ($Arg -replace "'", "''") + "'"
 }
 
+function Stop-TitanServerProcesses {
+    Get-Process titan_bin -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 120
+}
+
 function Invoke-Step {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -36,27 +42,68 @@ function Invoke-Step {
     )
 
     Write-Host "==> $Name"
+    Stop-TitanServerProcesses
+
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell.exe"
     $psi.Arguments = "-NoProfile -EncodedCommand $encoded"
     $psi.WorkingDirectory = (Get-Location).Path
     $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
-    [void]$proc.Start()
 
-    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-        try {
-            $proc.Kill()
-        } catch {
+    try {
+        [void]$proc.Start()
+        $start = Get-Date
+
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            Write-Warning "Step '$Name' timed out after ${TimeoutSec}s. Killing process tree."
+            try {
+                $proc.Kill($true)
+            } catch {
+            }
+
+            $stdout = $stdoutTask.Result
+            $stderr = $stderrTask.Result
+            if ($stdout) {
+                Write-Host "---- stdout (tail) ----"
+                $stdout.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+            }
+            if ($stderr) {
+                Write-Host "---- stderr (tail) ----"
+                $stderr.Split([Environment]::NewLine) | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+            }
+
+            throw "Step '$Name' timed out after ${TimeoutSec}s"
         }
-        throw "Step '$Name' timed out after ${TimeoutSec}s"
-    }
 
-    if ($proc.ExitCode -ne 0) {
-        throw "Step '$Name' failed with exit code $($proc.ExitCode)"
+        $proc.WaitForExit()
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+
+        if ($proc.ExitCode -ne 0) {
+            if ($stdout) {
+                Write-Host "---- stdout (tail) ----"
+                $stdout.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
+            }
+            if ($stderr) {
+                Write-Host "---- stderr (tail) ----"
+                $stderr.Split([Environment]::NewLine) | Select-Object -Last 120 | ForEach-Object { Write-Host $_ }
+            }
+            throw "Step '$Name' failed with exit code $($proc.ExitCode)"
+        }
+
+        $elapsedSec = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
+        Write-Host "Step '$Name' completed in ${elapsedSec}s"
+    } finally {
+        Stop-TitanServerProcesses
     }
 }
 

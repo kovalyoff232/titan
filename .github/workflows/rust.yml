@@ -94,7 +94,9 @@ jobs:
           -BenchmarkReport target/benchmarks/smoke-ci.json `
           -TestReport target/reports/test-timeout-report.json `
           -OutJson target/reports/weekly-kpi.json `
-          -OutTxt target/reports/weekly-kpi.txt
+          -OutTxt target/reports/weekly-kpi.txt `
+          -MinScore 85 `
+          -FailBelowMinScore
 
     - name: Upload recovery reconciliation report
       if: always()
