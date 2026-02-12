@@ -5,7 +5,6 @@ use crate::errors::ExecutionError;
 use crate::parser::{Expression, SelectItem};
 use crate::types::Column;
 use chrono::NaiveDate;
-use std::collections::HashMap;
 
 pub(super) struct FilterExecutor<'a> {
     input: Box<dyn Executor + 'a>,
@@ -93,21 +92,7 @@ impl<'a> Executor for ProjectionExecutor<'a> {
             return Ok(Some(row));
         }
 
-        let mut row_map = HashMap::new();
-        if self.input.schema().len() == row.len() {
-            row_map = row_vec_to_map(&row, self.input.schema(), None);
-        } else {
-            let left_len = self
-                .input
-                .schema()
-                .iter()
-                .filter(|c| c.name.starts_with("users."))
-                .count();
-            let (left_row, right_row) = row.split_at(left_len);
-            let (left_schema, right_schema) = self.input.schema().split_at(left_len);
-            row_map.extend(row_vec_to_map(left_row, left_schema, Some("users")));
-            row_map.extend(row_vec_to_map(right_row, right_schema, Some("orders")));
-        }
+        let row_map = row_vec_to_map(&row, self.input.schema(), None);
         let mut projected_row = Vec::new();
         for item in &self.expressions {
             if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
@@ -207,7 +192,7 @@ impl<'a> Executor for SortExecutor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Executor, Row, SortExecutor};
+    use super::{Executor, ProjectionExecutor, Row, SortExecutor};
     use crate::parser::Expression;
     use crate::types::Column;
 
@@ -270,5 +255,35 @@ mod tests {
         assert_eq!(sorted.len(), 3);
         assert_eq!(sorted[0], "2023-12-30");
         assert!(sorted.contains(&"not-a-date".to_string()));
+    }
+
+    #[test]
+    fn projection_executor_resolves_qualified_columns_without_hardcoded_table_names() {
+        let input = StaticRowsExecutor::new(
+            vec![
+                Column {
+                    name: "alpha.id".to_string(),
+                    type_id: 23,
+                },
+                Column {
+                    name: "beta.id".to_string(),
+                    type_id: 23,
+                },
+            ],
+            vec![vec!["10".to_string(), "77".to_string()]],
+        );
+
+        let mut projection = ProjectionExecutor::new(
+            Box::new(input),
+            vec![crate::parser::SelectItem::UnnamedExpr(
+                Expression::QualifiedColumn("beta".to_string(), "id".to_string()),
+            )],
+        );
+
+        let row = projection
+            .next()
+            .expect("projection should succeed")
+            .expect("row should be present");
+        assert_eq!(row, vec!["77".to_string()]);
     }
 }
