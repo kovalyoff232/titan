@@ -278,6 +278,30 @@ fn test_nullif_function_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_lower_and_upper_functions_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("lower_upper_test");
+
+    client.simple_query("CREATE TABLE case_values_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO case_values_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO case_values_test VALUES (2, 'BoB');");
+    client.simple_query("COMMIT;");
+
+    let rows = client
+        .simple_query("SELECT id, LOWER(name), UPPER(name) FROM case_values_test ORDER BY id;");
+    assert_eq!(
+        rows,
+        vec![vec!["1", "alice", "ALICE"], vec!["2", "bob", "BOB"]]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM case_values_test WHERE LOWER(name) = 'bob';");
+    assert_eq!(filtered_rows, vec![vec!["2"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

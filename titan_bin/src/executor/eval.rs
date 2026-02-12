@@ -132,6 +132,21 @@ pub(crate) fn evaluate_expr_for_row_to_val(
             let lval = evaluate_expr_for_row_to_val(left, row)?;
             let rval = evaluate_expr_for_row_to_val(right, row)?;
             match (lval, rval) {
+                (LiteralValue::Null, _) | (_, LiteralValue::Null) => match op {
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Like
+                    | BinaryOperator::NotLike
+                    | BinaryOperator::ILike
+                    | BinaryOperator::NotILike => Ok(LiteralValue::Bool(false)),
+                    _ => Err(ExecutionError::GenericError(
+                        "Unsupported operator for NULL".to_string(),
+                    )),
+                },
                 (LiteralValue::Number(l), LiteralValue::Number(r)) => {
                     let lnum = parse_i32_literal(&l)?;
                     let rnum = parse_i32_literal(&r)?;
@@ -314,6 +329,32 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     Ok(LiteralValue::Null)
                 } else {
                     Ok(left)
+                }
+            }
+            "LOWER" => {
+                if args.len() != 1 {
+                    return Err(ExecutionError::GenericError(
+                        "LOWER requires exactly 1 argument".to_string(),
+                    ));
+                }
+                match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => Ok(LiteralValue::String(text.to_lowercase())),
+                    _ => Err(ExecutionError::GenericError(
+                        "LOWER requires text argument".to_string(),
+                    )),
+                }
+            }
+            "UPPER" => {
+                if args.len() != 1 {
+                    return Err(ExecutionError::GenericError(
+                        "UPPER requires exactly 1 argument".to_string(),
+                    ));
+                }
+                match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => Ok(LiteralValue::String(text.to_uppercase())),
+                    _ => Err(ExecutionError::GenericError(
+                        "UPPER requires text argument".to_string(),
+                    )),
                 }
             }
             _ => Err(ExecutionError::GenericError(format!(
@@ -638,5 +679,46 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::String("left".to_string()));
+    }
+
+    #[test]
+    fn lower_function_converts_text_to_lowercase() {
+        let expr = Expression::Function {
+            name: "LOWER".to_string(),
+            args: vec![Expression::Literal(LiteralValue::String(
+                "MiXeD".to_string(),
+            ))],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("mixed".to_string()));
+    }
+
+    #[test]
+    fn upper_function_converts_text_to_uppercase() {
+        let expr = Expression::Function {
+            name: "UPPER".to_string(),
+            args: vec![Expression::Literal(LiteralValue::String(
+                "MiXeD".to_string(),
+            ))],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::String("MIXED".to_string()));
+    }
+
+    #[test]
+    fn null_comparison_returns_false_instead_of_type_error() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Null)),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(LiteralValue::String("x".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(false));
     }
 }
