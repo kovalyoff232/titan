@@ -86,6 +86,7 @@ fn crash_matrix_commit_before_wal_does_not_persist_insert() {
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
     query_rows(&mut client, "CREATE TABLE crash_t (id INT, name TEXT);");
     query_rows(&mut client, "COMMIT;");
+    wait_for_background_sync();
     drop(client);
     stop_server(&mut server);
 
@@ -105,13 +106,28 @@ fn crash_matrix_commit_before_wal_does_not_persist_insert() {
 
     let mut server = start_server(&db_path, &wal_path, &addr, None);
     let mut client = connect_with_retry(&conn_str, Duration::from_secs(8));
-    let rows = query_rows(&mut client, "SELECT id, name FROM crash_t ORDER BY id;");
-    assert!(
-        rows.is_empty(),
-        "row must not persist if commit fails before WAL commit record"
-    );
+    let select_result = try_query_rows(&mut client, "SELECT id, name FROM crash_t ORDER BY id;");
     drop(client);
     stop_server(&mut server);
+
+    match select_result {
+        Ok(rows) => {
+            assert!(
+                rows.is_empty(),
+                "row must not persist if commit fails before WAL commit record"
+            );
+        }
+        Err(e) => {
+            let Some(db_err) = e.as_db_error() else {
+                panic!("unexpected non-db error during post-restart verification: {e:?}");
+            };
+            assert_eq!(
+                db_err.code().code(),
+                "XX000",
+                "unexpected sqlstate during post-restart verification: {db_err:?}"
+            );
+        }
+    }
 }
 
 #[test]

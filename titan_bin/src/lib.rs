@@ -122,6 +122,30 @@ fn commit_transaction(
     Ok(())
 }
 
+fn handle_commit_failure(
+    stream: &mut TcpStream,
+    tm: &TransactionManager,
+    wal: &Arc<Mutex<WalManager>>,
+    bpm: &Arc<BufferPoolManager>,
+    lm: &LockManager,
+    tx_id: u32,
+    err: &io::Error,
+) -> io::Result<()> {
+    send_error_response(stream, &format!("Commit failed: {err}"), "XX000")?;
+
+    if tm.is_active(tx_id) {
+        if let Err(abort_err) = abort_transaction(tm, wal, bpm, lm, tx_id) {
+            crate::titan_debug_log!(
+                "[handle_client] Failed to abort tx_id {} after commit error: {}",
+                tx_id,
+                abort_err
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn write_message(stream: &mut TcpStream, msg_type: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 4) as i32;
     stream.write_all(&[msg_type])?;
@@ -329,7 +353,28 @@ fn handle_client(
                             continue;
                         }
                         parser::Statement::Commit => {
-                            commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true)?;
+                            if let Err(commit_err) =
+                                commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true)
+                            {
+                                crate::titan_debug_log!(
+                                    "[handle_client] Commit failed for tx_id {}: {}",
+                                    tx_id,
+                                    commit_err
+                                );
+                                handle_commit_failure(
+                                    &mut stream,
+                                    &tm,
+                                    &wal,
+                                    &bpm,
+                                    &lm,
+                                    tx_id,
+                                    &commit_err,
+                                )?;
+                                in_transaction = false;
+                                in_explicit_transaction = false;
+                                last_result = None;
+                                break;
+                            }
                             in_transaction = false;
                             in_explicit_transaction = false;
                             send_command_complete(&mut stream, "COMMIT")?;
@@ -423,7 +468,26 @@ fn handle_client(
                         "[handle_client] Committing implicit transaction with tx_id: {}",
                         tx_id
                     );
-                    commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true)?;
+                    if let Err(commit_err) = commit_transaction(&tm, &wal, &bpm, &lm, tx_id, true) {
+                        crate::titan_debug_log!(
+                            "[handle_client] Implicit commit failed for tx_id {}: {}",
+                            tx_id,
+                            commit_err
+                        );
+                        handle_commit_failure(
+                            &mut stream,
+                            &tm,
+                            &wal,
+                            &bpm,
+                            &lm,
+                            tx_id,
+                            &commit_err,
+                        )?;
+                        in_transaction = false;
+                        in_explicit_transaction = false;
+                        send_ready_for_query(&mut stream)?;
+                        continue;
+                    }
                     in_transaction = false;
                 }
 
