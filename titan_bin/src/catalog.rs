@@ -108,33 +108,36 @@ impl SystemCatalog {
                         continue;
                     }
                     let header = page.read_tuple_header(item_id_data.offset);
-                    let name_len = tuple_data[8] as usize;
-                    if tuple_data.len() >= 9 + name_len {
-                        let table_name = String::from_utf8_lossy(&tuple_data[9..9 + name_len]);
-                        if table_name == name {
-                            crate::titan_debug_log!(
-                                "[find_table] Checking item_id: {}, xmin: {}, xmax: {}, visible: true, name: {}",
-                                i,
-                                header.xmin,
-                                header.xmax,
-                                table_name
-                            );
-                            if let (Some(table_oid), Some(table_page_id)) =
-                                (read_u32(tuple_data, 0), read_u32(tuple_data, 4))
+                    let Some(name_len) = tuple_data.get(8).copied().map(|b| b as usize) else {
+                        continue;
+                    };
+                    let Some(name_bytes) = tuple_data.get(9..9 + name_len) else {
+                        continue;
+                    };
+                    let table_name = String::from_utf8_lossy(name_bytes);
+                    if table_name == name {
+                        crate::titan_debug_log!(
+                            "[find_table] Checking item_id: {}, xmin: {}, xmax: {}, visible: true, name: {}",
+                            i,
+                            header.xmin,
+                            header.xmax,
+                            table_name
+                        );
+                        if let (Some(table_oid), Some(table_page_id)) =
+                            (read_u32(tuple_data, 0), read_u32(tuple_data, 4))
+                        {
+                            if best_candidate
+                                .as_ref()
+                                .is_none_or(|(xmin, _, _)| header.xmin > *xmin)
                             {
-                                if best_candidate
-                                    .as_ref()
-                                    .is_none_or(|(xmin, _, _)| header.xmin > *xmin)
-                                {
-                                    best_candidate = Some((header.xmin, table_oid, table_page_id));
-                                    crate::titan_debug_log!(
-                                        "[find_table] Found candidate for '{}': oid={}, page_id={}, xmin={}",
-                                        name,
-                                        table_oid,
-                                        table_page_id,
-                                        header.xmin
-                                    );
-                                }
+                                best_candidate = Some((header.xmin, table_oid, table_page_id));
+                                crate::titan_debug_log!(
+                                    "[find_table] Found candidate for '{}': oid={}, page_id={}, xmin={}",
+                                    name,
+                                    table_oid,
+                                    table_page_id,
+                                    header.xmin
+                                );
                             }
                         }
                     }
@@ -187,11 +190,10 @@ impl SystemCatalog {
                             else {
                                 continue;
                             };
-                            if tuple_data.len() < 11 + name_len {
+                            let Some(name_bytes) = tuple_data.get(11..11 + name_len) else {
                                 continue;
-                            }
-                            let name =
-                                String::from_utf8_lossy(&tuple_data[11..11 + name_len]).to_string();
+                            };
+                            let name = String::from_utf8_lossy(name_bytes).to_string();
                             schema_cols.push((attnum, Column { name, type_id }));
                         }
                     }
@@ -270,7 +272,12 @@ pub fn update_pg_class_page_id(
         }
 
         let before_insert_page = pg_class_page.data.to_vec();
-        tuple_data[4..8].copy_from_slice(&new_page_id.to_be_bytes());
+        let page_id_slice = tuple_data.get_mut(4..8).ok_or_else(|| {
+            ExecutionError::GenericError(
+                "Corrupt pg_class tuple: missing page_id field bytes".to_string(),
+            )
+        })?;
+        page_id_slice.copy_from_slice(&new_page_id.to_be_bytes());
         let new_item_id = pg_class_page
             .add_tuple(&tuple_data, tx_id, 0)
             .ok_or_else(|| {
