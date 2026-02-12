@@ -209,6 +209,31 @@ fn test_where_in_and_not_in_filters() {
 
 #[test]
 #[serial]
+fn test_where_between_and_not_between_filters() {
+    let mut client = common::setup_server_and_client("between_filter_test");
+
+    client.simple_query("CREATE TABLE between_values_test (id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO between_values_test VALUES (5);");
+    client.simple_query("INSERT INTO between_values_test VALUES (10);");
+    client.simple_query("INSERT INTO between_values_test VALUES (15);");
+    client.simple_query("INSERT INTO between_values_test VALUES (20);");
+    client.simple_query("INSERT INTO between_values_test VALUES (25);");
+    client.simple_query("COMMIT;");
+
+    let between_rows = client
+        .simple_query("SELECT id FROM between_values_test WHERE id BETWEEN 10 AND 20 ORDER BY id;");
+    assert_eq!(between_rows, vec![vec!["10"], vec!["15"], vec!["20"]]);
+
+    let not_between_rows = client.simple_query(
+        "SELECT id FROM between_values_test WHERE id NOT BETWEEN 10 AND 20 ORDER BY id;",
+    );
+    assert_eq!(not_between_rows, vec![vec!["5"], vec!["25"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

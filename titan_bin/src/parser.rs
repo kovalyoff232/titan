@@ -122,6 +122,12 @@ pub enum Expression {
         list: Vec<Expression>,
         negated: bool,
     },
+    Between {
+        expr: Box<Expression>,
+        lower: Box<Expression>,
+        upper: Box<Expression>,
+        negated: bool,
+    },
     WindowFunction {
         function: WindowFunctionType,
         args: Vec<Expression>,
@@ -260,6 +266,18 @@ impl fmt::Display for Expression {
                 }
                 write!(f, "))")
             }
+            Expression::Between {
+                expr,
+                lower,
+                upper,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "({} NOT BETWEEN {} AND {})", expr, lower, upper)
+                } else {
+                    write!(f, "({} BETWEEN {} AND {})", expr, lower, upper)
+                }
+            }
             Expression::WindowFunction { function, .. } => write!(
                 f,
                 "{}() OVER (...)",
@@ -343,9 +361,9 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "IN" | "LIKE"
-                | "ILIKE" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST"
-                | "LAST" => Err(Simple::custom(
+                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "IN" | "BETWEEN"
+                | "LIKE" | "ILIKE" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS"
+                | "FIRST" | "LAST" => Err(Simple::custom(
                     span,
                     format!("keyword `{}` cannot be used as an identifier", ident),
                 )),
@@ -487,7 +505,33 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(just(">=").to(BinaryOperator::GtEq))
             .or(just(">").to(BinaryOperator::Gt));
 
-        let comparison = null_check
+        let between_predicate = null_check
+            .clone()
+            .then(
+                text::keyword("NOT")
+                    .padded()
+                    .ignore_then(text::keyword("BETWEEN"))
+                    .to(true)
+                    .or(text::keyword("BETWEEN").to(false))
+                    .then(null_check.clone())
+                    .then_ignore(text::keyword("AND").padded())
+                    .then(null_check.clone())
+                    .or_not(),
+            )
+            .map(|(left_expr, between_predicate)| {
+                if let Some(((negated, lower), upper)) = between_predicate {
+                    Expression::Between {
+                        expr: Box::new(left_expr),
+                        lower: Box::new(lower),
+                        upper: Box::new(upper),
+                        negated,
+                    }
+                } else {
+                    left_expr
+                }
+            });
+
+        let in_predicate = between_predicate
             .clone()
             .then(
                 text::keyword("NOT")
@@ -514,8 +558,11 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 } else {
                     left_expr
                 }
-            })
-            .then(comparison_op.padded().then(null_check).repeated())
+            });
+
+        let comparison = in_predicate
+            .clone()
+            .then(comparison_op.padded().then(in_predicate).repeated())
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
@@ -1034,6 +1081,63 @@ mod tests {
         };
         assert_eq!(expr.as_ref(), &Expression::Column("id".to_string()));
         assert_eq!(list.len(), 3);
+        assert!(*negated);
+    }
+
+    #[test]
+    fn select_where_parses_between_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE id BETWEEN 10 AND 20;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Between {
+            expr,
+            lower,
+            upper,
+            negated,
+        } = where_expr
+        else {
+            panic!("expected BETWEEN expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("id".to_string()));
+        assert_eq!(
+            lower.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("10".to_string()))
+        );
+        assert_eq!(
+            upper.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("20".to_string()))
+        );
+        assert!(!negated);
+    }
+
+    #[test]
+    fn select_where_parses_not_between_operator() {
+        let parsed =
+            sql_parser("SELECT id FROM users WHERE id NOT BETWEEN 10 AND 20;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Between {
+            expr,
+            lower,
+            upper,
+            negated,
+        } = where_expr
+        else {
+            panic!("expected NOT BETWEEN expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("id".to_string()));
+        assert_eq!(
+            lower.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("10".to_string()))
+        );
+        assert_eq!(
+            upper.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("20".to_string()))
+        );
         assert!(*negated);
     }
 

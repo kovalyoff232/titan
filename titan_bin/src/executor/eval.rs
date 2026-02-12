@@ -1,6 +1,7 @@
 use crate::errors::ExecutionError;
 use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use chrono::prelude::*;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 fn parse_i32_literal(value: &str) -> Result<i32, ExecutionError> {
@@ -46,6 +47,29 @@ fn like_match(value: &str, pattern: &str) -> bool {
     }
 
     dp[pattern_len][value_len]
+}
+
+fn compare_literal_values(
+    left: &LiteralValue,
+    right: &LiteralValue,
+) -> Result<Ordering, ExecutionError> {
+    match (left, right) {
+        (LiteralValue::Number(l), LiteralValue::Number(r)) => {
+            let lnum = parse_i32_literal(l)?;
+            let rnum = parse_i32_literal(r)?;
+            Ok(lnum.cmp(&rnum))
+        }
+        (LiteralValue::String(l), LiteralValue::String(r)) => Ok(l.cmp(r)),
+        (LiteralValue::Bool(l), LiteralValue::Bool(r)) => Ok(l.cmp(r)),
+        (LiteralValue::Date(l), LiteralValue::Date(r)) => {
+            let ldate = parse_date_literal(l)?;
+            let rdate = parse_date_literal(r)?;
+            Ok(ldate.cmp(&rdate))
+        }
+        _ => Err(ExecutionError::GenericError(
+            "Type mismatch in BETWEEN expression".to_string(),
+        )),
+    }
 }
 
 pub(crate) fn evaluate_expr_for_row(
@@ -225,6 +249,25 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 !is_match
             } else {
                 is_match
+            }))
+        }
+        Expression::Between {
+            expr,
+            lower,
+            upper,
+            negated,
+        } => {
+            let value = evaluate_expr_for_row_to_val(expr, row)?;
+            let lower_value = evaluate_expr_for_row_to_val(lower, row)?;
+            let upper_value = evaluate_expr_for_row_to_val(upper, row)?;
+            let lower_cmp = compare_literal_values(&value, &lower_value)?;
+            let upper_cmp = compare_literal_values(&value, &upper_value)?;
+            let is_between = (lower_cmp == Ordering::Greater || lower_cmp == Ordering::Equal)
+                && (upper_cmp == Ordering::Less || upper_cmp == Ordering::Equal);
+            Ok(LiteralValue::Bool(if *negated {
+                !is_between
+            } else {
+                is_between
             }))
         }
         Expression::WindowFunction { .. } => Err(ExecutionError::GenericError(
@@ -463,6 +506,34 @@ mod tests {
                 Expression::Literal(LiteralValue::Number("5".to_string())),
                 Expression::Literal(LiteralValue::Number("6".to_string())),
             ],
+            negated: true,
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn between_expression_evaluates_to_boolean() {
+        let expr = Expression::Between {
+            expr: Box::new(Expression::Literal(LiteralValue::Number("15".to_string()))),
+            lower: Box::new(Expression::Literal(LiteralValue::Number("10".to_string()))),
+            upper: Box::new(Expression::Literal(LiteralValue::Number("20".to_string()))),
+            negated: false,
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn not_between_expression_evaluates_to_boolean() {
+        let expr = Expression::Between {
+            expr: Box::new(Expression::Literal(LiteralValue::Number("25".to_string()))),
+            lower: Box::new(Expression::Literal(LiteralValue::Number("10".to_string()))),
+            upper: Box::new(Expression::Literal(LiteralValue::Number("20".to_string()))),
             negated: true,
         };
         let row = HashMap::new();
