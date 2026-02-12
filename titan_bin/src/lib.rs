@@ -39,17 +39,62 @@ macro_rules! titan_debug_log {
     };
 }
 
-fn parse_startup_code(startup_buf: &[u8], read_len: usize) -> io::Result<u32> {
-    if read_len < 8 || startup_buf.len() < 8 {
+fn parse_startup_code(startup_packet: &[u8]) -> io::Result<u32> {
+    if startup_packet.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "startup packet too short",
         ));
     }
 
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&startup_packet[0..4]);
+    let total_len = i32::from_be_bytes(len_bytes);
+    if total_len < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet has invalid length prefix",
+        ));
+    }
+    if total_len as usize != startup_packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet length prefix mismatch",
+        ));
+    }
+
     let mut code = [0u8; 4];
-    code.copy_from_slice(&startup_buf[4..8]);
+    code.copy_from_slice(&startup_packet[4..8]);
     Ok(u32::from_be_bytes(code))
+}
+
+fn read_startup_packet(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+    let mut len_prefix = [0u8; 4];
+    match stream.read_exact(&mut len_prefix) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let total_len = i32::from_be_bytes(len_prefix);
+    if total_len < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet has invalid length prefix",
+        ));
+    }
+    let total_len_usize = total_len as usize;
+    if total_len_usize > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet exceeds limit",
+        ));
+    }
+
+    let mut packet = vec![0u8; total_len_usize];
+    packet[0..4].copy_from_slice(&len_prefix);
+    stream.read_exact(&mut packet[4..])?;
+    Ok(Some(packet))
 }
 
 fn parse_message_payload_len(len_bytes: [u8; 4]) -> io::Result<usize> {
@@ -230,28 +275,27 @@ fn handle_client(
     );
     let mut buffer = BytesMut::with_capacity(1024);
 
-    let mut startup_buf = [0; 1024];
-    let mut startup_len = stream.read(&mut startup_buf)?;
-    if startup_len == 0 {
-        return Ok(());
-    }
+    let mut startup_packet = match read_startup_packet(&mut stream)? {
+        Some(packet) => packet,
+        None => return Ok(()),
+    };
 
-    let request_code = parse_startup_code(&startup_buf, startup_len)?;
+    let request_code = parse_startup_code(&startup_packet)?;
     if request_code == SSL_REQUEST_CODE {
         crate::titan_debug_log!("[handle_client] SSLRequest received, denying.");
         stream.write_all(b"N")?;
-        startup_len = stream.read(&mut startup_buf)?;
-        if startup_len == 0 {
-            return Ok(());
-        }
-        let request_code = parse_startup_code(&startup_buf, startup_len)?;
+        startup_packet = match read_startup_packet(&mut stream)? {
+            Some(packet) => packet,
+            None => return Ok(()),
+        };
+        let request_code = parse_startup_code(&startup_packet)?;
         if request_code == SSL_REQUEST_CODE {
             send_error_response(&mut stream, "Repeated SSLRequest", "08P01")?;
             return Ok(());
         }
     }
 
-    let protocol_version = parse_startup_code(&startup_buf, startup_len)?;
+    let protocol_version = parse_startup_code(&startup_packet)?;
     crate::titan_debug_log!("[handle_client] Protocol version: {}", protocol_version);
     if protocol_version != PG_PROTOCOL_V3 {
         send_error_response(&mut stream, "Unsupported protocol version", "08P01")?;
@@ -702,15 +746,24 @@ mod tests {
     #[test]
     fn parses_startup_code() {
         let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&(8_i32).to_be_bytes());
         buf[4..8].copy_from_slice(&PG_PROTOCOL_V3.to_be_bytes());
-        let code = parse_startup_code(&buf, 8).unwrap();
+        let code = parse_startup_code(&buf).unwrap();
         assert_eq!(code, PG_PROTOCOL_V3);
     }
 
     #[test]
     fn rejects_short_startup_packet() {
         let buf = [0u8; 4];
-        assert!(parse_startup_code(&buf, 4).is_err());
+        assert!(parse_startup_code(&buf).is_err());
+    }
+
+    #[test]
+    fn rejects_startup_packet_length_mismatch() {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&(12_i32).to_be_bytes());
+        buf[4..8].copy_from_slice(&PG_PROTOCOL_V3.to_be_bytes());
+        assert!(parse_startup_code(&buf).is_err());
     }
 
     #[test]
