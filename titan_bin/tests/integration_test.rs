@@ -194,3 +194,20 @@ fn test_order_by_supports_qualified_column_reference() {
     );
     assert_eq!(rows, vec![vec!["1", "a"], vec!["2", "b"], vec!["3", "c"]]);
 }
+
+#[test]
+#[serial]
+fn test_order_by_supports_desc_direction() {
+    let mut client = common::setup_server_and_client("order_by_desc_test");
+
+    client.simple_query("CREATE TABLE desc_sort_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO desc_sort_test VALUES (3, 'c');");
+    client.simple_query("INSERT INTO desc_sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO desc_sort_test VALUES (2, 'b');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, payload FROM desc_sort_test ORDER BY id DESC;");
+    assert_eq!(rows, vec![vec!["3", "c"], vec!["2", "b"], vec!["1", "a"]]);
+}

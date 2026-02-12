@@ -1,7 +1,7 @@
 use crate::catalog::SystemCatalog;
 use crate::errors::ExecutionError;
 use crate::parser::{
-    CommonTableExpression, Expression, SelectItem, SelectStatement, TableReference,
+    CommonTableExpression, Expression, OrderByExpr, SelectItem, SelectStatement, TableReference,
 };
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::Snapshot;
@@ -29,7 +29,7 @@ pub enum LogicalPlan {
     },
     Sort {
         input: Box<LogicalPlan>,
-        order_by: Vec<Expression>,
+        order_by: Vec<OrderByExpr>,
     },
     Aggregate {
         input: Box<LogicalPlan>,

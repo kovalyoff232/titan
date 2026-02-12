@@ -2,7 +2,7 @@ use super::eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 use super::helpers::row_vec_to_map;
 use super::{Executor, Row};
 use crate::errors::ExecutionError;
-use crate::parser::{Expression, SelectItem};
+use crate::parser::{Expression, OrderByExpr, SelectItem};
 use crate::types::Column;
 use chrono::NaiveDate;
 
@@ -113,7 +113,7 @@ pub(super) struct SortExecutor<'a> {
 impl<'a> SortExecutor<'a> {
     pub(super) fn new(
         mut input: Box<dyn Executor + 'a>,
-        order_by: Vec<Expression>,
+        order_by: Vec<OrderByExpr>,
     ) -> Result<Self, ExecutionError> {
         let mut rows = Vec::new();
         while let Some(row) = input.next()? {
@@ -127,10 +127,10 @@ impl<'a> SortExecutor<'a> {
             ));
         }
 
-        let sort_keys: Vec<(usize, u32)> = sort_exprs
+        let sort_keys: Vec<(usize, u32, bool)> = sort_exprs
             .iter()
             .map(|sort_expr| {
-                let (lookup_name, base_name) = match sort_expr {
+                let (lookup_name, base_name) = match &sort_expr.expr {
                     Expression::Column(name) => (name.clone(), name.clone()),
                     Expression::QualifiedColumn(table, column) => {
                         (format!("{table}.{column}"), column.clone())
@@ -149,14 +149,19 @@ impl<'a> SortExecutor<'a> {
                             || c.name == base_name
                             || c.name.ends_with(&format!(".{}", base_name))
                     })
-                    .and_then(|i| input.schema().get(i).map(|col| (i, col.type_id)))
+                    .and_then(|i| {
+                        input
+                            .schema()
+                            .get(i)
+                            .map(|col| (i, col.type_id, sort_expr.asc))
+                    })
                     .ok_or(ExecutionError::ColumnNotFound(base_name))
             })
             .collect::<Result<_, _>>()?;
 
         if rows
             .iter()
-            .any(|row| sort_keys.iter().any(|(idx, _)| row.get(*idx).is_none()))
+            .any(|row| sort_keys.iter().any(|(idx, _, _)| row.get(*idx).is_none()))
         {
             return Err(ExecutionError::GenericError(
                 "ORDER BY column index out of bounds for one or more rows".to_string(),
@@ -164,7 +169,7 @@ impl<'a> SortExecutor<'a> {
         }
 
         rows.sort_by(|a, b| {
-            for (sort_col_idx, sort_col_type) in &sort_keys {
+            for (sort_col_idx, sort_col_type, asc) in &sort_keys {
                 let Some(val_a) = a.get(*sort_col_idx) else {
                     continue;
                 };
@@ -194,7 +199,7 @@ impl<'a> SortExecutor<'a> {
                     _ => std::cmp::Ordering::Equal,
                 };
                 if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
+                    return if *asc { cmp } else { cmp.reverse() };
                 }
             }
             std::cmp::Ordering::Equal
@@ -228,7 +233,7 @@ impl<'a> Executor for SortExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Executor, ProjectionExecutor, Row, SortExecutor};
-    use crate::parser::Expression;
+    use crate::parser::{Expression, OrderByExpr};
     use crate::types::Column;
 
     struct StaticRowsExecutor {
@@ -280,7 +285,11 @@ mod tests {
 
         let mut sort_exec = SortExecutor::new(
             Box::new(input),
-            vec![Expression::Column("event_date".to_string())],
+            vec![OrderByExpr {
+                expr: Expression::Column("event_date".to_string()),
+                asc: true,
+                nulls_first: None,
+            }],
         )
         .expect("sort executor creation should succeed");
 
@@ -351,8 +360,16 @@ mod tests {
         let mut sort_exec = SortExecutor::new(
             Box::new(input),
             vec![
-                Expression::Column("group_id".to_string()),
-                Expression::Column("name".to_string()),
+                OrderByExpr {
+                    expr: Expression::Column("group_id".to_string()),
+                    asc: true,
+                    nulls_first: None,
+                },
+                OrderByExpr {
+                    expr: Expression::Column("name".to_string()),
+                    asc: true,
+                    nulls_first: None,
+                },
             ],
         )
         .expect("sort executor creation should succeed");
@@ -369,6 +386,45 @@ mod tests {
                 vec!["1".to_string(), "z".to_string()],
                 vec!["2".to_string(), "a".to_string()],
                 vec!["2".to_string(), "b".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_supports_desc_order_by_column() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "id".to_string(),
+                type_id: 23,
+            }],
+            vec![
+                vec!["3".to_string()],
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Column("id".to_string()),
+                asc: false,
+                nulls_first: None,
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["3".to_string()],
+                vec!["2".to_string()],
+                vec!["1".to_string()],
             ]
         );
     }
@@ -395,10 +451,11 @@ mod tests {
 
         let mut sort_exec = SortExecutor::new(
             Box::new(input),
-            vec![Expression::QualifiedColumn(
-                "users".to_string(),
-                "id".to_string(),
-            )],
+            vec![OrderByExpr {
+                expr: Expression::QualifiedColumn("users".to_string(), "id".to_string()),
+                asc: true,
+                nulls_first: None,
+            }],
         )
         .expect("sort executor creation should succeed");
 

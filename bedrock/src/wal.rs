@@ -808,11 +808,7 @@ mod tests {
             lsn
         };
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&wal_path)
-            .unwrap();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
         let dangling_header = WalRecordHeader {
             total_len: WAL_HEADER_LEN as u32 + 64,
             tx_id: 1234,

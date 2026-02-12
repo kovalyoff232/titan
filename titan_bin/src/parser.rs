@@ -26,7 +26,7 @@ pub struct SelectStatement {
     pub where_clause: Option<Expression>,
     pub group_by: Option<Vec<Expression>>,
     pub having: Option<Expression>,
-    pub order_by: Option<Vec<Expression>>,
+    pub order_by: Option<Vec<OrderByExpr>>,
     pub for_update: bool,
 }
 
@@ -301,7 +301,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "EXPLAIN" | "NOT" | "OR" => Err(Simple::custom(
+                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" => Err(Simple::custom(
                     span,
                     format!("keyword `{}` cannot be used as an identifier", ident),
                 )),
@@ -477,14 +477,29 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .ignore_then(expr.clone())
                 .or_not(),
         )
-        .then(
+        .then({
+            let order_by_expr = expr
+                .clone()
+                .then(
+                    text::keyword("ASC")
+                        .padded()
+                        .to(true)
+                        .or(text::keyword("DESC").padded().to(false))
+                        .or_not(),
+                )
+                .map(|(expr, asc)| OrderByExpr {
+                    expr,
+                    asc: asc.unwrap_or(true),
+                    nulls_first: None,
+                });
+
             text::keyword("ORDER")
                 .padded()
                 .ignore_then(text::keyword("BY"))
                 .padded()
-                .ignore_then(expr.clone().separated_by(just(',').padded()).collect())
-                .or_not(),
-        )
+                .ignore_then(order_by_expr.separated_by(just(',').padded()).collect())
+                .or_not()
+        })
         .then(
             text::keyword("FOR")
                 .padded()
@@ -670,7 +685,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Statement, sql_parser};
+    use super::{Expression, Statement, sql_parser};
 
     #[test]
     fn dump_page_parses_valid_u32() {
@@ -682,5 +697,20 @@ mod tests {
     fn dump_page_rejects_out_of_range_value() {
         let parsed = sql_parser("DUMP PAGE 4294967296;");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn select_order_by_parses_direction_modifiers() {
+        let parsed =
+            sql_parser("SELECT id, name FROM users ORDER BY id DESC, name ASC;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let order_by = stmt.order_by.as_ref().expect("ORDER BY must be present");
+        assert_eq!(order_by.len(), 2);
+        assert_eq!(order_by[0].expr, Expression::Column("id".to_string()));
+        assert!(!order_by[0].asc);
+        assert_eq!(order_by[1].expr, Expression::Column("name".to_string()));
+        assert!(order_by[1].asc);
     }
 }

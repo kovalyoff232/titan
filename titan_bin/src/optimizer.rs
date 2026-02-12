@@ -1,6 +1,6 @@
 use crate::catalog::SystemCatalog;
 use crate::errors::ExecutionError;
-use crate::parser::{Expression, LiteralValue, SelectItem};
+use crate::parser::{Expression, LiteralValue, OrderByExpr, SelectItem};
 use crate::planner::LogicalPlan;
 use bedrock::buffer_pool::BufferPoolManager;
 use bedrock::transaction::{Snapshot, TransactionManager};
@@ -71,7 +71,7 @@ pub enum PhysicalPlan {
     },
     Sort {
         input: Box<PhysicalPlan>,
-        order_by: Vec<Expression>,
+        order_by: Vec<OrderByExpr>,
     },
     HashAggregate {
         input: Box<PhysicalPlan>,
@@ -358,7 +358,7 @@ mod tests {
         PhysicalPlan, create_physical_plan, create_simple_physical_plan, sorted_table_names,
     };
     use crate::catalog::SystemCatalog;
-    use crate::parser::{BinaryOperator, Expression, LiteralValue, SelectItem};
+    use crate::parser::{BinaryOperator, Expression, LiteralValue, OrderByExpr, SelectItem};
     use crate::planner::LogicalPlan;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -419,7 +419,11 @@ mod tests {
                     alias: None,
                     filter: None,
                 }),
-                order_by: vec![Expression::Column("id".to_string())],
+                order_by: vec![OrderByExpr {
+                    expr: Expression::Column("id".to_string()),
+                    asc: true,
+                    nulls_first: None,
+                }],
             }),
             expressions: vec![SelectItem::Wildcard],
         };
@@ -453,7 +457,11 @@ mod tests {
                         right: Box::new(Expression::Literal(LiteralValue::Number("7".to_string()))),
                     }),
                 }),
-                order_by: vec![Expression::Column("id".to_string())],
+                order_by: vec![OrderByExpr {
+                    expr: Expression::Column("id".to_string()),
+                    asc: true,
+                    nulls_first: None,
+                }],
             }),
             expressions: vec![SelectItem::Wildcard],
         };
