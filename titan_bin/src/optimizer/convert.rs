@@ -5,8 +5,14 @@ use crate::planner::LogicalPlan;
 pub(super) fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
     match plan {
         LogicalPlan::Scan {
-            table_name, filter, ..
-        } => PhysicalPlan::TableScan { table_name, filter },
+            table_name,
+            alias,
+            filter,
+        } => PhysicalPlan::TableScan {
+            table_name,
+            alias,
+            filter,
+        },
         LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
             input: Box::new(create_simple_physical_plan(*input)),
             predicate,

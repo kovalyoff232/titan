@@ -67,9 +67,15 @@ pub(crate) fn evaluate_expr_for_row_to_val(
         }
         Expression::QualifiedColumn(table, col) => {
             let qname = format!("{}.{}", table, col);
-            row.get(&qname)
-                .cloned()
-                .ok_or(ExecutionError::ColumnNotFound(qname))
+            if let Some(value) = row.get(&qname) {
+                return Ok(value.clone());
+            }
+            if !row.keys().any(|key| key.contains('.')) {
+                if let Some(value) = row.get(col) {
+                    return Ok(value.clone());
+                }
+            }
+            Err(ExecutionError::ColumnNotFound(qname))
         }
         Expression::Binary { left, op, right } => {
             let lval = evaluate_expr_for_row_to_val(left, row)?;

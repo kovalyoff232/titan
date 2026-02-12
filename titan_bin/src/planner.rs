@@ -191,9 +191,9 @@ fn build_plan_from_table_ref(
     _system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
     match table_ref {
-        TableReference::Table { name } => Ok(LogicalPlan::Scan {
+        TableReference::Table { name, alias } => Ok(LogicalPlan::Scan {
             table_name: name.clone(),
-            alias: None,
+            alias: alias.clone(),
             filter: None,
         }),
         TableReference::Join {

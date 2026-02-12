@@ -37,6 +37,7 @@ pub struct TableStats {
 pub enum PhysicalPlan {
     TableScan {
         table_name: String,
+        alias: Option<String>,
         filter: Option<Expression>,
     },
     IndexScan {
@@ -159,8 +160,12 @@ fn compare_plan_info_stable(a: &PlanInfo, b: &PlanInfo) -> Ordering {
 
 pub(crate) fn physical_plan_stability_key(plan: &PhysicalPlan) -> String {
     match plan {
-        PhysicalPlan::TableScan { table_name, filter } => {
-            format!("scan:{table_name}:{filter:?}")
+        PhysicalPlan::TableScan {
+            table_name,
+            alias,
+            filter,
+        } => {
+            format!("scan:{table_name}:{alias:?}:{filter:?}")
         }
         PhysicalPlan::IndexScan {
             table_name,

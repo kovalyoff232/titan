@@ -213,12 +213,25 @@ fn lock_system_catalog<'a>(
         .map_err(|_| ExecutionError::GenericError("system catalog lock poisoned".to_string()))
 }
 
+fn table_scan_qualifier(plan: &PhysicalPlan) -> Option<String> {
+    match plan {
+        PhysicalPlan::TableScan {
+            table_name, alias, ..
+        } => alias.clone().or_else(|| Some(table_name.clone())),
+        _ => None,
+    }
+}
+
 fn create_executor<'a>(
     ctx: &ExecutorBuildCtx<'a>,
     plan: &'a PhysicalPlan,
 ) -> Result<Box<dyn Executor + 'a>, ExecutionError> {
     match plan {
-        PhysicalPlan::TableScan { table_name, filter } => {
+        PhysicalPlan::TableScan {
+            table_name,
+            alias,
+            filter,
+        } => {
             let (table_oid, first_page_id) = lock_system_catalog(ctx.system_catalog)?
                 .find_table(table_name, ctx.bpm, ctx.tx_id, ctx.snapshot)?
                 .ok_or_else(|| ExecutionError::TableNotFound(table_name.clone()))?;
@@ -238,6 +251,7 @@ fn create_executor<'a>(
                     snapshot: ctx.snapshot,
                     for_update: ctx.select_stmt.for_update,
                     filter: None,
+                    table_qualifier: alias.clone().or_else(|| Some(table_name.clone())),
                 },
             ));
 
@@ -292,16 +306,8 @@ fn create_executor<'a>(
         } => {
             let left_executor = create_executor(ctx, left)?;
             let right_executor = create_executor(ctx, right)?;
-            let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                Some(table_name.clone())
-            } else {
-                None
-            };
-            let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                Some(table_name.clone())
-            } else {
-                None
-            };
+            let left_table_name = table_scan_qualifier(left);
+            let right_table_name = table_scan_qualifier(right);
             Ok(Box::new(NestedLoopJoinExecutor::new(
                 left_executor,
                 right_executor,
@@ -318,16 +324,8 @@ fn create_executor<'a>(
         } => {
             let left_executor = create_executor(ctx, left)?;
             let right_executor = create_executor(ctx, right)?;
-            let left_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**left {
-                Some(table_name.clone())
-            } else {
-                None
-            };
-            let right_table_name = if let PhysicalPlan::TableScan { table_name, .. } = &**right {
-                Some(table_name.clone())
-            } else {
-                None
-            };
+            let left_table_name = table_scan_qualifier(left);
+            let right_table_name = table_scan_qualifier(right);
             Ok(Box::new(HashJoinExecutor::new(
                 left_executor,
                 right_executor,

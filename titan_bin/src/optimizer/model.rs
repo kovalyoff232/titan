@@ -220,8 +220,13 @@ fn find_first_table(plan: &PhysicalPlan) -> Option<String> {
 
 fn collect_plan_tables(plan: &PhysicalPlan, out: &mut HashSet<String>) {
     match plan {
-        PhysicalPlan::TableScan { table_name, .. } => {
+        PhysicalPlan::TableScan {
+            table_name, alias, ..
+        } => {
             out.insert(table_name.clone());
+            if let Some(alias_name) = alias {
+                out.insert(alias_name.clone());
+            }
         }
         PhysicalPlan::IndexScan { table_name, .. } => {
             out.insert(table_name.clone());

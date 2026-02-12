@@ -44,6 +44,7 @@ pub enum SelectItem {
 pub enum TableReference {
     Table {
         name: String,
+        alias: Option<String>,
     },
     Join {
         left: Box<TableReference>,
@@ -465,7 +466,15 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         }));
 
     let table_reference = recursive(|table_ref| {
-        let table = ident.map(|name| TableReference::Table { name });
+        let table_alias = text::keyword("AS")
+            .padded()
+            .ignore_then(ident)
+            .or(ident)
+            .or_not();
+
+        let table = ident
+            .then(table_alias)
+            .map(|(name, alias)| TableReference::Table { name, alias });
 
         table
             .then(
@@ -763,7 +772,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Expression, Statement, sql_parser};
+    use super::{Expression, Statement, TableReference, sql_parser};
 
     #[test]
     fn dump_page_parses_valid_u32() {
@@ -857,5 +866,29 @@ mod tests {
         };
         assert!(stmt.group_by.is_some());
         assert!(stmt.having.is_some());
+    }
+
+    #[test]
+    fn select_from_table_aliases_are_parsed() {
+        let parsed =
+            sql_parser("SELECT u.id, o.item FROM users u JOIN orders AS o ON u.id = o.user_id;")
+                .expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert_eq!(stmt.from.len(), 1);
+        let TableReference::Join { left, right, .. } = &stmt.from[0] else {
+            panic!("expected JOIN table reference");
+        };
+        let TableReference::Table { name, alias } = left.as_ref() else {
+            panic!("expected left table");
+        };
+        assert_eq!(name, "users");
+        assert_eq!(alias.as_deref(), Some("u"));
+        let TableReference::Table { name, alias } = right.as_ref() else {
+            panic!("expected right table");
+        };
+        assert_eq!(name, "orders");
+        assert_eq!(alias.as_deref(), Some("o"));
     }
 }

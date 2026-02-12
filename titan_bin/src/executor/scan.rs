@@ -40,6 +40,7 @@ pub(super) struct TableScanExecutor<'a> {
     snapshot: &'a Snapshot,
     for_update: bool,
     filter: Option<Expression>,
+    table_qualifier: Option<String>,
     current_page_id: PageId,
     current_item_id: u16,
 }
@@ -51,6 +52,7 @@ pub(super) struct TableScanConfig<'a> {
     pub(super) snapshot: &'a Snapshot,
     pub(super) for_update: bool,
     pub(super) filter: Option<Expression>,
+    pub(super) table_qualifier: Option<String>,
 }
 
 impl<'a> TableScanExecutor<'a> {
@@ -67,6 +69,7 @@ impl<'a> TableScanExecutor<'a> {
             snapshot: config.snapshot,
             for_update: config.for_update,
             filter: config.filter,
+            table_qualifier: config.table_qualifier,
             current_page_id: config.first_page_id,
             current_item_id: 0,
         }
@@ -107,7 +110,13 @@ impl<'a> Executor for TableScanExecutor<'a> {
                 if let Some(tuple_data) = page.get_tuple(item_id) {
                     let parsed_row = parse_tuple(tuple_data, &self.schema);
                     if let Some(predicate) = &self.filter {
-                        if !evaluate_expr_for_row(predicate, &parsed_row)? {
+                        let mut filter_row = parsed_row.clone();
+                        if let Some(qualifier) = &self.table_qualifier {
+                            for (key, value) in &parsed_row {
+                                filter_row.insert(format!("{qualifier}.{key}"), value.clone());
+                            }
+                        }
+                        if !evaluate_expr_for_row(predicate, &filter_row)? {
                             continue;
                         }
                     }

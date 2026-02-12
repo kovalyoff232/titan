@@ -78,6 +78,53 @@ fn test_join_tables() {
 
 #[test]
 #[serial]
+fn test_single_table_alias_supports_qualified_projection_and_filter() {
+    let mut client = common::setup_server_and_client("single_table_alias_test");
+
+    client.simple_query("CREATE TABLE alias_users_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO alias_users_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO alias_users_test VALUES (2, 'Bob');");
+    client.simple_query("INSERT INTO alias_users_test VALUES (3, 'Bob');");
+    client.simple_query("COMMIT;");
+
+    let rows = client
+        .simple_query("SELECT u.id FROM alias_users_test AS u WHERE u.name = 'Bob' ORDER BY u.id;");
+    assert_eq!(rows, vec![vec!["2"], vec!["3"]]);
+}
+
+#[test]
+#[serial]
+fn test_join_with_table_aliases() {
+    let mut client = common::setup_server_and_client("join_alias_test");
+
+    client.simple_query("CREATE TABLE alias_join_users (uid INT, uname TEXT);");
+    client.simple_query("CREATE TABLE alias_join_orders (oid INT, uid INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO alias_join_users VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO alias_join_users VALUES (2, 'Bob');");
+    client.simple_query("INSERT INTO alias_join_orders VALUES (101, 1);");
+    client.simple_query("INSERT INTO alias_join_orders VALUES (102, 2);");
+    client.simple_query("INSERT INTO alias_join_orders VALUES (103, 1);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT u.uname, o.oid FROM alias_join_users u JOIN alias_join_orders o ON u.uid = o.uid ORDER BY o.oid;",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["Alice", "101"],
+            vec!["Bob", "102"],
+            vec!["Alice", "103"],
+        ]
+    );
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

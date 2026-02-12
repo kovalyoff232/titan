@@ -117,6 +117,7 @@ fn build_single_relation_cache(
 
         let seq_scan_plan = PhysicalPlan::TableScan {
             table_name: table_name.to_string(),
+            alias: None,
             filter: None,
         };
         let seq_scan_cost = cost_seq_scan(table_stats, base_cardinality);
@@ -443,6 +444,7 @@ mod tests {
             PlanInfo {
                 plan: Arc::new(PhysicalPlan::TableScan {
                     table_name: "z_table".to_string(),
+                    alias: None,
                     filter: None,
                 }),
                 cost: 1.0,
@@ -451,6 +453,7 @@ mod tests {
             PlanInfo {
                 plan: Arc::new(PhysicalPlan::TableScan {
                     table_name: "a_table".to_string(),
+                    alias: None,
                     filter: None,
                 }),
                 cost: 1.0,
