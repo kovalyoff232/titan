@@ -117,6 +117,17 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         )),
                     }
                 }
+                (LiteralValue::String(l), LiteralValue::String(r)) => match op {
+                    BinaryOperator::Eq => Ok(LiteralValue::Bool(l == r)),
+                    BinaryOperator::NotEq => Ok(LiteralValue::Bool(l != r)),
+                    BinaryOperator::Lt => Ok(LiteralValue::Bool(l < r)),
+                    BinaryOperator::LtEq => Ok(LiteralValue::Bool(l <= r)),
+                    BinaryOperator::Gt => Ok(LiteralValue::Bool(l > r)),
+                    BinaryOperator::GtEq => Ok(LiteralValue::Bool(l >= r)),
+                    _ => Err(ExecutionError::GenericError(
+                        "Unsupported operator for text".to_string(),
+                    )),
+                },
                 _ => Err(ExecutionError::GenericError(
                     "Type mismatch in binary expression".to_string(),
                 )),
@@ -227,5 +238,18 @@ mod tests {
             Err(ExecutionError::GenericError(msg))
             if msg.contains("Invalid date value")
         ));
+    }
+
+    #[test]
+    fn string_equality_comparison_evaluates_to_boolean() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::String("Bob".to_string()))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(LiteralValue::String("Bob".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
     }
 }

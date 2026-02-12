@@ -308,3 +308,21 @@ fn test_group_by_lowercase_sum_avg_with_having_alias() {
     );
     assert_eq!(rows, vec![vec!["2", "120", "40"]]);
 }
+
+#[test]
+#[serial]
+fn test_where_text_equality_filter() {
+    let mut client = common::setup_server_and_client("where_text_filter_test");
+
+    client.simple_query("CREATE TABLE text_filter_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO text_filter_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO text_filter_test VALUES (2, 'Bob');");
+    client.simple_query("INSERT INTO text_filter_test VALUES (3, 'Charlie');");
+    client.simple_query("COMMIT;");
+
+    let rows =
+        client.simple_query("SELECT id FROM text_filter_test WHERE name = 'Bob' ORDER BY id;");
+    assert_eq!(rows, vec![vec!["2"]]);
+}
