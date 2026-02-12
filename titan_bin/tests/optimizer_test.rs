@@ -172,3 +172,52 @@ fn test_optimizer_handles_large_join_graph_with_fallback() {
     assert_eq!(result[0][0], "1");
     assert_eq!(result[0][1], "81");
 }
+
+#[test]
+#[serial]
+fn test_explain_select_plan_is_stable_across_invocations() {
+    let mut client = common::setup_server_and_client("optimizer_explain_stability_test");
+
+    client.simple_query("CREATE TABLE ex_users (id INT, name TEXT);");
+    client.simple_query("CREATE TABLE ex_orders (id INT, user_id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO ex_users VALUES (1, 'alice');");
+    client.simple_query("INSERT INTO ex_users VALUES (2, 'bob');");
+    client.simple_query("INSERT INTO ex_orders VALUES (100, 1);");
+    client.simple_query("INSERT INTO ex_orders VALUES (101, 2);");
+    client.simple_query("COMMIT;");
+
+    let query = "EXPLAIN SELECT ex_users.name \
+                 FROM ex_users \
+                 JOIN ex_orders ON ex_users.id = ex_orders.user_id \
+                 WHERE ex_orders.id >= 100 \
+                 ORDER BY ex_users.id;";
+
+    let expected = client.simple_query(query);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(expected[0].len(), 2);
+    assert!(!expected[0][0].is_empty(), "plan_key must be present");
+    assert!(!expected[0][1].is_empty(), "plan text must be present");
+
+    for _ in 0..30 {
+        let current = client.simple_query(query);
+        assert_eq!(current, expected);
+    }
+}
+
+#[test]
+#[serial]
+fn test_explain_rejects_non_select_statement() {
+    let mut client = common::setup_server_and_client("optimizer_explain_non_select_test");
+
+    client.simple_query("CREATE TABLE ex_non_select (id INT);");
+    client.simple_query("COMMIT;");
+
+    let err = client
+        .client
+        .simple_query("EXPLAIN INSERT INTO ex_non_select VALUES (1);")
+        .expect_err("EXPLAIN INSERT should be rejected");
+    let db_err = err.as_db_error().expect("expected database error");
+    assert_eq!(db_err.code().code(), "XX000");
+}

@@ -157,7 +157,7 @@ fn compare_plan_info_stable(a: &PlanInfo, b: &PlanInfo) -> Ordering {
     physical_plan_stability_key(&a.plan).cmp(&physical_plan_stability_key(&b.plan))
 }
 
-fn physical_plan_stability_key(plan: &PhysicalPlan) -> String {
+pub(crate) fn physical_plan_stability_key(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::TableScan { table_name, filter } => {
             format!("scan:{table_name}:{filter:?}")

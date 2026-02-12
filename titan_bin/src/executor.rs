@@ -158,6 +158,37 @@ pub fn execute(stmt: &Statement, ctx: &ExecuteCtx<'_>) -> Result<ExecuteResult, 
             };
             execute_analyze(table_name, &ctx).map(|_| ExecuteResult::Ddl)
         }
+        Statement::Explain(explain_stmt) => match explain_stmt.as_ref() {
+            Statement::Select(select_stmt) => {
+                let logical_plan = planner::create_logical_plan(
+                    select_stmt,
+                    bpm,
+                    tx_id,
+                    snapshot,
+                    system_catalog,
+                )?;
+                let physical_plan =
+                    optimizer::optimize(logical_plan, bpm, tm, tx_id, snapshot, system_catalog)?;
+                let plan_key = optimizer::physical_plan_stability_key(&physical_plan);
+                let plan_text = format!("{physical_plan:?}");
+                Ok(ExecuteResult::ResultSet(ResultSet {
+                    columns: vec![
+                        Column {
+                            name: "plan_key".to_string(),
+                            type_id: 25,
+                        },
+                        Column {
+                            name: "plan".to_string(),
+                            type_id: 25,
+                        },
+                    ],
+                    rows: vec![vec![plan_key, plan_text]],
+                }))
+            }
+            _ => Err(ExecutionError::GenericError(
+                "EXPLAIN supports only SELECT statements".to_string(),
+            )),
+        },
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(ExecuteResult::Ddl),
         _ => Err(ExecutionError::GenericError(
             "Unsupported statement type".to_string(),
