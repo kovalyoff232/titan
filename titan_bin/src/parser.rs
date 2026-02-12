@@ -27,6 +27,8 @@ pub struct SelectStatement {
     pub group_by: Option<Vec<Expression>>,
     pub having: Option<Expression>,
     pub order_by: Option<Vec<OrderByExpr>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
     pub for_update: bool,
 }
 
@@ -301,10 +303,12 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" => Err(Simple::custom(
-                    span,
-                    format!("keyword `{}` cannot be used as an identifier", ident),
-                )),
+                | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT" | "OFFSET" => {
+                    Err(Simple::custom(
+                        span,
+                        format!("keyword `{}` cannot be used as an identifier", ident),
+                    ))
+                }
                 _ => Ok(ident),
             });
 
@@ -501,6 +505,26 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .or_not()
         })
         .then(
+            text::keyword("LIMIT")
+                .padded()
+                .ignore_then(text::int(10).padded().try_map(|value: String, span| {
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| Simple::custom(span, format!("invalid LIMIT value: {value}")))
+                }))
+                .or_not(),
+        )
+        .then(
+            text::keyword("OFFSET")
+                .padded()
+                .ignore_then(text::int(10).padded().try_map(|value: String, span| {
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| Simple::custom(span, format!("invalid OFFSET value: {value}")))
+                }))
+                .or_not(),
+        )
+        .then(
             text::keyword("FOR")
                 .padded()
                 .ignore_then(text::keyword("UPDATE"))
@@ -508,7 +532,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .or_not(),
         )
         .map(
-            |((((select_list, from), where_clause), order_by), for_update)| {
+            |((((((select_list, from), where_clause), order_by), limit), offset), for_update)| {
                 Statement::Select(Box::new(SelectStatement {
                     with_clause: None,
                     select_list,
@@ -517,6 +541,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                     group_by: None,
                     having: None,
                     order_by,
+                    limit,
+                    offset,
                     for_update: for_update.is_some(),
                 }))
             },
@@ -712,5 +738,16 @@ mod tests {
         assert!(!order_by[0].asc);
         assert_eq!(order_by[1].expr, Expression::Column("name".to_string()));
         assert!(order_by[1].asc);
+    }
+
+    #[test]
+    fn select_limit_and_offset_are_parsed() {
+        let parsed =
+            sql_parser("SELECT id FROM users ORDER BY id LIMIT 2 OFFSET 1;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert_eq!(stmt.limit, Some(2));
+        assert_eq!(stmt.offset, Some(1));
     }
 }

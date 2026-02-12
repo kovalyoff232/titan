@@ -157,6 +157,14 @@ pub fn create_logical_plan(
         };
     }
 
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: stmt.limit,
+            offset: stmt.offset,
+        };
+    }
+
     plan = LogicalPlan::Projection {
         input: Box::new(plan),
         expressions: stmt.select_list.clone(),

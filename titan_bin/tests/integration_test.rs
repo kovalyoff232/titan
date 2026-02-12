@@ -228,3 +228,22 @@ fn test_order_by_supports_position_reference() {
     let rows = client.simple_query("SELECT id, payload FROM position_sort_test ORDER BY 1 DESC;");
     assert_eq!(rows, vec![vec!["3", "c"], vec!["2", "b"], vec!["1", "a"]]);
 }
+
+#[test]
+#[serial]
+fn test_select_order_by_limit_offset() {
+    let mut client = common::setup_server_and_client("limit_offset_test");
+
+    client.simple_query("CREATE TABLE limit_test (id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO limit_test VALUES (3);");
+    client.simple_query("INSERT INTO limit_test VALUES (1);");
+    client.simple_query("INSERT INTO limit_test VALUES (5);");
+    client.simple_query("INSERT INTO limit_test VALUES (2);");
+    client.simple_query("INSERT INTO limit_test VALUES (4);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id FROM limit_test ORDER BY id LIMIT 2 OFFSET 1;");
+    assert_eq!(rows, vec![vec!["2"], vec!["3"]]);
+}
