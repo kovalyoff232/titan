@@ -252,11 +252,28 @@ fn send_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resul
 }
 
 fn send_data_row(stream: &mut TcpStream, columns: &[Column], row: &[String]) -> io::Result<()> {
+    if row.len() != columns.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "row width does not match row description",
+        ));
+    }
+
     let mut data = BytesMut::new();
     data.put_i16(row.len() as i16);
     for (i, val) in row.iter().enumerate() {
-        let final_val = if columns[i].type_id == 16 {
-            if val.to_lowercase() == "t" { "t" } else { "f" }
+        let col = columns.get(i).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing column metadata for row",
+            )
+        })?;
+        let final_val = if col.type_id == 16 {
+            if val.eq_ignore_ascii_case("t") {
+                "t"
+            } else {
+                "f"
+            }
         } else {
             val.as_str()
         };
@@ -317,18 +334,33 @@ fn handle_client(
 
     loop {
         let mut msg_type = [0u8; 1];
-        if stream.read_exact(&mut msg_type).is_err() {
-            crate::titan_debug_log!("[handle_client] Connection closed by peer.");
-            if in_transaction {
-                if let Err(e) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
-                    crate::titan_debug_log!(
-                        "[handle_client] Failed to abort tx_id {}: {}",
-                        tx_id,
-                        e
-                    );
+        match stream.read_exact(&mut msg_type) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                crate::titan_debug_log!("[handle_client] Connection closed by peer.");
+                if in_transaction {
+                    if let Err(abort_err) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                        crate::titan_debug_log!(
+                            "[handle_client] Failed to abort tx_id {}: {}",
+                            tx_id,
+                            abort_err
+                        );
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
+            Err(e) => {
+                if in_transaction {
+                    if let Err(abort_err) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                        crate::titan_debug_log!(
+                            "[handle_client] Failed to abort tx_id {} after read error: {}",
+                            tx_id,
+                            abort_err
+                        );
+                    }
+                }
+                return Err(e);
+            }
         }
 
         let mut len_bytes = [0u8; 4];
@@ -562,6 +594,17 @@ fn handle_client(
                     "[handle_client] Received unknown message type: {}",
                     msg_type[0]
                 );
+                send_error_response(&mut stream, "Unsupported frontend message type", "08P01")?;
+                if in_transaction {
+                    if let Err(abort_err) = abort_transaction(&tm, &wal, &bpm, &lm, tx_id) {
+                        crate::titan_debug_log!(
+                            "[handle_client] Failed to abort tx_id {} on protocol error: {}",
+                            tx_id,
+                            abort_err
+                        );
+                    }
+                }
+                return Ok(());
             }
         }
     }
@@ -744,9 +787,13 @@ fn initialize_db(
 #[cfg(test)]
 mod tests {
     use super::{
-        PG_PROTOCOL_V3, SSL_REQUEST_CODE, parse_message_payload_len, parse_simple_query_payload,
-        parse_startup_code,
+        MAX_MESSAGE_BYTES, PG_PROTOCOL_V3, SSL_REQUEST_CODE, parse_message_payload_len,
+        parse_simple_query_payload, parse_startup_code, send_data_row,
     };
+    use crate::types::Column;
+    use std::io;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn parses_startup_code() {
@@ -783,6 +830,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_message_payload_length() {
+        let oversized = (MAX_MESSAGE_BYTES as i32) + 5;
+        assert!(parse_message_payload_len(oversized.to_be_bytes()).is_err());
+    }
+
+    #[test]
     fn parses_query_payload_with_trailing_nul() {
         let q = parse_simple_query_payload(b"SELECT 1;\0").unwrap();
         assert_eq!(q, "SELECT 1;");
@@ -803,6 +856,23 @@ mod tests {
     fn rejects_invalid_utf8_query_payload() {
         let invalid = [0xFF_u8, 0xFE_u8, 0xFD_u8, 0x00_u8];
         assert!(parse_simple_query_payload(&invalid).is_err());
+    }
+
+    #[test]
+    fn send_data_row_rejects_row_width_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connector = thread::spawn(move || TcpStream::connect(addr).unwrap());
+        let (mut stream, _) = listener.accept().unwrap();
+        let _peer = connector.join().unwrap();
+
+        let cols = vec![Column {
+            name: "id".to_string(),
+            type_id: 23,
+        }];
+        let row = vec!["1".to_string(), "extra".to_string()];
+        let err = send_data_row(&mut stream, &cols, &row).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
