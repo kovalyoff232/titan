@@ -304,7 +304,7 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
                 | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "ASC" | "DESC" | "LIMIT"
-                | "OFFSET" | "NULL" => Err(Simple::custom(
+                | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => Err(Simple::custom(
                     span,
                     format!("keyword `{}` cannot be used as an identifier", ident),
                 )),
@@ -525,10 +525,21 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                         .or(text::keyword("DESC").padded().to(false))
                         .or_not(),
                 )
-                .map(|(expr, asc)| OrderByExpr {
+                .then(
+                    text::keyword("NULLS")
+                        .padded()
+                        .ignore_then(
+                            text::keyword("FIRST")
+                                .padded()
+                                .to(true)
+                                .or(text::keyword("LAST").padded().to(false)),
+                        )
+                        .or_not(),
+                )
+                .map(|((expr, asc), nulls_first)| OrderByExpr {
                     expr,
                     asc: asc.unwrap_or(true),
-                    nulls_first: None,
+                    nulls_first,
                 });
 
             text::keyword("ORDER")
@@ -778,6 +789,24 @@ mod tests {
         assert!(!order_by[0].asc);
         assert_eq!(order_by[1].expr, Expression::Column("name".to_string()));
         assert!(order_by[1].asc);
+    }
+
+    #[test]
+    fn select_order_by_parses_nulls_modifiers() {
+        let parsed =
+            sql_parser("SELECT id, name FROM users ORDER BY id DESC NULLS LAST, name NULLS FIRST;")
+                .expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let order_by = stmt.order_by.as_ref().expect("ORDER BY must be present");
+        assert_eq!(order_by.len(), 2);
+        assert_eq!(order_by[0].expr, Expression::Column("id".to_string()));
+        assert!(!order_by[0].asc);
+        assert_eq!(order_by[0].nulls_first, Some(false));
+        assert_eq!(order_by[1].expr, Expression::Column("name".to_string()));
+        assert!(order_by[1].asc);
+        assert_eq!(order_by[1].nulls_first, Some(true));
     }
 
     #[test]

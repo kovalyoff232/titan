@@ -154,7 +154,7 @@ impl<'a> SortExecutor<'a> {
             ));
         }
 
-        let sort_keys: Vec<(usize, u32, bool)> = sort_exprs
+        let sort_keys: Vec<(usize, u32, bool, bool)> = sort_exprs
             .iter()
             .map(|sort_expr| match &sort_expr.expr {
                 Expression::Column(name) => input
@@ -162,10 +162,12 @@ impl<'a> SortExecutor<'a> {
                     .iter()
                     .position(|c| c.name == *name || c.name.ends_with(&format!(".{}", name)))
                     .and_then(|i| {
+                        let asc = sort_expr.asc;
+                        let nulls_first = sort_expr.nulls_first.unwrap_or(!asc);
                         input
                             .schema()
                             .get(i)
-                            .map(|col| (i, col.type_id, sort_expr.asc))
+                            .map(|col| (i, col.type_id, asc, nulls_first))
                     })
                     .ok_or_else(|| ExecutionError::ColumnNotFound(name.clone())),
                 Expression::QualifiedColumn(table, column) => {
@@ -179,10 +181,12 @@ impl<'a> SortExecutor<'a> {
                                 || c.name.ends_with(&format!(".{}", column))
                         })
                         .and_then(|i| {
+                            let asc = sort_expr.asc;
+                            let nulls_first = sort_expr.nulls_first.unwrap_or(!asc);
                             input
                                 .schema()
                                 .get(i)
-                                .map(|col| (i, col.type_id, sort_expr.asc))
+                                .map(|col| (i, col.type_id, asc, nulls_first))
                         })
                         .ok_or_else(|| ExecutionError::ColumnNotFound(column.clone()))
                 }
@@ -196,10 +200,12 @@ impl<'a> SortExecutor<'a> {
                                 "ORDER BY position must be a positive integer".to_string(),
                             )
                         })?;
+                    let asc = sort_expr.asc;
+                    let nulls_first = sort_expr.nulls_first.unwrap_or(!asc);
                     input
                         .schema()
                         .get(position)
-                        .map(|col| (position, col.type_id, sort_expr.asc))
+                        .map(|col| (position, col.type_id, asc, nulls_first))
                         .ok_or_else(|| {
                             ExecutionError::GenericError(format!(
                                 "ORDER BY position {} is out of range",
@@ -213,23 +219,38 @@ impl<'a> SortExecutor<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        if rows
-            .iter()
-            .any(|row| sort_keys.iter().any(|(idx, _, _)| row.get(*idx).is_none()))
-        {
+        if rows.iter().any(|row| {
+            sort_keys
+                .iter()
+                .any(|(idx, _, _, _)| row.get(*idx).is_none())
+        }) {
             return Err(ExecutionError::GenericError(
                 "ORDER BY column index out of bounds for one or more rows".to_string(),
             ));
         }
 
         rows.sort_by(|a, b| {
-            for (sort_col_idx, sort_col_type, asc) in &sort_keys {
+            for (sort_col_idx, sort_col_type, asc, nulls_first) in &sort_keys {
                 let Some(val_a) = a.get(*sort_col_idx) else {
                     continue;
                 };
                 let Some(val_b) = b.get(*sort_col_idx) else {
                     continue;
                 };
+                let is_null_a = val_a.is_empty() || val_a.eq_ignore_ascii_case("NULL");
+                let is_null_b = val_b.is_empty() || val_b.eq_ignore_ascii_case("NULL");
+                if is_null_a || is_null_b {
+                    if is_null_a && is_null_b {
+                        continue;
+                    }
+                    return match (is_null_a, *nulls_first) {
+                        (true, true) => std::cmp::Ordering::Less,
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        (false, false) => std::cmp::Ordering::Less,
+                    };
+                }
+
                 let cmp = match sort_col_type {
                     23 => {
                         let num_a = val_a.parse::<i32>().unwrap_or(0);
@@ -479,6 +500,84 @@ mod tests {
                 vec!["3".to_string()],
                 vec!["2".to_string()],
                 vec!["1".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_supports_nulls_last_for_ascending_order() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "payload".to_string(),
+                type_id: 25,
+            }],
+            vec![
+                vec!["b".to_string()],
+                vec!["".to_string()],
+                vec!["a".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Column("payload".to_string()),
+                asc: true,
+                nulls_first: Some(false),
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string()],
+                vec!["".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_executor_supports_explicit_nulls_last_for_descending_order() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "payload".to_string(),
+                type_id: 25,
+            }],
+            vec![
+                vec!["b".to_string()],
+                vec!["".to_string()],
+                vec!["a".to_string()],
+            ],
+        );
+
+        let mut sort_exec = SortExecutor::new(
+            Box::new(input),
+            vec![OrderByExpr {
+                expr: Expression::Column("payload".to_string()),
+                asc: false,
+                nulls_first: Some(false),
+            }],
+        )
+        .expect("sort executor creation should succeed");
+
+        let mut sorted = Vec::new();
+        while let Some(row) = sort_exec.next().expect("sorted fetch should succeed") {
+            sorted.push(row);
+        }
+
+        assert_eq!(
+            sorted,
+            vec![
+                vec!["b".to_string()],
+                vec!["a".to_string()],
+                vec!["".to_string()],
             ]
         );
     }
