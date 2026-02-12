@@ -117,6 +117,11 @@ pub enum Expression {
         expr: Box<Expression>,
         negated: bool,
     },
+    InList {
+        expr: Box<Expression>,
+        list: Vec<Expression>,
+        negated: bool,
+    },
     WindowFunction {
         function: WindowFunctionType,
         args: Vec<Expression>,
@@ -240,6 +245,21 @@ impl fmt::Display for Expression {
                     write!(f, "({} IS NULL)", expr)
                 }
             }
+            Expression::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let operator = if *negated { "NOT IN" } else { "IN" };
+                write!(f, "({} {} (", expr, operator)?;
+                for (idx, item) in list.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "))")
+            }
             Expression::WindowFunction { function, .. } => write!(
                 f,
                 "{}() OVER (...)",
@@ -323,13 +343,12 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "LIKE" | "ILIKE"
-                | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => {
-                    Err(Simple::custom(
-                        span,
-                        format!("keyword `{}` cannot be used as an identifier", ident),
-                    ))
-                }
+                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "IN" | "LIKE"
+                | "ILIKE" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST"
+                | "LAST" => Err(Simple::custom(
+                    span,
+                    format!("keyword `{}` cannot be used as an identifier", ident),
+                )),
                 _ => Ok(ident),
             });
 
@@ -470,6 +489,32 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
         let comparison = null_check
             .clone()
+            .then(
+                text::keyword("NOT")
+                    .padded()
+                    .ignore_then(text::keyword("IN"))
+                    .to(true)
+                    .or(text::keyword("IN").to(false))
+                    .then(
+                        expr.clone()
+                            .separated_by(just(',').padded())
+                            .at_least(1)
+                            .collect::<Vec<_>>()
+                            .delimited_by(just('(').padded(), just(')').padded()),
+                    )
+                    .or_not(),
+            )
+            .map(|(left_expr, in_predicate)| {
+                if let Some((negated, list)) = in_predicate {
+                    Expression::InList {
+                        expr: Box::new(left_expr),
+                        list,
+                        negated,
+                    }
+                } else {
+                    left_expr
+                }
+            })
             .then(comparison_op.padded().then(null_check).repeated())
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
@@ -950,6 +995,46 @@ mod tests {
             panic!("expected binary expression in WHERE");
         };
         assert_eq!(*op, super::BinaryOperator::NotILike);
+    }
+
+    #[test]
+    fn select_where_parses_in_list_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE id IN (1, 2, 3);").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::InList {
+            expr,
+            list,
+            negated,
+        } = where_expr
+        else {
+            panic!("expected IN list expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("id".to_string()));
+        assert_eq!(list.len(), 3);
+        assert!(!negated);
+    }
+
+    #[test]
+    fn select_where_parses_not_in_list_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE id NOT IN (1, 2, 3);").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::InList {
+            expr,
+            list,
+            negated,
+        } = where_expr
+        else {
+            panic!("expected NOT IN list expression in WHERE");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("id".to_string()));
+        assert_eq!(list.len(), 3);
+        assert!(*negated);
     }
 
     #[test]

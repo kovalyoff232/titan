@@ -182,6 +182,33 @@ fn test_where_like_filter() {
 
 #[test]
 #[serial]
+fn test_where_in_and_not_in_filters() {
+    let mut client = common::setup_server_and_client("in_filter_test");
+
+    client.simple_query("CREATE TABLE in_users_test (id INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO in_users_test VALUES (1, 'Alice');");
+    client.simple_query("INSERT INTO in_users_test VALUES (2, 'Bob');");
+    client.simple_query("INSERT INTO in_users_test VALUES (3, 'Carol');");
+    client.simple_query("INSERT INTO in_users_test VALUES (4, 'Dave');");
+    client.simple_query("COMMIT;");
+
+    let in_id_rows =
+        client.simple_query("SELECT id FROM in_users_test WHERE id IN (1, 3) ORDER BY id;");
+    assert_eq!(in_id_rows, vec![vec!["1"], vec!["3"]]);
+
+    let not_in_id_rows =
+        client.simple_query("SELECT id FROM in_users_test WHERE id NOT IN (1, 3) ORDER BY id;");
+    assert_eq!(not_in_id_rows, vec![vec!["2"], vec!["4"]]);
+
+    let in_text_rows = client
+        .simple_query("SELECT id FROM in_users_test WHERE name IN ('Bob', 'Dave') ORDER BY id;");
+    assert_eq!(in_text_rows, vec![vec!["2"], vec!["4"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

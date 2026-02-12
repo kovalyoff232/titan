@@ -209,6 +209,24 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 is_null
             }))
         }
+        Expression::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = evaluate_expr_for_row_to_val(expr, row)?;
+            let is_match = list
+                .iter()
+                .map(|item| evaluate_expr_for_row_to_val(item, row))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|item_value| item_value == &value);
+            Ok(LiteralValue::Bool(if *negated {
+                !is_match
+            } else {
+                is_match
+            }))
+        }
         Expression::WindowFunction { .. } => Err(ExecutionError::GenericError(
             "Window functions cannot be evaluated in WHERE clause".to_string(),
         )),
@@ -412,6 +430,40 @@ mod tests {
             ))),
             op: BinaryOperator::NotILike,
             right: Box::new(Expression::Literal(LiteralValue::String("bo%".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn in_list_expression_evaluates_to_boolean() {
+        let expr = Expression::InList {
+            expr: Box::new(Expression::Literal(LiteralValue::Number("2".to_string()))),
+            list: vec![
+                Expression::Literal(LiteralValue::Number("1".to_string())),
+                Expression::Literal(LiteralValue::Number("2".to_string())),
+                Expression::Literal(LiteralValue::Number("3".to_string())),
+            ],
+            negated: false,
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn not_in_list_expression_evaluates_to_boolean() {
+        let expr = Expression::InList {
+            expr: Box::new(Expression::Literal(LiteralValue::Number("2".to_string()))),
+            list: vec![
+                Expression::Literal(LiteralValue::Number("4".to_string())),
+                Expression::Literal(LiteralValue::Number("5".to_string())),
+                Expression::Literal(LiteralValue::Number("6".to_string())),
+            ],
+            negated: true,
         };
         let row = HashMap::new();
 
