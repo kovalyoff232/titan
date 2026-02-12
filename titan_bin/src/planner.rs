@@ -153,9 +153,10 @@ pub fn create_logical_plan(
     }
 
     if let Some(order_by) = &stmt.order_by {
+        let resolved_order_by = resolve_order_by_aliases(order_by, &stmt.select_list);
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
-            order_by: order_by.clone(),
+            order_by: resolved_order_by,
         };
     }
 
@@ -309,6 +310,46 @@ fn is_aggregate_function(name: &str) -> bool {
     )
 }
 
+fn is_sort_resolvable_expression(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Column(_)
+            | Expression::QualifiedColumn(_, _)
+            | Expression::Literal(crate::parser::LiteralValue::Number(_))
+    )
+}
+
+fn resolve_order_by_aliases(
+    order_by: &[OrderByExpr],
+    select_list: &[SelectItem],
+) -> Vec<OrderByExpr> {
+    order_by
+        .iter()
+        .map(|order_expr| {
+            let resolved_expr = match &order_expr.expr {
+                Expression::Column(alias_name) => select_list
+                    .iter()
+                    .find_map(|item| match item {
+                        SelectItem::ExprWithAlias { expr, alias }
+                            if alias == alias_name && is_sort_resolvable_expression(expr) =>
+                        {
+                            Some(expr.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| order_expr.expr.clone()),
+                _ => order_expr.expr.clone(),
+            };
+
+            OrderByExpr {
+                expr: resolved_expr,
+                asc: order_expr.asc,
+                nulls_first: order_expr.nulls_first,
+            }
+        })
+        .collect()
+}
+
 fn convert_window_frame(frame: &crate::parser::WindowFrame) -> WindowFramePlan {
     use crate::parser::WindowFrame;
 
@@ -334,5 +375,50 @@ fn convert_frame_bound(bound: &crate::parser::FrameBound) -> FrameBoundPlan {
         FrameBound::UnboundedFollowing => FrameBoundPlan::UnboundedFollowing,
         FrameBound::Preceding(n) => FrameBoundPlan::Preceding(*n),
         FrameBound::Following(n) => FrameBoundPlan::Following(*n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_order_by_aliases;
+    use crate::parser::{Expression, LiteralValue, OrderByExpr, SelectItem};
+
+    #[test]
+    fn resolve_order_by_alias_to_underlying_column_expression() {
+        let select_list = vec![SelectItem::ExprWithAlias {
+            expr: Expression::Column("id".to_string()),
+            alias: "item_id".to_string(),
+        }];
+        let order_by = vec![OrderByExpr {
+            expr: Expression::Column("item_id".to_string()),
+            asc: false,
+            nulls_first: None,
+        }];
+
+        let resolved = resolve_order_by_aliases(&order_by, &select_list);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr, Expression::Column("id".to_string()));
+        assert!(!resolved[0].asc);
+    }
+
+    #[test]
+    fn keeps_order_by_alias_when_underlying_expression_is_not_sort_resolvable() {
+        let select_list = vec![SelectItem::ExprWithAlias {
+            expr: Expression::Binary {
+                left: Box::new(Expression::Column("id".to_string())),
+                op: crate::parser::BinaryOperator::Plus,
+                right: Box::new(Expression::Literal(LiteralValue::Number("1".to_string()))),
+            },
+            alias: "k".to_string(),
+        }];
+        let order_by = vec![OrderByExpr {
+            expr: Expression::Column("k".to_string()),
+            asc: true,
+            nulls_first: None,
+        }];
+
+        let resolved = resolve_order_by_aliases(&order_by, &select_list);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr, Expression::Column("k".to_string()));
     }
 }

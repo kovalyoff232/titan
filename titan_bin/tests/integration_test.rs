@@ -214,6 +214,24 @@ fn test_order_by_supports_desc_direction() {
 
 #[test]
 #[serial]
+fn test_order_by_supports_select_alias_reference() {
+    let mut client = common::setup_server_and_client("order_by_select_alias_test");
+
+    client.simple_query("CREATE TABLE alias_sort_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO alias_sort_test VALUES (3, 'c');");
+    client.simple_query("INSERT INTO alias_sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO alias_sort_test VALUES (2, 'b');");
+    client.simple_query("COMMIT;");
+
+    let rows =
+        client.simple_query("SELECT id AS item_id FROM alias_sort_test ORDER BY item_id DESC;");
+    assert_eq!(rows, vec![vec!["3"], vec!["2"], vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_order_by_supports_nulls_last_for_ascending() {
     let mut client = common::setup_server_and_client("order_by_nulls_last_asc_test");
 
