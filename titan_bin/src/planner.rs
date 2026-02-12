@@ -132,11 +132,13 @@ pub fn create_logical_plan(
     }
     let mut plan = from_plan;
 
-    if let Some(group_by) = &stmt.group_by {
-        let aggregates = extract_aggregates(&stmt.select_list)?;
+    let aggregates = extract_aggregates(&stmt.select_list)?;
+    let requires_aggregate =
+        stmt.group_by.is_some() || !aggregates.is_empty() || stmt.having.is_some();
+    if requires_aggregate {
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
-            group_by: group_by.clone(),
+            group_by: stmt.group_by.clone().unwrap_or_default(),
             aggregates,
             having: stmt.having.clone(),
         };

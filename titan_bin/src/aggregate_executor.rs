@@ -115,8 +115,9 @@ impl<'a> HashAggregateExecutor<'a> {
                         "Aggregate state mismatch: missing aggregate state slot".to_string(),
                     )
                 })?;
+                let function_name = agg.function.to_uppercase();
 
-                if agg.function.to_uppercase() == "COUNT" && agg.args.is_empty() {
+                if function_name == "COUNT" && agg.args.is_empty() {
                     agg_state.count += 1;
                     continue;
                 }
@@ -124,11 +125,11 @@ impl<'a> HashAggregateExecutor<'a> {
                 if let Some(arg) = agg.args.first() {
                     let val = evaluate_expr_for_row_to_val(arg, &row_map)?;
 
-                    if matches!(val, LiteralValue::Null) && agg.function.to_uppercase() != "COUNT" {
+                    if matches!(val, LiteralValue::Null) {
                         continue;
                     }
 
-                    match agg.function.to_uppercase().as_str() {
+                    match function_name.as_str() {
                         "COUNT" => {
                             agg_state.count += 1;
                         }
@@ -420,5 +421,36 @@ mod tests {
             result,
             Err(ExecutionError::GenericError(msg)) if msg.contains("Invalid numeric literal for SUM")
         ));
+    }
+
+    #[test]
+    fn count_over_null_literal_returns_zero() {
+        let input = MockExecutor::new(
+            vec![Column {
+                name: "id".to_string(),
+                type_id: 23,
+            }],
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ],
+        );
+        let mut exec = HashAggregateExecutor::new(
+            Box::new(input),
+            vec![],
+            vec![AggregateExpr {
+                function: "COUNT".to_string(),
+                args: vec![Expression::Literal(LiteralValue::Null)],
+                alias: Some("null_cnt".to_string()),
+            }],
+            None,
+        );
+
+        let row = exec
+            .next()
+            .expect("aggregate execution should succeed")
+            .expect("aggregate row must exist");
+        assert_eq!(row, vec!["0".to_string()]);
     }
 }

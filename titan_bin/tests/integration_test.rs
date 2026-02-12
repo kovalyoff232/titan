@@ -382,6 +382,25 @@ fn test_group_by_lowercase_sum_avg_with_having_alias() {
 
 #[test]
 #[serial]
+fn test_count_null_expression_ignores_nulls() {
+    let mut client = common::setup_server_and_client("count_null_expr_test");
+
+    client.simple_query("CREATE TABLE count_null_test (id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO count_null_test VALUES (1);");
+    client.simple_query("INSERT INTO count_null_test VALUES (2);");
+    client.simple_query("INSERT INTO count_null_test VALUES (3);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT COUNT(NULL) AS null_cnt, COUNT(*) AS total_cnt FROM count_null_test;",
+    );
+    assert_eq!(rows, vec![vec!["0", "3"]]);
+}
+
+#[test]
+#[serial]
 fn test_where_text_equality_filter() {
     let mut client = common::setup_server_and_client("where_text_filter_test");
 
