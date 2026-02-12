@@ -99,3 +99,39 @@ fn test_optimizer_chooses_index_scan() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], "text150");
 }
+
+#[test]
+#[serial]
+fn test_optimizer_handles_nested_join_with_where_filter() {
+    let mut client = common::setup_server_and_client("optimizer_nested_join_where_test");
+
+    client.simple_query("CREATE TABLE t8 (id INT, tag TEXT);");
+    client.simple_query("CREATE TABLE t9 (id INT, t8_id INT);");
+    client.simple_query("CREATE TABLE t10 (id INT, t9_id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO t8 VALUES (1, 'a');");
+    client.simple_query("INSERT INTO t8 VALUES (2, 'b');");
+
+    client.simple_query("INSERT INTO t9 VALUES (11, 1);");
+    client.simple_query("INSERT INTO t9 VALUES (12, 1);");
+    client.simple_query("INSERT INTO t9 VALUES (13, 2);");
+
+    client.simple_query("INSERT INTO t10 VALUES (101, 11);");
+    client.simple_query("INSERT INTO t10 VALUES (102, 12);");
+    client.simple_query("INSERT INTO t10 VALUES (103, 13);");
+    client.simple_query("COMMIT;");
+
+    let result = client.simple_query(
+        "SELECT t8.id, t9.id, t10.id \
+         FROM t8 \
+         JOIN t9 ON t8.id = t9.t8_id \
+         JOIN t10 ON t9.id = t10.t9_id \
+         WHERE t10.id = 102;",
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], "1");
+    assert_eq!(result[0][1], "12");
+    assert_eq!(result[0][2], "102");
+}

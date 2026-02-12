@@ -14,6 +14,10 @@ pub enum LogicalPlan {
         alias: Option<String>,
         filter: Option<Expression>,
     },
+    Filter {
+        input: Box<LogicalPlan>,
+        predicate: Expression,
+    },
     Projection {
         input: Box<LogicalPlan>,
         expressions: Vec<SelectItem>,
@@ -103,42 +107,27 @@ pub fn create_logical_plan(
     snapshot: &Snapshot,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
 ) -> Result<LogicalPlan, ExecutionError> {
-    let from_plan = if stmt.from.is_empty() {
+    let mut from_plan = if stmt.from.is_empty() {
         LogicalPlan::Scan {
             table_name: "dummy".to_string(),
             alias: None,
             filter: None,
         }
     } else {
-        match &stmt.from[0] {
-            TableReference::Table { name } => LogicalPlan::Scan {
-                table_name: name.clone(),
-                alias: None,
-                filter: stmt.where_clause.clone(),
-            },
-            TableReference::Join {
-                left,
-                right,
-                on_condition,
-            } => {
-                let left_plan =
-                    build_plan_from_table_ref(left, bpm, tx_id, snapshot, system_catalog)?;
-                let right_plan =
-                    build_plan_from_table_ref(right, bpm, tx_id, snapshot, system_catalog)?;
-                LogicalPlan::Join {
-                    left: Box::new(left_plan),
-                    right: Box::new(right_plan),
-                    condition: on_condition.clone(),
-                }
-            }
-        }
+        build_plan_from_table_ref(&stmt.from[0], bpm, tx_id, snapshot, system_catalog)?
     };
 
-    let mut plan = from_plan;
-
-    if let Some(_where_clause) = &stmt.where_clause {
-        if !matches!(plan, LogicalPlan::Scan { .. }) {}
+    if let Some(where_clause) = &stmt.where_clause {
+        if let LogicalPlan::Scan { filter, .. } = &mut from_plan {
+            *filter = Some(where_clause.clone());
+        } else {
+            from_plan = LogicalPlan::Filter {
+                input: Box::new(from_plan),
+                predicate: where_clause.clone(),
+            };
+        }
     }
+    let mut plan = from_plan;
 
     if let Some(group_by) = &stmt.group_by {
         let aggregates = extract_aggregates(&stmt.select_list)?;
@@ -193,9 +182,21 @@ fn build_plan_from_table_ref(
             alias: None,
             filter: None,
         }),
-        _ => Err(ExecutionError::PlanningError(
-            "Nested joins not supported yet".to_string(),
-        )),
+        TableReference::Join {
+            left,
+            right,
+            on_condition,
+        } => {
+            let left_plan =
+                build_plan_from_table_ref(left, _bpm, _tx_id, _snapshot, _system_catalog)?;
+            let right_plan =
+                build_plan_from_table_ref(right, _bpm, _tx_id, _snapshot, _system_catalog)?;
+            Ok(LogicalPlan::Join {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                condition: on_condition.clone(),
+            })
+        }
     }
 }
 

@@ -17,6 +17,7 @@ pub(super) fn get_table_names(plan: &LogicalPlan) -> HashSet<String> {
             tables.insert(table_name.clone());
         }
         LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }

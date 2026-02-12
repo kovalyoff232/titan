@@ -21,6 +21,7 @@ fn find_scan_filter<'a>(plan: &'a LogicalPlan, table_name: &str) -> Option<&'a E
         } if scan_table == table_name => filter.as_ref(),
         LogicalPlan::Scan { .. } | LogicalPlan::CteRef { .. } => None,
         LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }

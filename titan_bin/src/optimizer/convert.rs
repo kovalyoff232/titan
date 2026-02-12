@@ -7,6 +7,10 @@ pub(super) fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Scan {
             table_name, filter, ..
         } => PhysicalPlan::TableScan { table_name, filter },
+        LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(create_simple_physical_plan(*input)),
+            predicate,
+        },
         LogicalPlan::Projection { input, expressions } => PhysicalPlan::Projection {
             input: Box::new(create_simple_physical_plan(*input)),
             expressions,

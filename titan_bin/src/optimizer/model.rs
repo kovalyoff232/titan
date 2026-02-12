@@ -251,6 +251,7 @@ pub(super) fn find_join_condition(
             find_join_condition(left, p1, p2).or_else(|| find_join_condition(right, p1, p2))
         }
         LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -272,6 +273,7 @@ fn get_table_name_from_expr(expr: &Expression) -> Option<String> {
 
 pub(super) fn get_filter_from_logical_plan(plan: &LogicalPlan) -> Option<&Expression> {
     match plan {
+        LogicalPlan::Filter { predicate, .. } => Some(predicate),
         LogicalPlan::Scan { filter, .. } => filter.as_ref(),
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Sort { input, .. }
