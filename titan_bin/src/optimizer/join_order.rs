@@ -100,21 +100,12 @@ fn estimate_index_cardinality(
     (total_rows / n_distinct).clamp(1.0, total_rows)
 }
 
-pub(super) fn choose_best_join_plan(
+fn build_single_relation_cache(
     plan: &LogicalPlan,
     table_names: &[String],
     stats: &HashMap<String, Arc<TableStats>>,
     system_catalog: &Arc<Mutex<SystemCatalog>>,
-) -> Option<PlanInfo> {
-    let num_tables = table_names.len();
-    if num_tables == 0 {
-        return None;
-    }
-
-    if num_tables > DP_JOIN_RELATION_LIMIT {
-        return None;
-    }
-
+) -> PlanCache {
     let mut cache: PlanCache = HashMap::new();
 
     for (i, table_name) in table_names.iter().enumerate() {
@@ -166,6 +157,113 @@ pub(super) fn choose_best_join_plan(
 
         plans_for_rel.sort_by(compare_plan_info_stable);
         cache.insert(relation_mask, plans_for_rel);
+    }
+
+    cache
+}
+
+fn best_single_relation_plan(cache: &PlanCache, relation_idx: usize) -> Option<PlanInfo> {
+    cache
+        .get(&(1u32 << relation_idx))
+        .and_then(|plans| plans.first().cloned())
+}
+
+fn choose_greedy_fallback_plan(
+    plan: &LogicalPlan,
+    table_names: &[String],
+    stats: &HashMap<String, Arc<TableStats>>,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
+    cache: &PlanCache,
+) -> Option<PlanInfo> {
+    struct Candidate {
+        relation_idx: usize,
+        plan: PlanInfo,
+    }
+
+    let mut remaining = (0..table_names.len()).collect::<Vec<_>>();
+    let first_idx = remaining.first().copied()?;
+    remaining.remove(0);
+
+    let mut current = best_single_relation_plan(cache, first_idx)?;
+
+    while !remaining.is_empty() {
+        let mut candidates = Vec::new();
+
+        for &next_idx in &remaining {
+            let Some(next_plan) = best_single_relation_plan(cache, next_idx) else {
+                continue;
+            };
+
+            let candidate_plan = if let Some((left_key, right_key)) =
+                find_join_condition(plan, &current, &next_plan)
+            {
+                let joined_plan = PhysicalPlan::HashJoin {
+                    left: Box::new((*current.plan).clone()),
+                    right: Box::new((*next_plan.plan).clone()),
+                    left_key: left_key.clone(),
+                    right_key: right_key.clone(),
+                };
+                let estimated_cardinality = estimate_join_cardinality(
+                    &current,
+                    &next_plan,
+                    &left_key,
+                    &right_key,
+                    stats,
+                    system_catalog,
+                )
+                .unwrap_or((current.cardinality * next_plan.cardinality).max(1.0));
+                PlanInfo {
+                    plan: Arc::new(joined_plan),
+                    cost: cost_hash_join(&current, &next_plan),
+                    cardinality: estimated_cardinality,
+                }
+            } else {
+                let joined_plan = PhysicalPlan::NestedLoopJoin {
+                    left: Box::new((*current.plan).clone()),
+                    right: Box::new((*next_plan.plan).clone()),
+                    condition: Expression::Literal(LiteralValue::Bool(true)),
+                };
+                PlanInfo {
+                    plan: Arc::new(joined_plan),
+                    cost: current.cost + (current.cardinality * next_plan.cost),
+                    cardinality: (current.cardinality * next_plan.cardinality).max(1.0),
+                }
+            };
+
+            candidates.push(Candidate {
+                relation_idx: next_idx,
+                plan: candidate_plan,
+            });
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        candidates.sort_by(|a, b| compare_plan_info_stable(&a.plan, &b.plan));
+        let selected = candidates.remove(0);
+        current = selected.plan;
+        remaining.retain(|idx| *idx != selected.relation_idx);
+    }
+
+    Some(current)
+}
+
+pub(super) fn choose_best_join_plan(
+    plan: &LogicalPlan,
+    table_names: &[String],
+    stats: &HashMap<String, Arc<TableStats>>,
+    system_catalog: &Arc<Mutex<SystemCatalog>>,
+) -> Option<PlanInfo> {
+    let num_tables = table_names.len();
+    if num_tables == 0 {
+        return None;
+    }
+
+    let mut cache = build_single_relation_cache(plan, table_names, stats, system_catalog);
+
+    if num_tables > DP_JOIN_RELATION_LIMIT {
+        return choose_greedy_fallback_plan(plan, table_names, stats, system_catalog, &cache);
     }
 
     for i in 2..=num_tables {
@@ -305,6 +403,38 @@ mod tests {
                 )),
             },
         }
+    }
+
+    fn build_equi_join_chain(table_count: usize) -> LogicalPlan {
+        let mut plan = LogicalPlan::Scan {
+            table_name: "t0".to_string(),
+            alias: None,
+            filter: None,
+        };
+
+        for i in 1..table_count {
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(LogicalPlan::Scan {
+                    table_name: format!("t{}", i),
+                    alias: None,
+                    filter: None,
+                }),
+                condition: Expression::Binary {
+                    left: Box::new(Expression::QualifiedColumn(
+                        format!("t{}", i - 1),
+                        "id".to_string(),
+                    )),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expression::QualifiedColumn(
+                        format!("t{}", i),
+                        "id".to_string(),
+                    )),
+                },
+            };
+        }
+
+        plan
     }
 
     #[test]
@@ -488,15 +618,24 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_when_relation_count_exceeds_dp_limit() {
-        let logical = build_two_table_equi_join();
+    fn uses_greedy_fallback_when_relation_count_exceeds_dp_limit() {
+        let relation_count = DP_JOIN_RELATION_LIMIT + 1;
+        let logical = build_equi_join_chain(relation_count);
         let table_names = (0..(DP_JOIN_RELATION_LIMIT + 1))
             .map(|i| format!("t{}", i))
             .collect::<Vec<_>>();
         let stats: HashMap<String, Arc<TableStats>> = HashMap::new();
         let system_catalog = Arc::new(Mutex::new(SystemCatalog::new()));
 
-        let best = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog);
-        assert!(best.is_none());
+        let expected = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+            .map(|p| physical_plan_stability_key(&p.plan))
+            .expect("expected greedy fallback plan");
+
+        for _ in 0..20 {
+            let current = choose_best_join_plan(&logical, &table_names, &stats, &system_catalog)
+                .map(|p| physical_plan_stability_key(&p.plan))
+                .expect("expected greedy fallback plan");
+            assert_eq!(current, expected);
+        }
     }
 }

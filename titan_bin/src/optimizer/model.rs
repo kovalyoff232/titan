@@ -3,7 +3,7 @@ use crate::catalog::SystemCatalog;
 use crate::parser::{BinaryOperator, Expression, LiteralValue};
 use crate::planner::LogicalPlan;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 const SEQ_PAGE_COST: f64 = 1.0;
@@ -218,11 +218,48 @@ fn find_first_table(plan: &PhysicalPlan) -> Option<String> {
     }
 }
 
+fn collect_plan_tables(plan: &PhysicalPlan, out: &mut HashSet<String>) {
+    match plan {
+        PhysicalPlan::TableScan { table_name, .. } => {
+            out.insert(table_name.clone());
+        }
+        PhysicalPlan::IndexScan { table_name, .. } => {
+            out.insert(table_name.clone());
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::StreamAggregate { input, .. }
+        | PhysicalPlan::Window { input, .. }
+        | PhysicalPlan::Limit { input, .. } => collect_plan_tables(input, out),
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. }
+        | PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            collect_plan_tables(left, out);
+            collect_plan_tables(right, out);
+        }
+        PhysicalPlan::MaterializeCTE { plan, .. } => collect_plan_tables(plan, out),
+        PhysicalPlan::CTEScan { name } => {
+            out.insert(format!("cte_{name}"));
+        }
+    }
+}
+
+fn plan_table_set(plan: &PhysicalPlan) -> HashSet<String> {
+    let mut tables = HashSet::new();
+    collect_plan_tables(plan, &mut tables);
+    tables
+}
+
 pub(super) fn find_join_condition(
     plan: &LogicalPlan,
     p1: &PlanInfo,
     p2: &PlanInfo,
 ) -> Option<(Expression, Expression)> {
+    let p1_tables = plan_table_set(&p1.plan);
+    let p2_tables = plan_table_set(&p2.plan);
+
     match plan {
         LogicalPlan::Join {
             left,
@@ -235,16 +272,16 @@ pub(super) fn find_join_condition(
                 right: cond_right,
             } = condition
             {
-                let p1_table = find_first_table(&p1.plan);
-                let p2_table = find_first_table(&p2.plan);
                 let cond_left_table = get_table_name_from_expr(cond_left);
                 let cond_right_table = get_table_name_from_expr(cond_right);
 
-                if cond_left_table == p1_table && cond_right_table == p2_table {
-                    return Some((*(cond_left.clone()), *(cond_right.clone())));
-                }
-                if cond_left_table == p2_table && cond_right_table == p1_table {
-                    return Some((*(cond_right.clone()), *(cond_left.clone())));
+                if let (Some(left_table), Some(right_table)) = (cond_left_table, cond_right_table) {
+                    if p1_tables.contains(&left_table) && p2_tables.contains(&right_table) {
+                        return Some((*(cond_left.clone()), *(cond_right.clone())));
+                    }
+                    if p1_tables.contains(&right_table) && p2_tables.contains(&left_table) {
+                        return Some((*(cond_right.clone()), *(cond_left.clone())));
+                    }
                 }
             }
 
@@ -344,8 +381,10 @@ pub(super) fn estimate_join_cardinality(
     let left_card = left_plan.cardinality;
     let right_card = right_plan.cardinality;
 
-    let left_table = find_first_table(&left_plan.plan)?;
-    let right_table = find_first_table(&right_plan.plan)?;
+    let left_table =
+        get_table_name_from_expr(left_key).or_else(|| find_first_table(&left_plan.plan))?;
+    let right_table =
+        get_table_name_from_expr(right_key).or_else(|| find_first_table(&right_plan.plan))?;
     let left_col = get_col_name(left_key)?;
     let right_col = get_col_name(right_key)?;
 
