@@ -130,6 +130,12 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         BinaryOperator::NotLike => Err(ExecutionError::GenericError(
                             "Unsupported operator for number".to_string(),
                         )),
+                        BinaryOperator::ILike => Err(ExecutionError::GenericError(
+                            "Unsupported operator for number".to_string(),
+                        )),
+                        BinaryOperator::NotILike => Err(ExecutionError::GenericError(
+                            "Unsupported operator for number".to_string(),
+                        )),
                     }
                 }
                 (LiteralValue::Bool(l), LiteralValue::Bool(r)) => match op {
@@ -165,6 +171,14 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     BinaryOperator::GtEq => Ok(LiteralValue::Bool(l >= r)),
                     BinaryOperator::Like => Ok(LiteralValue::Bool(like_match(&l, &r))),
                     BinaryOperator::NotLike => Ok(LiteralValue::Bool(!like_match(&l, &r))),
+                    BinaryOperator::ILike => Ok(LiteralValue::Bool(like_match(
+                        &l.to_lowercase(),
+                        &r.to_lowercase(),
+                    ))),
+                    BinaryOperator::NotILike => Ok(LiteralValue::Bool(!like_match(
+                        &l.to_lowercase(),
+                        &r.to_lowercase(),
+                    ))),
                     _ => Err(ExecutionError::GenericError(
                         "Unsupported operator for text".to_string(),
                     )),
@@ -368,6 +382,36 @@ mod tests {
             ))),
             op: BinaryOperator::NotLike,
             right: Box::new(Expression::Literal(LiteralValue::String("Bo%".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn string_ilike_pattern_comparison_evaluates_to_boolean() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::String(
+                "ALICE".to_string(),
+            ))),
+            op: BinaryOperator::ILike,
+            right: Box::new(Expression::Literal(LiteralValue::String("al%".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Bool(true));
+    }
+
+    #[test]
+    fn string_not_ilike_pattern_comparison_evaluates_to_boolean() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::String(
+                "ALICE".to_string(),
+            ))),
+            op: BinaryOperator::NotILike,
+            right: Box::new(Expression::Literal(LiteralValue::String("bo%".to_string()))),
         };
         let row = HashMap::new();
 

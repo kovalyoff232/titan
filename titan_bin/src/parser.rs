@@ -156,6 +156,8 @@ pub enum BinaryOperator {
     NotEq,
     Like,
     NotLike,
+    ILike,
+    NotILike,
     Lt,
     LtEq,
     Gt,
@@ -300,6 +302,8 @@ impl fmt::Display for BinaryOperator {
             BinaryOperator::NotEq => write!(f, "<>"),
             BinaryOperator::Like => write!(f, "LIKE"),
             BinaryOperator::NotLike => write!(f, "NOT LIKE"),
+            BinaryOperator::ILike => write!(f, "ILIKE"),
+            BinaryOperator::NotILike => write!(f, "NOT ILIKE"),
             BinaryOperator::Lt => write!(f, "<"),
             BinaryOperator::LtEq => write!(f, "<="),
             BinaryOperator::Gt => write!(f, ">"),
@@ -319,8 +323,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "INT" | "TEXT" | "BOOLEAN" | "DATE" | "DUMP" | "PAGE" | "UPDATE" | "SET"
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
-                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "LIKE" | "ASC"
-                | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => {
+                | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "LIKE" | "ILIKE"
+                | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS" | "FIRST" | "LAST" => {
                     Err(Simple::custom(
                         span,
                         format!("keyword `{}` cannot be used as an identifier", ident),
@@ -451,8 +455,13 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(just("<>").to(BinaryOperator::NotEq))
             .or(text::keyword("NOT")
                 .padded()
+                .ignore_then(text::keyword("ILIKE"))
+                .to(BinaryOperator::NotILike))
+            .or(text::keyword("NOT")
+                .padded()
                 .ignore_then(text::keyword("LIKE"))
                 .to(BinaryOperator::NotLike))
+            .or(text::keyword("ILIKE").to(BinaryOperator::ILike))
             .or(text::keyword("LIKE").to(BinaryOperator::Like))
             .or(just("<=").to(BinaryOperator::LtEq))
             .or(just("<").to(BinaryOperator::Lt))
@@ -915,6 +924,32 @@ mod tests {
             panic!("expected binary expression in WHERE");
         };
         assert_eq!(*op, super::BinaryOperator::NotLike);
+    }
+
+    #[test]
+    fn select_where_parses_ilike_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE name ILIKE 'al%';").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Binary { op, .. } = where_expr else {
+            panic!("expected binary expression in WHERE");
+        };
+        assert_eq!(*op, super::BinaryOperator::ILike);
+    }
+
+    #[test]
+    fn select_where_parses_not_ilike_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE name NOT ILIKE 'al%';").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Binary { op, .. } = where_expr else {
+            panic!("expected binary expression in WHERE");
+        };
+        assert_eq!(*op, super::BinaryOperator::NotILike);
     }
 
     #[test]

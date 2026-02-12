@@ -170,6 +170,14 @@ fn test_where_like_filter() {
     let not_like_rows = client
         .simple_query("SELECT id FROM like_users_test WHERE name NOT LIKE 'Al%' ORDER BY id;");
     assert_eq!(not_like_rows, vec![vec!["3"]]);
+
+    let ilike_rows =
+        client.simple_query("SELECT id FROM like_users_test WHERE name ILIKE 'al%' ORDER BY id;");
+    assert_eq!(ilike_rows, vec![vec!["1"], vec!["2"]]);
+
+    let not_ilike_rows = client
+        .simple_query("SELECT id FROM like_users_test WHERE name NOT ILIKE 'al%' ORDER BY id;");
+    assert_eq!(not_ilike_rows, vec![vec!["3"]]);
 }
 
 #[test]
