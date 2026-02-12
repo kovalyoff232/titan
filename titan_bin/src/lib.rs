@@ -127,7 +127,12 @@ fn parse_simple_query_payload(payload: &[u8]) -> io::Result<String> {
     } else {
         payload
     };
-    Ok(String::from_utf8_lossy(text).to_string())
+    String::from_utf8(text.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "query payload is not valid UTF-8",
+        )
+    })
 }
 
 fn lock_wal<'a>(wal: &'a Arc<Mutex<WalManager>>) -> io::Result<MutexGuard<'a, WalManager>> {
@@ -792,6 +797,12 @@ mod tests {
     #[test]
     fn rejects_empty_query_payload() {
         assert!(parse_simple_query_payload(b"").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_query_payload() {
+        let invalid = [0xFF_u8, 0xFE_u8, 0xFD_u8, 0x00_u8];
+        assert!(parse_simple_query_payload(&invalid).is_err());
     }
 
     #[test]
