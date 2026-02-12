@@ -68,3 +68,47 @@ fn test_analyze_persists_total_row_count_statistic() {
     assert_eq!(stats[0][0], "0");
     assert_eq!(stats[0][1], "3");
 }
+
+#[test]
+#[serial]
+fn test_analyze_refreshes_stats_after_data_changes() {
+    let mut client = common::setup_server_and_client("analyze_refresh_test");
+
+    client.simple_query("CREATE TABLE test_refresh (id INT, category TEXT);");
+    client.simple_query("INSERT INTO test_refresh VALUES (1, 'A');");
+    client.simple_query("INSERT INTO test_refresh VALUES (2, 'A');");
+    client.simple_query("INSERT INTO test_refresh VALUES (3, 'B');");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("ANALYZE test_refresh;");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO test_refresh VALUES (4, 'C');");
+    client.simple_query("INSERT INTO test_refresh VALUES (5, 'B');");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("ANALYZE test_refresh;");
+    client.simple_query("COMMIT;");
+
+    let distinct_stats = client.simple_query(
+        "SELECT staattnum, stadistinct FROM pg_statistic WHERE stakind = 1 ORDER BY staattnum;",
+    );
+    assert_eq!(
+        distinct_stats.len(),
+        2,
+        "ANALYZE refresh should keep one visible distinct stat row per column"
+    );
+    assert_eq!(distinct_stats[0][0], "0");
+    assert_eq!(distinct_stats[0][1], "5");
+    assert_eq!(distinct_stats[1][0], "1");
+    assert_eq!(distinct_stats[1][1], "3");
+
+    let row_count_stats =
+        client.simple_query("SELECT stadistinct FROM pg_statistic WHERE stakind = 0;");
+    assert_eq!(
+        row_count_stats.len(),
+        1,
+        "ANALYZE refresh should keep one visible row-count stat row"
+    );
+    assert_eq!(row_count_stats[0][0], "5");
+}
