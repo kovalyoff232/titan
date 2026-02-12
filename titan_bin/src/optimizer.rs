@@ -276,25 +276,79 @@ fn create_physical_plan(
             );
         }
 
-        if let LogicalPlan::Projection { expressions, .. } = &plan {
-            final_plan = PhysicalPlan::Projection {
-                input: Box::new(final_plan),
-                expressions: expressions.clone(),
-            };
-            final_plan_info.cost += cost_projection(&final_plan_info, expressions.len());
-        }
-
-        if let LogicalPlan::Sort { order_by, .. } = &plan {
-            final_plan = PhysicalPlan::Sort {
-                input: Box::new(final_plan),
-                order_by: order_by.clone(),
-            };
-            final_plan_info.cost += cost_sort(&final_plan_info);
-        }
+        final_plan = apply_non_filter_wrappers(&plan, final_plan, &mut final_plan_info);
 
         final_plan
     } else {
         create_simple_physical_plan(plan)
+    }
+}
+
+fn apply_non_filter_wrappers(
+    logical: &LogicalPlan,
+    base: PhysicalPlan,
+    plan_info: &mut PlanInfo,
+) -> PhysicalPlan {
+    match logical {
+        LogicalPlan::Projection { input, expressions } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            plan_info.cost += cost_projection(plan_info, expressions.len());
+            PhysicalPlan::Projection {
+                input: Box::new(wrapped),
+                expressions: expressions.clone(),
+            }
+        }
+        LogicalPlan::Sort { input, order_by } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            plan_info.cost += cost_sort(plan_info);
+            PhysicalPlan::Sort {
+                input: Box::new(wrapped),
+                order_by: order_by.clone(),
+            }
+        }
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            PhysicalPlan::Limit {
+                input: Box::new(wrapped),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            having,
+        } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            PhysicalPlan::HashAggregate {
+                input: Box::new(wrapped),
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+                having: having.clone(),
+            }
+        }
+        LogicalPlan::Window {
+            input,
+            window_functions,
+        } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            PhysicalPlan::Window {
+                input: Box::new(wrapped),
+                window_functions: window_functions.clone(),
+            }
+        }
+        LogicalPlan::Filter { input, .. } | LogicalPlan::WithCte { input, .. } => {
+            apply_non_filter_wrappers(input, base, plan_info)
+        }
+        LogicalPlan::SetOperation { .. }
+        | LogicalPlan::CteRef { .. }
+        | LogicalPlan::Scan { .. }
+        | LogicalPlan::Join { .. } => base,
     }
 }
 

@@ -131,3 +131,20 @@ fn test_date_type() {
     assert!(filtered_rows.contains(&vec!["1".to_string()]));
     assert!(filtered_rows.contains(&vec!["3".to_string()]));
 }
+
+#[test]
+#[serial]
+fn test_order_by_sorts_unsorted_input() {
+    let mut client = common::setup_server_and_client("order_by_unsorted_test");
+
+    client.simple_query("CREATE TABLE sort_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO sort_test VALUES (3, 'c');");
+    client.simple_query("INSERT INTO sort_test VALUES (1, 'a');");
+    client.simple_query("INSERT INTO sort_test VALUES (2, 'b');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, payload FROM sort_test ORDER BY id;");
+    assert_eq!(rows, vec![vec!["1", "a"], vec!["2", "b"], vec!["3", "c"]]);
+}
