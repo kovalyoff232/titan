@@ -285,7 +285,13 @@ pub mod window_exec {
             let mut rows_with_same_value = 0;
 
             for i in 0..partition.rows.len() {
-                if i > 0 && self.order_values_equal(&partition.rows[i - 1], &partition.rows[i]) {
+                let same_as_previous = i > 0
+                    && partition
+                        .rows
+                        .get(i - 1)
+                        .zip(partition.rows.get(i))
+                        .is_some_and(|(prev, current)| self.order_values_equal(prev, current));
+                if same_as_previous {
                     rows_with_same_value += 1;
                 } else {
                     current_rank += rows_with_same_value;
@@ -302,7 +308,13 @@ pub mod window_exec {
             let mut current_rank = 1;
 
             for i in 0..partition.rows.len() {
-                if i > 0 && !self.order_values_equal(&partition.rows[i - 1], &partition.rows[i]) {
+                let changed_from_previous = i > 0
+                    && partition
+                        .rows
+                        .get(i - 1)
+                        .zip(partition.rows.get(i))
+                        .is_some_and(|(prev, current)| !self.order_values_equal(prev, current));
+                if changed_from_previous {
                     current_rank += 1;
                 }
                 result.push(LiteralValue::Number(current_rank.to_string()));
@@ -340,9 +352,15 @@ pub mod window_exec {
             for i in 0..partition.rows.len() {
                 let mut count = i + 1;
 
-                while count < partition.rows.len()
-                    && self.order_values_equal(&partition.rows[i], &partition.rows[count])
-                {
+                while count < partition.rows.len() {
+                    let same_value = partition
+                        .rows
+                        .get(i)
+                        .zip(partition.rows.get(count))
+                        .is_some_and(|(left, right)| self.order_values_equal(left, right));
+                    if !same_value {
+                        break;
+                    }
                     count += 1;
                 }
                 let cume_dist = count as f64 / n;
@@ -385,25 +403,35 @@ pub mod window_exec {
         }
 
         fn compute_lag(&self, partition: &WindowPartition, offset: i64) -> Vec<LiteralValue> {
+            let offset = usize::try_from(offset).unwrap_or(0);
             let mut result = Vec::new();
             for i in 0..partition.rows.len() {
-                if i >= offset as usize {
-                    result.push(partition.rows[i - offset as usize][0].clone());
+                let value = if i >= offset {
+                    partition
+                        .rows
+                        .get(i - offset)
+                        .and_then(|row| row.first())
+                        .cloned()
+                        .unwrap_or(LiteralValue::Null)
                 } else {
-                    result.push(LiteralValue::Null);
-                }
+                    LiteralValue::Null
+                };
+                result.push(value);
             }
             result
         }
 
         fn compute_lead(&self, partition: &WindowPartition, offset: i64) -> Vec<LiteralValue> {
+            let offset = usize::try_from(offset).unwrap_or(0);
             let mut result = Vec::new();
             for i in 0..partition.rows.len() {
-                if i + (offset as usize) < partition.rows.len() {
-                    result.push(partition.rows[i + offset as usize][0].clone());
-                } else {
-                    result.push(LiteralValue::Null);
-                }
+                let value = i
+                    .checked_add(offset)
+                    .and_then(|idx| partition.rows.get(idx))
+                    .and_then(|row| row.first())
+                    .cloned()
+                    .unwrap_or(LiteralValue::Null);
+                result.push(value);
             }
             result
         }
@@ -412,7 +440,12 @@ pub mod window_exec {
             if partition.rows.is_empty() {
                 vec![]
             } else {
-                let first = partition.rows[0][0].clone();
+                let first = partition
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .cloned()
+                    .unwrap_or(LiteralValue::Null);
                 vec![first; partition.rows.len()]
             }
         }
@@ -429,7 +462,12 @@ pub mod window_exec {
             if n <= 0 || n as usize > partition.rows.len() {
                 vec![LiteralValue::Null; partition.rows.len()]
             } else {
-                let nth = partition.rows[n as usize - 1][0].clone();
+                let nth = partition
+                    .rows
+                    .get(n as usize - 1)
+                    .and_then(|row| row.first())
+                    .cloned()
+                    .unwrap_or(LiteralValue::Null);
                 vec![nth; partition.rows.len()]
             }
         }
@@ -448,7 +486,7 @@ pub mod window_exec {
                     let mut result = Vec::new();
                     let mut sum = 0.0;
                     for row in &partition.rows {
-                        if let LiteralValue::Number(n) = &row[0] {
+                        if let Some(LiteralValue::Number(n)) = row.first() {
                             sum += n.parse::<f64>().unwrap_or(0.0);
                         }
                         result.push(LiteralValue::Number(sum.to_string()));

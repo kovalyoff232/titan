@@ -98,12 +98,16 @@ impl<'a> WindowFunctionExecutor<'a> {
             .map(|expr| match expr {
                 Expression::Column(name) => {
                     if let Some(idx) = self.input.schema().iter().position(|c| c.name == *name) {
-                        match self.input.schema()[idx].type_id {
-                            16 => LiteralValue::Bool(row[idx] == "t"),
-                            23 => LiteralValue::Number(row[idx].clone()),
-                            25 => LiteralValue::String(row[idx].clone()),
-                            1082 => LiteralValue::Date(row[idx].clone()),
-                            _ => LiteralValue::String(row[idx].clone()),
+                        if let Some((col, value)) = self.input.schema().get(idx).zip(row.get(idx)) {
+                            match col.type_id {
+                                16 => LiteralValue::Bool(value == "t"),
+                                23 => LiteralValue::Number(value.clone()),
+                                25 => LiteralValue::String(value.clone()),
+                                1082 => LiteralValue::Date(value.clone()),
+                                _ => LiteralValue::String(value.clone()),
+                            }
+                        } else {
+                            LiteralValue::Null
                         }
                     } else {
                         LiteralValue::Null
@@ -119,13 +123,16 @@ impl<'a> WindowFunctionExecutor<'a> {
             return;
         }
 
-        partition.rows.sort_by(|a, b| match (&a[0], &b[0]) {
-            (LiteralValue::Number(n1), LiteralValue::Number(n2)) => {
+        partition.rows.sort_by(|a, b| match (a.first(), b.first()) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(LiteralValue::Number(n1)), Some(LiteralValue::Number(n2))) => {
                 let v1 = n1.parse::<f64>().unwrap_or(0.0);
                 let v2 = n2.parse::<f64>().unwrap_or(0.0);
                 v1.partial_cmp(&v2).unwrap_or(std::cmp::Ordering::Equal)
             }
-            (LiteralValue::String(s1), LiteralValue::String(s2)) => s1.cmp(s2),
+            (Some(LiteralValue::String(s1)), Some(LiteralValue::String(s2))) => s1.cmp(s2),
             _ => std::cmp::Ordering::Equal,
         });
     }
@@ -162,7 +169,12 @@ impl<'a> WindowFunctionExecutor<'a> {
         for (i, input_row) in input_rows.iter().enumerate() {
             let mut output_row = input_row.clone();
             for window_result in &window_results {
-                output_row.push(window_result[i].clone());
+                let value = window_result.get(i).cloned().ok_or_else(|| {
+                    ExecutionError::GenericError(
+                        "Window function result cardinality mismatch".to_string(),
+                    )
+                })?;
+                output_row.push(value);
             }
             output_rows.push(output_row);
         }
@@ -179,13 +191,11 @@ impl<'a> Executor for WindowFunctionExecutor<'a> {
             self.index = 0;
         }
 
-        if self.index < self.results.len() {
-            let row = self.results[self.index].clone();
-            self.index += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
+        let Some(row) = self.results.get(self.index).cloned() else {
+            return Ok(None);
+        };
+        self.index += 1;
+        Ok(Some(row))
     }
 
     fn schema(&self) -> &Vec<Column> {
@@ -250,16 +260,12 @@ impl Executor for CteScanExecutor {
             ExecutionError::PlanningError(format!("CTE '{}' not found", self.cte_name))
         })?;
 
-        if self.current_index < cte.rows.len() {
-            let row = cte.rows[self.current_index]
-                .iter()
-                .map(|v| v.to_string())
-                .collect();
-            self.current_index += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
+        let Some(row_values) = cte.rows.get(self.current_index) else {
+            return Ok(None);
+        };
+        let row = row_values.iter().map(|v| v.to_string()).collect();
+        self.current_index += 1;
+        Ok(Some(row))
     }
 
     fn schema(&self) -> &Vec<Column> {
@@ -419,13 +425,11 @@ impl<'a> Executor for SetOperationExecutor<'a> {
         self.materialize()?;
 
         if let Some(rows) = &self.materialized {
-            if self.current_index < rows.len() {
-                let row = rows[self.current_index].clone();
-                self.current_index += 1;
-                Ok(Some(row))
-            } else {
-                Ok(None)
-            }
+            let Some(row) = rows.get(self.current_index).cloned() else {
+                return Ok(None);
+            };
+            self.current_index += 1;
+            Ok(Some(row))
         } else {
             Ok(None)
         }

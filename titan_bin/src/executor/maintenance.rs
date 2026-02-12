@@ -244,7 +244,9 @@ fn analyze_table_and_update_stats(
             } else {
                 let j = rand::Rng::gen_range(&mut rng, 0..=idx);
                 if j < RESERVOIR_SIZE {
-                    reservoir[j] = val.clone();
+                    if let Some(slot) = reservoir.get_mut(j) {
+                        *slot = val.clone();
+                    }
                 }
             }
         }
