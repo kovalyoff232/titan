@@ -376,10 +376,17 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 _ => Ok(ident),
             });
 
-    let number = text::int(10)
-        .chain::<char, _, _>(just('.').chain(text::digits(10)).or_not().flatten())
-        .collect::<String>()
-        .map(LiteralValue::Number);
+    let number = just('-')
+        .or_not()
+        .then(
+            text::int(10)
+                .chain::<char, _, _>(just('.').chain(text::digits(10)).or_not().flatten())
+                .collect::<String>(),
+        )
+        .map(|(sign, digits)| match sign {
+            Some(_) => LiteralValue::Number(format!("-{}", digits)),
+            None => LiteralValue::Number(digits),
+        });
 
     let string_literal = just('\'')
         .ignore_then(filter(|c| *c != '\'').repeated())
@@ -1183,6 +1190,20 @@ mod tests {
         assert!(matches!(
             stmt.select_list[0],
             super::SelectItem::UnnamedExpr(Expression::Literal(super::LiteralValue::Null))
+        ));
+    }
+
+    #[test]
+    fn select_negative_number_literal_is_parsed() {
+        let parsed = sql_parser("SELECT -7;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert!(matches!(
+            stmt.select_list[0],
+            super::SelectItem::UnnamedExpr(Expression::Literal(super::LiteralValue::Number(
+                ref number
+            ))) if number == "-7"
         ));
     }
 

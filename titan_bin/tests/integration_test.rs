@@ -397,7 +397,7 @@ fn test_abs_greatest_and_least_functions() {
     );
     client.simple_query("COMMIT;");
 
-    client.simple_query("INSERT INTO extrema_values_test VALUES (1, 7, 2, 9);");
+    client.simple_query("INSERT INTO extrema_values_test VALUES (1, -7, 2, 9);");
     client.simple_query("INSERT INTO extrema_values_test VALUES (2, 4, 10, 3);");
     client.simple_query("COMMIT;");
 
