@@ -313,19 +313,20 @@ fn test_length_and_trim_functions_in_projection_and_filter() {
     client.simple_query("COMMIT;");
 
     let rows = client.simple_query(
-        "SELECT id, LENGTH(TRIM(payload)), LTRIM(payload, ' x'), RTRIM(payload, ' x') \
+        "SELECT id, LENGTH(TRIM(payload)), CHAR_LENGTH(TRIM(payload)), CHARACTER_LENGTH(TRIM(payload)), \
+         LTRIM(payload, ' x'), RTRIM(payload, ' x') \
          FROM trim_values_test ORDER BY id;",
     );
     assert_eq!(
         rows,
         vec![
-            vec!["1", "5", "Alpha  ", "  Alpha"],
-            vec!["2", "8", "betaxx", "xxbeta"]
+            vec!["1", "5", "5", "5", "Alpha  ", "  Alpha"],
+            vec!["2", "8", "8", "8", "betaxx", "xxbeta"]
         ]
     );
 
-    let filtered_rows =
-        client.simple_query("SELECT id FROM trim_values_test WHERE LENGTH(TRIM(payload)) = 5;");
+    let filtered_rows = client
+        .simple_query("SELECT id FROM trim_values_test WHERE CHAR_LENGTH(TRIM(payload)) = 5;");
     assert_eq!(filtered_rows, vec![vec!["1"]]);
 }
 

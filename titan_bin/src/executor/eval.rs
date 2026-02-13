@@ -1214,6 +1214,22 @@ mod tests {
     }
 
     #[test]
+    fn char_length_aliases_match_length_behavior() {
+        let row = HashMap::new();
+        for function_name in ["CHAR_LENGTH", "CHARACTER_LENGTH"] {
+            let expr = Expression::Function {
+                name: function_name.to_string(),
+                args: vec![Expression::Literal(LiteralValue::String(
+                    "te st".to_string(),
+                ))],
+            };
+
+            let result = evaluate_expr_for_row_to_val(&expr, &row);
+            assert_eq!(result.unwrap(), LiteralValue::Number("5".to_string()));
+        }
+    }
+
+    #[test]
     fn trim_functions_remove_expected_characters() {
         let trim_expr = Expression::Function {
             name: "TRIM".to_string(),
