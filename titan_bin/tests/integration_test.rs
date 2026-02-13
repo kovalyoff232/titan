@@ -417,6 +417,23 @@ fn test_abs_greatest_and_least_functions() {
 
 #[test]
 #[serial]
+fn test_insert_supports_computed_expressions() {
+    let mut client = common::setup_server_and_client("insert_expressions_test");
+
+    client.simple_query("CREATE TABLE insert_expr_values_test (id INT, score INT, name TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query(
+        "INSERT INTO insert_expr_values_test VALUES (1 + 1, ABS(-7), LOWER('MixEd'));",
+    );
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, score, name FROM insert_expr_values_test;");
+    assert_eq!(rows, vec![vec!["2", "7", "mixed"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

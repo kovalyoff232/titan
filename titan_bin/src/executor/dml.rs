@@ -529,30 +529,10 @@ impl<'a> Executor for DeleteExecutor<'a> {
 pub(super) fn serialize_expressions(values: &[Expression]) -> Result<Vec<u8>, ExecutionError> {
     let mut tuple_data = Vec::new();
     let epoch = epoch_date()?;
+    let row = HashMap::new();
     for value in values {
-        match value {
-            Expression::Literal(LiteralValue::Number(n)) => tuple_data
-                .extend_from_slice(&parse_i32_literal(n, "insert expression")?.to_be_bytes()),
-            Expression::Literal(LiteralValue::String(s)) => {
-                tuple_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                tuple_data.extend_from_slice(s.as_bytes());
-            }
-            Expression::Literal(LiteralValue::Bool(b)) => tuple_data.push(if *b { 1 } else { 0 }),
-            Expression::Literal(LiteralValue::Date(s)) => {
-                let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                    .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
-                let days = date.signed_duration_since(epoch).num_days() as i32;
-                tuple_data.extend_from_slice(&days.to_be_bytes());
-            }
-            Expression::Literal(LiteralValue::Null) => {
-                tuple_data.extend_from_slice(&0i32.to_be_bytes());
-            }
-            _ => {
-                return Err(ExecutionError::GenericError(
-                    "Unsupported expression type for insert".to_string(),
-                ));
-            }
-        }
+        let evaluated = evaluate_expr_for_row_to_val(value, &row)?;
+        append_literal_value(&mut tuple_data, &evaluated, &epoch, "insert expression")?;
     }
     Ok(tuple_data)
 }
@@ -565,27 +545,38 @@ pub(super) fn serialize_literal_map(
     let epoch = epoch_date()?;
     for col in schema {
         if let Some(val) = map.get(&col.name) {
-            match val {
-                LiteralValue::Number(n) => new_data
-                    .extend_from_slice(&parse_i32_literal(n, "row serialization")?.to_be_bytes()),
-                LiteralValue::String(s) => {
-                    new_data.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                    new_data.extend_from_slice(s.as_bytes());
-                }
-                LiteralValue::Bool(b) => new_data.push(if *b { 1 } else { 0 }),
-                LiteralValue::Date(s) => {
-                    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                        .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
-                    let days = date.signed_duration_since(epoch).num_days() as i32;
-                    new_data.extend_from_slice(&days.to_be_bytes());
-                }
-                LiteralValue::Null => {
-                    new_data.extend_from_slice(&0i32.to_be_bytes());
-                }
-            }
+            append_literal_value(&mut new_data, val, &epoch, "row serialization")?;
         }
     }
     Ok(new_data)
+}
+
+fn append_literal_value(
+    data: &mut Vec<u8>,
+    value: &LiteralValue,
+    epoch: &NaiveDate,
+    context: &str,
+) -> Result<(), ExecutionError> {
+    match value {
+        LiteralValue::Number(n) => {
+            data.extend_from_slice(&parse_i32_literal(n, context)?.to_be_bytes());
+        }
+        LiteralValue::String(s) => {
+            data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        LiteralValue::Bool(b) => data.push(if *b { 1 } else { 0 }),
+        LiteralValue::Date(s) => {
+            let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| ExecutionError::GenericError(e.to_string()))?;
+            let days = date.signed_duration_since(*epoch).num_days() as i32;
+            data.extend_from_slice(&days.to_be_bytes());
+        }
+        LiteralValue::Null => {
+            data.extend_from_slice(&0i32.to_be_bytes());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn find_or_create_page_for_insert(
@@ -677,7 +668,7 @@ pub(super) fn insert_tuple_and_log(
 #[cfg(test)]
 mod tests {
     use super::{serialize_expressions, serialize_literal_map};
-    use crate::parser::{Expression, LiteralValue};
+    use crate::parser::{BinaryOperator, Expression, LiteralValue};
     use crate::types::Column;
     use std::collections::HashMap;
 
@@ -688,6 +679,24 @@ mod tests {
         ))];
         let result = serialize_expressions(&values);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_expressions_supports_computed_insert_values() {
+        let values = vec![
+            Expression::Binary {
+                left: Box::new(Expression::Literal(LiteralValue::Number("2".to_string()))),
+                op: BinaryOperator::Plus,
+                right: Box::new(Expression::Literal(LiteralValue::Number("3".to_string()))),
+            },
+            Expression::Function {
+                name: "ABS".to_string(),
+                args: vec![Expression::Literal(LiteralValue::Number("-7".to_string()))],
+            },
+        ];
+
+        let result = serialize_expressions(&values).expect("computed values should serialize");
+        assert_eq!(result, [5i32.to_be_bytes(), 7i32.to_be_bytes()].concat());
     }
 
     #[test]
