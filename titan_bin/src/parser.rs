@@ -1055,6 +1055,19 @@ mod tests {
     }
 
     #[test]
+    fn select_where_parses_angle_not_equal_operator() {
+        let parsed = sql_parser("SELECT id FROM users WHERE name <> 'Bob';").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let where_expr = stmt.where_clause.as_ref().expect("WHERE must be present");
+        let Expression::Binary { op, .. } = where_expr else {
+            panic!("expected binary expression in WHERE");
+        };
+        assert_eq!(*op, super::BinaryOperator::NotEq);
+    }
+
+    #[test]
     fn select_where_parses_like_operator() {
         let parsed = sql_parser("SELECT id FROM users WHERE name LIKE 'Al%';").expect("parse");
         let Statement::Select(stmt) = &parsed[0] else {
