@@ -22,6 +22,9 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         expressions: Vec<SelectItem>,
     },
+    Distinct {
+        input: Box<LogicalPlan>,
+    },
     Join {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
@@ -152,26 +155,52 @@ pub fn create_logical_plan(
         };
     }
 
-    if let Some(order_by) = &stmt.order_by {
-        let resolved_order_by = resolve_order_by_aliases(order_by, &stmt.select_list);
-        plan = LogicalPlan::Sort {
+    if stmt.distinct {
+        plan = LogicalPlan::Projection {
             input: Box::new(plan),
-            order_by: resolved_order_by,
+            expressions: stmt.select_list.clone(),
+        };
+
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+
+        if let Some(order_by) = &stmt.order_by {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                order_by: order_by.clone(),
+            };
+        }
+
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                limit: stmt.limit,
+                offset: stmt.offset,
+            };
+        }
+    } else {
+        if let Some(order_by) = &stmt.order_by {
+            let resolved_order_by = resolve_order_by_aliases(order_by, &stmt.select_list);
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                order_by: resolved_order_by,
+            };
+        }
+
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                limit: stmt.limit,
+                offset: stmt.offset,
+            };
+        }
+
+        plan = LogicalPlan::Projection {
+            input: Box::new(plan),
+            expressions: stmt.select_list.clone(),
         };
     }
-
-    if stmt.limit.is_some() || stmt.offset.is_some() {
-        plan = LogicalPlan::Limit {
-            input: Box::new(plan),
-            limit: stmt.limit,
-            offset: stmt.offset,
-        };
-    }
-
-    plan = LogicalPlan::Projection {
-        input: Box::new(plan),
-        expressions: stmt.select_list.clone(),
-    };
 
     if let Some(cte_list) = &stmt.with_clause {
         plan = LogicalPlan::WithCte {

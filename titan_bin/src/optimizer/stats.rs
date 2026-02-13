@@ -18,6 +18,7 @@ pub(super) fn get_table_names(plan: &LogicalPlan) -> HashSet<String> {
         }
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }

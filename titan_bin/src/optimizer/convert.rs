@@ -21,6 +21,9 @@ pub(super) fn create_simple_physical_plan(plan: LogicalPlan) -> PhysicalPlan {
             input: Box::new(create_simple_physical_plan(*input)),
             expressions,
         },
+        LogicalPlan::Distinct { input } => PhysicalPlan::Distinct {
+            input: Box::new(create_simple_physical_plan(*input)),
+        },
         LogicalPlan::Join {
             left,
             right,

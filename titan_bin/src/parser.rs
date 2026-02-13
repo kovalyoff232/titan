@@ -21,6 +21,7 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SelectStatement {
     pub with_clause: Option<Vec<CommonTableExpression>>,
+    pub distinct: bool,
     pub select_list: Vec<SelectItem>,
     pub from: Vec<TableReference>,
     pub where_clause: Option<Expression>,
@@ -370,8 +371,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 | "WHERE" | "DELETE" | "ON" | "INDEX" | "JOIN" | "VACUUM" | "START"
                 | "TRANSACTION" | "FOR" | "TRUE" | "FALSE" | "ORDER" | "BY" | "ANALYZE"
                 | "GROUP" | "HAVING" | "EXPLAIN" | "NOT" | "OR" | "IS" | "IN" | "BETWEEN"
-                | "LIKE" | "ILIKE" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL" | "NULLS"
-                | "FIRST" | "LAST" => Err(Simple::custom(
+                | "LIKE" | "ILIKE" | "DISTINCT" | "ASC" | "DESC" | "LIMIT" | "OFFSET" | "NULL"
+                | "NULLS" | "FIRST" | "LAST" => Err(Simple::custom(
                     span,
                     format!("keyword `{}` cannot be used as an identifier", ident),
                 )),
@@ -686,7 +687,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
 
     let select = text::keyword("SELECT")
         .padded()
-        .ignore_then(
+        .ignore_then(text::keyword("DISTINCT").padded().or_not())
+        .then(
             select_item
                 .separated_by(just(',').padded())
                 .allow_trailing()
@@ -781,13 +783,20 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
         .map(
             |(
                 (
-                    ((((((select_list, from), where_clause), group_by), having), order_by), limit),
+                    (
+                        (
+                            (((((distinct, select_list), from), where_clause), group_by), having),
+                            order_by,
+                        ),
+                        limit,
+                    ),
                     offset,
                 ),
                 for_update,
             )| {
                 Statement::Select(Box::new(SelectStatement {
                     with_clause: None,
+                    distinct: distinct.is_some(),
                     select_list,
                     from: from.unwrap_or_default(),
                     where_clause,
@@ -1020,6 +1029,16 @@ mod tests {
         };
         assert_eq!(stmt.limit, Some(2));
         assert_eq!(stmt.offset, Some(1));
+    }
+
+    #[test]
+    fn select_distinct_is_parsed() {
+        let parsed = sql_parser("SELECT DISTINCT id, name FROM users;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        assert!(stmt.distinct);
+        assert_eq!(stmt.select_list.len(), 2);
     }
 
     #[test]

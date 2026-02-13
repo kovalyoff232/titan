@@ -5,6 +5,7 @@ use crate::errors::ExecutionError;
 use crate::parser::{Expression, LiteralValue, OrderByExpr, SelectItem};
 use crate::types::Column;
 use chrono::NaiveDate;
+use std::collections::HashSet;
 
 pub(super) struct FilterExecutor<'a> {
     input: Box<dyn Executor + 'a>,
@@ -128,6 +129,48 @@ impl<'a> Executor for ProjectionExecutor<'a> {
             }
         }
         Ok(Some(projected_row))
+    }
+}
+
+pub(super) struct DistinctExecutor<'a> {
+    input: Box<dyn Executor + 'a>,
+    distinct_rows: Vec<Row>,
+    cursor: usize,
+}
+
+impl<'a> DistinctExecutor<'a> {
+    pub(super) fn new(mut input: Box<dyn Executor + 'a>) -> Result<Self, ExecutionError> {
+        let mut distinct_rows = Vec::new();
+        let mut seen = HashSet::new();
+
+        while let Some(row) = input.next()? {
+            if seen.insert(row.clone()) {
+                distinct_rows.push(row);
+            }
+        }
+
+        Ok(Self {
+            input,
+            distinct_rows,
+            cursor: 0,
+        })
+    }
+}
+
+impl<'a> Executor for DistinctExecutor<'a> {
+    fn schema(&self) -> &Vec<Column> {
+        self.input.schema()
+    }
+
+    fn next(&mut self) -> Result<Option<Row>, ExecutionError> {
+        if self.cursor >= self.distinct_rows.len() {
+            return Ok(None);
+        }
+        let Some(row) = self.distinct_rows.get(self.cursor).cloned() else {
+            return Ok(None);
+        };
+        self.cursor += 1;
+        Ok(Some(row))
     }
 }
 
@@ -307,7 +350,7 @@ impl<'a> Executor for SortExecutor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Executor, ProjectionExecutor, Row, SortExecutor};
+    use super::{DistinctExecutor, Executor, ProjectionExecutor, Row, SortExecutor};
     use crate::parser::{Expression, LiteralValue, OrderByExpr};
     use crate::types::Column;
 
@@ -409,6 +452,40 @@ mod tests {
             .expect("projection should succeed")
             .expect("row should be present");
         assert_eq!(row, vec!["77".to_string()]);
+    }
+
+    #[test]
+    fn distinct_executor_deduplicates_rows_preserving_first_seen_order() {
+        let input = StaticRowsExecutor::new(
+            vec![Column {
+                name: "id".to_string(),
+                type_id: 23,
+            }],
+            vec![
+                vec!["1".to_string()],
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["1".to_string()],
+                vec!["3".to_string()],
+                vec!["2".to_string()],
+            ],
+        );
+
+        let mut distinct_exec =
+            DistinctExecutor::new(Box::new(input)).expect("distinct creation should succeed");
+        let mut rows = Vec::new();
+        while let Some(row) = distinct_exec.next().expect("distinct fetch should succeed") {
+            rows.push(row);
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ]
+        );
     }
 
     #[test]

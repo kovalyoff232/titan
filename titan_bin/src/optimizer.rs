@@ -53,6 +53,9 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         expressions: Vec<SelectItem>,
     },
+    Distinct {
+        input: Box<PhysicalPlan>,
+    },
     HashJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -184,6 +187,9 @@ pub(crate) fn physical_plan_stability_key(plan: &PhysicalPlan) -> String {
                 physical_plan_stability_key(input)
             )
         }
+        PhysicalPlan::Distinct { input } => {
+            format!("distinct:{}", physical_plan_stability_key(input))
+        }
         PhysicalPlan::HashJoin {
             left,
             right,
@@ -301,6 +307,12 @@ fn apply_non_filter_wrappers(
             PhysicalPlan::Projection {
                 input: Box::new(wrapped),
                 expressions: expressions.clone(),
+            }
+        }
+        LogicalPlan::Distinct { input } => {
+            let wrapped = apply_non_filter_wrappers(input, base, plan_info);
+            PhysicalPlan::Distinct {
+                input: Box::new(wrapped),
             }
         }
         LogicalPlan::Sort { input, order_by } => {

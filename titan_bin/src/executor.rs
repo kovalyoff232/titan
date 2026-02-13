@@ -27,7 +27,7 @@ pub(crate) use eval::{evaluate_expr_for_row, evaluate_expr_for_row_to_val};
 pub use helpers::parse_tuple;
 use join::{HashJoinExecutor, NestedLoopJoinExecutor};
 use maintenance::{MaintenanceCtx, execute_analyze, execute_vacuum};
-use pipeline::{FilterExecutor, ProjectionExecutor, SortExecutor};
+use pipeline::{DistinctExecutor, FilterExecutor, ProjectionExecutor, SortExecutor};
 use scan::{IndexScanExecutor, TableScanConfig, TableScanExecutor};
 
 pub trait Executor {
@@ -341,6 +341,10 @@ fn create_executor<'a>(
                 input_executor,
                 expressions.clone(),
             )))
+        }
+        PhysicalPlan::Distinct { input } => {
+            let input_executor = create_executor(ctx, input)?;
+            Ok(Box::new(DistinctExecutor::new(input_executor)?))
         }
         PhysicalPlan::Sort { input, order_by } => {
             let input_executor = create_executor(ctx, input)?;

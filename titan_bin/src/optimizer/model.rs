@@ -233,6 +233,7 @@ fn find_first_table(plan: &PhysicalPlan) -> Option<String> {
         PhysicalPlan::IndexScan { table_name, .. } => Some(table_name.clone()),
         PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
         | PhysicalPlan::StreamAggregate { input, .. }
@@ -261,6 +262,7 @@ fn collect_plan_tables(plan: &PhysicalPlan, out: &mut HashSet<String>) {
         }
         PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
         | PhysicalPlan::StreamAggregate { input, .. }
@@ -322,6 +324,7 @@ pub(super) fn find_join_condition(
         }
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -346,6 +349,7 @@ pub(super) fn get_filter_from_logical_plan(plan: &LogicalPlan) -> Option<&Expres
         LogicalPlan::Filter { predicate, .. } => Some(predicate),
         LogicalPlan::Scan { filter, .. } => filter.as_ref(),
         LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }

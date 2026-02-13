@@ -22,6 +22,7 @@ fn find_scan_filter<'a>(plan: &'a LogicalPlan, table_name: &str) -> Option<&'a E
         LogicalPlan::Scan { .. } | LogicalPlan::CteRef { .. } => None,
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }

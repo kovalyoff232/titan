@@ -874,3 +874,42 @@ fn test_where_text_not_equal_filter_with_bang_operator() {
         .simple_query("SELECT id FROM text_filter_bang_test WHERE name != 'Bob' ORDER BY id;");
     assert_eq!(rows, vec![vec!["1"], vec!["3"]]);
 }
+
+#[test]
+#[serial]
+fn test_select_distinct_is_applied_before_limit() {
+    let mut client = common::setup_server_and_client("distinct_limit_order_test");
+
+    client.simple_query("CREATE TABLE distinct_limit_test (id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO distinct_limit_test VALUES (1);");
+    client.simple_query("INSERT INTO distinct_limit_test VALUES (1);");
+    client.simple_query("INSERT INTO distinct_limit_test VALUES (2);");
+    client.simple_query("INSERT INTO distinct_limit_test VALUES (3);");
+    client.simple_query("COMMIT;");
+
+    let rows =
+        client.simple_query("SELECT DISTINCT id FROM distinct_limit_test ORDER BY id LIMIT 2;");
+    assert_eq!(rows, vec![vec!["1"], vec!["2"]]);
+}
+
+#[test]
+#[serial]
+fn test_select_distinct_supports_alias_order_by() {
+    let mut client = common::setup_server_and_client("distinct_alias_order_test");
+
+    client.simple_query("CREATE TABLE distinct_alias_test (id INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO distinct_alias_test VALUES (1);");
+    client.simple_query("INSERT INTO distinct_alias_test VALUES (2);");
+    client.simple_query("INSERT INTO distinct_alias_test VALUES (2);");
+    client.simple_query("INSERT INTO distinct_alias_test VALUES (3);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT DISTINCT id AS distinct_id FROM distinct_alias_test ORDER BY distinct_id DESC;",
+    );
+    assert_eq!(rows, vec![vec!["3"], vec!["2"], vec!["1"]]);
+}
