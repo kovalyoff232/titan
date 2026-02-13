@@ -342,6 +342,15 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         "NOT operator requires a boolean expression".to_string(),
                     )),
                 },
+                crate::parser::UnaryOperator::Negate => match val {
+                    LiteralValue::Number(n) => {
+                        Ok(LiteralValue::Number((-parse_i32_literal(&n)?).to_string()))
+                    }
+                    LiteralValue::Null => Ok(LiteralValue::Null),
+                    _ => Err(ExecutionError::GenericError(
+                        "Unary minus requires a numeric expression".to_string(),
+                    )),
+                },
             }
         }
         Expression::IsNull { expr, negated } => {
@@ -1434,6 +1443,18 @@ mod tests {
             result,
             Err(ExecutionError::GenericError(msg)) if msg == "Division by zero"
         ));
+    }
+
+    #[test]
+    fn unary_negate_evaluates_numeric_expression() {
+        let expr = Expression::Unary {
+            op: crate::parser::UnaryOperator::Negate,
+            expr: Box::new(Expression::Literal(LiteralValue::Number("9".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Number("-9".to_string()));
     }
 
     #[test]

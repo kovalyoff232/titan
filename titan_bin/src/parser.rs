@@ -157,6 +157,7 @@ pub enum LiteralValue {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnaryOperator {
     Not,
+    Negate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -330,6 +331,7 @@ impl fmt::Display for UnaryOperator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UnaryOperator::Not => write!(f, "NOT"),
+            UnaryOperator::Negate => write!(f, "-"),
         }
     }
 }
@@ -447,16 +449,17 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 .delimited_by(just('(').padded(), just(')').padded()))
             .boxed();
 
-        let unary = text::keyword("NOT")
-            .padded()
-            .map(|_| UnaryOperator::Not)
-            .then(atom.clone())
-            .map(|(op, expr)| Expression::Unary {
-                op,
-                expr: Box::new(expr),
-            })
-            .or(atom)
-            .boxed();
+        let unary = choice((
+            text::keyword("NOT").padded().map(|_| UnaryOperator::Not),
+            just('-').padded().to(UnaryOperator::Negate),
+        ))
+        .then(atom.clone())
+        .map(|(op, expr)| Expression::Unary {
+            op,
+            expr: Box::new(expr),
+        })
+        .or(atom)
+        .boxed();
 
         let factor = unary
             .clone()
@@ -1205,6 +1208,25 @@ mod tests {
                 ref number
             ))) if number == "-7"
         ));
+    }
+
+    #[test]
+    fn select_unary_minus_on_column_is_parsed() {
+        let parsed = sql_parser("SELECT -amount FROM users;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let super::SelectItem::UnnamedExpr(expr) = &stmt.select_list[0] else {
+            panic!("expected unnamed expression");
+        };
+        let Expression::Unary {
+            op: super::UnaryOperator::Negate,
+            expr,
+        } = expr
+        else {
+            panic!("expected unary negate expression");
+        };
+        assert_eq!(expr.as_ref(), &Expression::Column("amount".to_string()));
     }
 
     #[test]

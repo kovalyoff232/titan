@@ -418,6 +418,25 @@ fn test_arithmetic_operators_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_unary_minus_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("unary_minus_test");
+
+    client.simple_query("CREATE TABLE unary_values_test (id INT, amount INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO unary_values_test VALUES (1, 5);");
+    client.simple_query("INSERT INTO unary_values_test VALUES (2, -3);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query("SELECT id, -amount FROM unary_values_test ORDER BY id;");
+    assert_eq!(rows, vec![vec!["1", "-5"], vec!["2", "3"]]);
+
+    let filtered_rows = client.simple_query("SELECT id FROM unary_values_test WHERE -amount > 0;");
+    assert_eq!(filtered_rows, vec![vec!["2"]]);
+}
+
+#[test]
+#[serial]
 fn test_abs_greatest_and_least_functions() {
     let mut client = common::setup_server_and_client("extrema_functions_test");
 
