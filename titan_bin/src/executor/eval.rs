@@ -138,6 +138,22 @@ fn strpos_by_char_index(value: &str, pattern: &str) -> i32 {
     }
 }
 
+fn left_by_char_count(value: &str, count: i32) -> String {
+    if count <= 0 {
+        return String::new();
+    }
+    value.chars().take(count as usize).collect()
+}
+
+fn right_by_char_count(value: &str, count: i32) -> String {
+    if count <= 0 {
+        return String::new();
+    }
+    let total = value.chars().count();
+    let skip = total.saturating_sub(count as usize);
+    value.chars().skip(skip).collect()
+}
+
 pub(crate) fn evaluate_expr_for_row(
     expr: &Expression,
     row: &HashMap<String, LiteralValue>,
@@ -576,6 +592,89 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 Ok(LiteralValue::Number(
                     strpos_by_char_index(&source, &search).to_string(),
                 ))
+            }
+            "LEFT" => {
+                if args.len() != 2 {
+                    return Err(ExecutionError::GenericError(
+                        "LEFT requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "LEFT source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let count = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::Number(text) => parse_i32_literal(&text)?,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "LEFT count argument must be integer".to_string(),
+                        ));
+                    }
+                };
+                Ok(LiteralValue::String(left_by_char_count(&source, count)))
+            }
+            "RIGHT" => {
+                if args.len() != 2 {
+                    return Err(ExecutionError::GenericError(
+                        "RIGHT requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "RIGHT source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let count = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::Number(text) => parse_i32_literal(&text)?,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "RIGHT count argument must be integer".to_string(),
+                        ));
+                    }
+                };
+                Ok(LiteralValue::String(right_by_char_count(&source, count)))
+            }
+            "REPEAT" => {
+                if args.len() != 2 {
+                    return Err(ExecutionError::GenericError(
+                        "REPEAT requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let source = match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::String(text) => text,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "REPEAT source argument must be text".to_string(),
+                        ));
+                    }
+                };
+                let count = match evaluate_expr_for_row_to_val(&args[1], row)? {
+                    LiteralValue::Number(text) => parse_i32_literal(&text)?,
+                    LiteralValue::Null => return Ok(LiteralValue::Null),
+                    _ => {
+                        return Err(ExecutionError::GenericError(
+                            "REPEAT count argument must be integer".to_string(),
+                        ));
+                    }
+                };
+                if count < 0 {
+                    return Err(ExecutionError::GenericError(
+                        "REPEAT count cannot be negative".to_string(),
+                    ));
+                }
+                Ok(LiteralValue::String(source.repeat(count as usize)))
             }
             "GREATEST" | "LEAST" => {
                 if args.is_empty() {
@@ -1245,6 +1344,45 @@ mod tests {
         assert_eq!(
             evaluate_expr_for_row_to_val(&least_expr, &row).unwrap(),
             LiteralValue::String("b".to_string())
+        );
+    }
+
+    #[test]
+    fn left_right_and_repeat_functions_return_expected_values() {
+        let left_expr = Expression::Function {
+            name: "LEFT".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("abcdef".to_string())),
+                Expression::Literal(LiteralValue::Number("3".to_string())),
+            ],
+        };
+        let right_expr = Expression::Function {
+            name: "RIGHT".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("abcdef".to_string())),
+                Expression::Literal(LiteralValue::Number("2".to_string())),
+            ],
+        };
+        let repeat_expr = Expression::Function {
+            name: "REPEAT".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("ab".to_string())),
+                Expression::Literal(LiteralValue::Number("3".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&left_expr, &row).unwrap(),
+            LiteralValue::String("abc".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&right_expr, &row).unwrap(),
+            LiteralValue::String("ef".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&repeat_expr, &row).unwrap(),
+            LiteralValue::String("ababab".to_string())
         );
     }
 

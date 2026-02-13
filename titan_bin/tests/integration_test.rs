@@ -361,6 +361,35 @@ fn test_substring_replace_concat_and_strpos_functions() {
 
 #[test]
 #[serial]
+fn test_left_right_and_repeat_functions() {
+    let mut client = common::setup_server_and_client("left_right_repeat_test");
+
+    client.simple_query("CREATE TABLE text_slice_test (id INT, payload TEXT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO text_slice_test VALUES (1, 'abcdef');");
+    client.simple_query("INSERT INTO text_slice_test VALUES (2, 'xy');");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, LEFT(payload, 3), RIGHT(payload, 2), REPEAT(payload, 2) \
+         FROM text_slice_test ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "abc", "ef", "abcdefabcdef"],
+            vec!["2", "xy", "xy", "xyxy"]
+        ]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM text_slice_test WHERE LEFT(payload, 1) = 'a';");
+    assert_eq!(filtered_rows, vec![vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_arithmetic_operators_in_projection_and_filter() {
     let mut client = common::setup_server_and_client("arithmetic_ops_test");
 
