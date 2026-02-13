@@ -209,6 +209,11 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     | BinaryOperator::NotLike
                     | BinaryOperator::ILike
                     | BinaryOperator::NotILike => Ok(LiteralValue::Bool(false)),
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo => Ok(LiteralValue::Null),
                     _ => Err(ExecutionError::GenericError(
                         "Unsupported operator for NULL".to_string(),
                     )),
@@ -220,6 +225,25 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                         BinaryOperator::Plus => Ok(LiteralValue::Number((lnum + rnum).to_string())),
                         BinaryOperator::Minus => {
                             Ok(LiteralValue::Number((lnum - rnum).to_string()))
+                        }
+                        BinaryOperator::Multiply => {
+                            Ok(LiteralValue::Number((lnum * rnum).to_string()))
+                        }
+                        BinaryOperator::Divide => {
+                            if rnum == 0 {
+                                return Err(ExecutionError::GenericError(
+                                    "Division by zero".to_string(),
+                                ));
+                            }
+                            Ok(LiteralValue::Number((lnum / rnum).to_string()))
+                        }
+                        BinaryOperator::Modulo => {
+                            if rnum == 0 {
+                                return Err(ExecutionError::GenericError(
+                                    "Modulo by zero".to_string(),
+                                ));
+                            }
+                            Ok(LiteralValue::Number((lnum % rnum).to_string()))
                         }
                         BinaryOperator::Eq => Ok(LiteralValue::Bool(lnum == rnum)),
                         BinaryOperator::NotEq => Ok(LiteralValue::Bool(lnum != rnum)),
@@ -1134,6 +1158,56 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Number("3".to_string()));
+    }
+
+    #[test]
+    fn numeric_multiply_divide_and_modulo_evaluate_correctly() {
+        let row = HashMap::new();
+
+        let multiply_expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("6".to_string()))),
+            op: BinaryOperator::Multiply,
+            right: Box::new(Expression::Literal(LiteralValue::Number("7".to_string()))),
+        };
+        let divide_expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("21".to_string()))),
+            op: BinaryOperator::Divide,
+            right: Box::new(Expression::Literal(LiteralValue::Number("3".to_string()))),
+        };
+        let modulo_expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("22".to_string()))),
+            op: BinaryOperator::Modulo,
+            right: Box::new(Expression::Literal(LiteralValue::Number("5".to_string()))),
+        };
+
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&multiply_expr, &row).unwrap(),
+            LiteralValue::Number("42".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&divide_expr, &row).unwrap(),
+            LiteralValue::Number("7".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&modulo_expr, &row).unwrap(),
+            LiteralValue::Number("2".to_string())
+        );
+    }
+
+    #[test]
+    fn numeric_division_by_zero_returns_error() {
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(LiteralValue::Number("21".to_string()))),
+            op: BinaryOperator::Divide,
+            right: Box::new(Expression::Literal(LiteralValue::Number("0".to_string()))),
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert!(matches!(
+            result,
+            Err(ExecutionError::GenericError(msg)) if msg == "Division by zero"
+        ));
     }
 
     #[test]

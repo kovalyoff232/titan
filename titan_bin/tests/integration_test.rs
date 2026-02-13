@@ -361,6 +361,34 @@ fn test_substring_replace_concat_and_strpos_functions() {
 
 #[test]
 #[serial]
+fn test_arithmetic_operators_in_projection_and_filter() {
+    let mut client = common::setup_server_and_client("arithmetic_ops_test");
+
+    client.simple_query("CREATE TABLE arithmetic_values_test (id INT, a INT, b INT);");
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO arithmetic_values_test VALUES (1, 6, 4);");
+    client.simple_query("INSERT INTO arithmetic_values_test VALUES (2, 9, 3);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, a * b, a / b, a % b, a + b - 1 FROM arithmetic_values_test ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "24", "1", "2", "9"],
+            vec!["2", "27", "3", "0", "11"]
+        ]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM arithmetic_values_test WHERE a * b = 27;");
+    assert_eq!(filtered_rows, vec![vec!["2"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 

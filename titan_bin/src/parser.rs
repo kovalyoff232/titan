@@ -163,6 +163,9 @@ pub enum UnaryOperator {
 pub enum BinaryOperator {
     Plus,
     Minus,
+    Multiply,
+    Divide,
+    Modulo,
     Eq,
     NotEq,
     Like,
@@ -336,6 +339,9 @@ impl fmt::Display for BinaryOperator {
         match self {
             BinaryOperator::Plus => write!(f, "+"),
             BinaryOperator::Minus => write!(f, "-"),
+            BinaryOperator::Multiply => write!(f, "*"),
+            BinaryOperator::Divide => write!(f, "/"),
+            BinaryOperator::Modulo => write!(f, "%"),
             BinaryOperator::Eq => write!(f, "="),
             BinaryOperator::NotEq => write!(f, "<>"),
             BinaryOperator::Like => write!(f, "LIKE"),
@@ -431,7 +437,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
             .or(column)
             .or(expr
                 .clone()
-                .delimited_by(just('(').padded(), just(')').padded()));
+                .delimited_by(just('(').padded(), just(')').padded()))
+            .boxed();
 
         let unary = text::keyword("NOT")
             .padded()
@@ -441,9 +448,29 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 op,
                 expr: Box::new(expr),
             })
-            .or(atom);
+            .or(atom)
+            .boxed();
 
-        let product = unary
+        let factor = unary
+            .clone()
+            .then(
+                choice((
+                    just('*').to(BinaryOperator::Multiply),
+                    just('/').to(BinaryOperator::Divide),
+                    just('%').to(BinaryOperator::Modulo),
+                ))
+                .padded()
+                .then(unary.clone())
+                .repeated(),
+            )
+            .foldl(|left, (op, right)| Expression::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+            .boxed();
+
+        let product = factor
             .clone()
             .then(
                 choice((
@@ -451,14 +478,15 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                     just('-').to(BinaryOperator::Minus),
                 ))
                 .padded()
-                .then(unary)
+                .then(factor)
                 .repeated(),
             )
             .foldl(|left, (op, right)| Expression::Binary {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            });
+            })
+            .boxed();
 
         let null_check = product
             .clone()
@@ -484,7 +512,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 } else {
                     expr
                 }
-            });
+            })
+            .boxed();
 
         let comparison_op = just("=")
             .to(BinaryOperator::Eq)
@@ -529,7 +558,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 } else {
                     left_expr
                 }
-            });
+            })
+            .boxed();
 
         let in_predicate = between_predicate
             .clone()
@@ -558,7 +588,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 } else {
                     left_expr
                 }
-            });
+            })
+            .boxed();
 
         let comparison = in_predicate
             .clone()
@@ -567,7 +598,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            });
+            })
+            .boxed();
 
         let conjunction = comparison
             .clone()
@@ -582,7 +614,8 @@ pub fn sql_parser(s: &str) -> Result<Vec<Statement>, Vec<Simple<char>>> {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            });
+            })
+            .boxed();
 
         conjunction
             .clone()
@@ -1193,6 +1226,47 @@ mod tests {
         };
         assert_eq!(expr.as_ref(), &Expression::Column("deleted_at".to_string()));
         assert!(*negated);
+    }
+
+    #[test]
+    fn select_expression_parses_multiply_before_plus() {
+        let parsed = sql_parser("SELECT 2 + 3 * 4;").expect("parse");
+        let Statement::Select(stmt) = &parsed[0] else {
+            panic!("expected SELECT statement");
+        };
+        let super::SelectItem::UnnamedExpr(expr) = &stmt.select_list[0] else {
+            panic!("expected unnamed expression");
+        };
+        let Expression::Binary {
+            left,
+            op: outer_op,
+            right,
+        } = expr
+        else {
+            panic!("expected outer binary expression");
+        };
+        assert_eq!(*outer_op, super::BinaryOperator::Plus);
+        assert_eq!(
+            left.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("2".to_string()))
+        );
+        let Expression::Binary {
+            left: inner_left,
+            op: inner_op,
+            right: inner_right,
+        } = right.as_ref()
+        else {
+            panic!("expected inner binary expression");
+        };
+        assert_eq!(*inner_op, super::BinaryOperator::Multiply);
+        assert_eq!(
+            inner_left.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("3".to_string()))
+        );
+        assert_eq!(
+            inner_right.as_ref(),
+            &Expression::Literal(super::LiteralValue::Number("4".to_string()))
+        );
     }
 
     #[test]
