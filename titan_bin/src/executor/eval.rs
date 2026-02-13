@@ -437,6 +437,23 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                     )),
                 }
             }
+            "ABS" => {
+                if args.len() != 1 {
+                    return Err(ExecutionError::GenericError(
+                        "ABS requires exactly 1 argument".to_string(),
+                    ));
+                }
+                match evaluate_expr_for_row_to_val(&args[0], row)? {
+                    LiteralValue::Number(text) => {
+                        let value = parse_i32_literal(&text)?;
+                        Ok(LiteralValue::Number(value.abs().to_string()))
+                    }
+                    LiteralValue::Null => Ok(LiteralValue::Null),
+                    _ => Err(ExecutionError::GenericError(
+                        "ABS requires numeric argument".to_string(),
+                    )),
+                }
+            }
             "CONCAT" => {
                 let mut out = String::new();
                 for arg in args {
@@ -559,6 +576,35 @@ pub(crate) fn evaluate_expr_for_row_to_val(
                 Ok(LiteralValue::Number(
                     strpos_by_char_index(&source, &search).to_string(),
                 ))
+            }
+            "GREATEST" | "LEAST" => {
+                if args.is_empty() {
+                    return Err(ExecutionError::GenericError(
+                        "GREATEST/LEAST requires at least 1 argument".to_string(),
+                    ));
+                }
+                let pick_greatest = name.eq_ignore_ascii_case("GREATEST");
+                let mut best: Option<LiteralValue> = None;
+                for arg in args {
+                    let value = evaluate_expr_for_row_to_val(arg, row)?;
+                    if matches!(value, LiteralValue::Null) {
+                        return Ok(LiteralValue::Null);
+                    }
+                    if let Some(current_best) = best.as_ref() {
+                        let ordering = compare_literal_values(&value, current_best)?;
+                        let should_replace = if pick_greatest {
+                            ordering == Ordering::Greater
+                        } else {
+                            ordering == Ordering::Less
+                        };
+                        if should_replace {
+                            best = Some(value);
+                        }
+                    } else {
+                        best = Some(value);
+                    }
+                }
+                Ok(best.unwrap_or(LiteralValue::Null))
             }
             "TRIM" | "BTRIM" => {
                 if args.is_empty() || args.len() > 2 {
@@ -1114,6 +1160,18 @@ mod tests {
     }
 
     #[test]
+    fn abs_function_returns_absolute_value() {
+        let expr = Expression::Function {
+            name: "ABS".to_string(),
+            args: vec![Expression::Literal(LiteralValue::Number("-12".to_string()))],
+        };
+        let row = HashMap::new();
+
+        let result = evaluate_expr_for_row_to_val(&expr, &row);
+        assert_eq!(result.unwrap(), LiteralValue::Number("12".to_string()));
+    }
+
+    #[test]
     fn replace_function_rewrites_matching_substrings() {
         let expr = Expression::Function {
             name: "REPLACE".to_string(),
@@ -1158,6 +1216,36 @@ mod tests {
 
         let result = evaluate_expr_for_row_to_val(&expr, &row);
         assert_eq!(result.unwrap(), LiteralValue::Number("3".to_string()));
+    }
+
+    #[test]
+    fn greatest_and_least_functions_return_expected_values() {
+        let greatest_expr = Expression::Function {
+            name: "GREATEST".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::Number("10".to_string())),
+                Expression::Literal(LiteralValue::Number("3".to_string())),
+                Expression::Literal(LiteralValue::Number("7".to_string())),
+            ],
+        };
+        let least_expr = Expression::Function {
+            name: "LEAST".to_string(),
+            args: vec![
+                Expression::Literal(LiteralValue::String("z".to_string())),
+                Expression::Literal(LiteralValue::String("b".to_string())),
+                Expression::Literal(LiteralValue::String("k".to_string())),
+            ],
+        };
+        let row = HashMap::new();
+
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&greatest_expr, &row).unwrap(),
+            LiteralValue::Number("10".to_string())
+        );
+        assert_eq!(
+            evaluate_expr_for_row_to_val(&least_expr, &row).unwrap(),
+            LiteralValue::String("b".to_string())
+        );
     }
 
     #[test]

@@ -389,6 +389,34 @@ fn test_arithmetic_operators_in_projection_and_filter() {
 
 #[test]
 #[serial]
+fn test_abs_greatest_and_least_functions() {
+    let mut client = common::setup_server_and_client("extrema_functions_test");
+
+    client.simple_query(
+        "CREATE TABLE extrema_values_test (id INT, delta INT, left_v INT, right_v INT);",
+    );
+    client.simple_query("COMMIT;");
+
+    client.simple_query("INSERT INTO extrema_values_test VALUES (1, 7, 2, 9);");
+    client.simple_query("INSERT INTO extrema_values_test VALUES (2, 4, 10, 3);");
+    client.simple_query("COMMIT;");
+
+    let rows = client.simple_query(
+        "SELECT id, ABS(delta), GREATEST(left_v, right_v), LEAST(left_v, right_v) \
+         FROM extrema_values_test ORDER BY id;",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1", "7", "9", "2"], vec!["2", "4", "10", "3"]]
+    );
+
+    let filtered_rows =
+        client.simple_query("SELECT id FROM extrema_values_test WHERE ABS(delta) = 7;");
+    assert_eq!(filtered_rows, vec![vec!["1"]]);
+}
+
+#[test]
+#[serial]
 fn test_boolean_type() {
     let mut client = common::setup_server_and_client("boolean_test");
 
